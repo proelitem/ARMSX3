@@ -418,6 +418,49 @@ namespace vk
 				"It most likely failed to load and fell back silently; `adb logcat | grep hook_impl` has the reason. "
 				"Treat this session as running the SYSTEM driver.");
 		}
+
+		// ARMSX3: XR readiness, logged once per device so a tester's ARMSX3.log answers it.
+		//
+		// A standalone headset's OpenXR runtime (Meta Quest, Pico) hands the application its
+		// swapchain images as AHardwareBuffer-backed VkImages, imported into the application's
+		// own VkDevice. Presenting through OpenXR therefore needs the ICD in use -- the system
+		// driver or an adrenotools Turnip build -- to expose the import path. Whether a given
+		// Turnip pack does is not documented anywhere, and there is no vulkaninfo on a headset,
+		// so the device creation log is the one place every tester already looks.
+		//
+		// Nothing is gated on this yet. It is a measurement for the Quest 3 bring-up; the
+		// OpenXR presentation path, once it exists, will require the first entry outright.
+		{
+			static constexpr const char* s_xr_extensions[] =
+			{
+				"VK_ANDROID_external_memory_android_hardware_buffer", // AHB import: hard requirement
+				"VK_KHR_external_memory",                             // its dependency
+				"VK_KHR_dedicated_allocation",                        // its dependency
+				"VK_KHR_sampler_ycbcr_conversion",                    // its dependency
+				"VK_EXT_queue_family_foreign",                        // its dependency
+				"VK_KHR_external_memory_fd",                          // dma-buf path (Pico / non-AHB runtimes)
+				"VK_KHR_external_semaphore_fd",                       // runtime sync objects
+				"VK_KHR_timeline_semaphore",                          // runtime sync objects
+				"VK_KHR_multiview",                                   // single-pass stereo, optional
+			};
+
+			const auto xr_extensions = vk::supported_extensions(vk::supported_extensions::enumeration_class::device, nullptr, dev);
+			bool ahb_import_ok = true;
+
+			for (const char* ext : s_xr_extensions)
+			{
+				const bool ok = xr_extensions.is_supported(ext);
+				rsx_log.always()("XR readiness: [%s] %s", ok ? "Supported" : "Not supported", ext);
+
+				if (!ok && std::string_view(ext) == "VK_ANDROID_external_memory_android_hardware_buffer")
+				{
+					ahb_import_ok = false;
+				}
+			}
+
+			rsx_log.always()("XR readiness: AHardwareBuffer swapchain import is %s on this driver",
+				ahb_import_ok ? "AVAILABLE" : "NOT AVAILABLE (an OpenXR presentation path cannot use this driver)");
+		}
 #endif
 
 		if (get_driver_vendor() == driver_vendor::RADV && get_name().find("LLVM 8.0.0") != umax)
