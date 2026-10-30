@@ -202,7 +202,13 @@ object Rpcs3Bridge {
         runCatching { com.armsx2.config.ConfigDatabase.purgeIfStale() }
         // Applies whether or not the database was ever downloaded.
         runCatching { com.armsx2.config.ConfigDatabase.ensureLocalOverrides() }
-        RPCSX.instance.initialize(RPCSX.rootDirectory, "00000001", com.armsx2.DeviceTier.socIdentity())
+        // The SoC line of ARMSX3.log; on a VR headset it also names the headset, since
+        // Build.MODEL there ("Quest 3") never reaches the log otherwise.
+        RPCSX.instance.initialize(
+            RPCSX.rootDirectory,
+            "00000001",
+            com.armsx2.HeadsetProfile.annotateSocIdentity(com.armsx2.HeadsetProfile.current, com.armsx2.DeviceTier.socIdentity()),
+        )
         RPCSX.initialized = true
 
         // Into the log that initialize() just opened, so every log a tester sends says how the

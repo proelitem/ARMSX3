@@ -95,6 +95,10 @@ object DeviceTier {
         "QCS8550" to "Snapdragon 8 Gen 2-class",
         "QCS9075" to "Snapdragon 8 Elite-class",
         "CQ8725S" to "Snapdragon 8 Elite-class",
+        // Qualcomm's part number for the Snapdragon XR2 Gen 2 (Meta Quest 3 / 3S: Adreno 740
+        // at 640 MHz). Confirm against ro.soc.model from a real unit (android/tools/quest3,
+        // `info`); the annotation is display-only, so a mismatch costs nothing but this label.
+        "SXR2230P" to "Snapdragon XR2 Gen 2",
     )
 
     /** Android reports missing Build fields as the literal [Build.UNKNOWN]

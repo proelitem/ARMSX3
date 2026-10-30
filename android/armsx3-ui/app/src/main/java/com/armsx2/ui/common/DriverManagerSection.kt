@@ -107,7 +107,11 @@ fun DriverManagerSection() {
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(str("backend.driver.recommended"), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text(gpuRec?.sourceLabel ?: str("backend.driver.recommendSystem"), style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
+                    Text(
+                        if (gpuRec == null || gpuRec.systemDriver) str("backend.driver.recommendSystem") else gpuRec.sourceLabel,
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
                 }
                 gpuRec?.reason?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
             }

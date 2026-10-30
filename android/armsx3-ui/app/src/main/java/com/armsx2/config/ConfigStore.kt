@@ -901,7 +901,10 @@ object ConfigStore {
         // on too many setups. Everyone starts on PCSX2's two-frame queue and can opt in from the
         // Performance tab. Settings.vsyncQueueSize already defaults to 2, so this just materialises
         // the global save that the rest of the config layer keys "is this a fresh install?" off.
-        saveGlobal(Settings())
+        //
+        // A VR headset starts from the same defaults with the ones that matter there pinned
+        // (720p native, no MSAA, no GPU turbo, two-frame queue); a phone gets Settings() as is.
+        saveGlobal(com.armsx2.HeadsetProfile.freshInstallDefaults(com.armsx2.HeadsetProfile.current, Settings()))
     }
 
     // Migration 1 (config.migrated.lowLatencyDefault) flipped existing capable devices ON. It is

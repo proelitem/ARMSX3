@@ -60,7 +60,11 @@ object GpuInfo {
         }
     }
 
-    data class Recommendation(val sourceLabel: String, val reason: String)
+    /**
+     * [systemDriver] true means "keep the built-in driver": [sourceLabel] is then empty and the
+     * UI shows its system-driver string instead, with [reason] underneath as usual.
+     */
+    data class Recommendation(val sourceLabel: String, val reason: String, val systemDriver: Boolean = false)
 
     /**
      * Suggested driver source for [renderer], or null when no custom driver
@@ -70,7 +74,16 @@ object GpuInfo {
      * verbatim. (It previously said it matched friendlyDriverSource(), which does
      * not exist anywhere in the tree.)
      */
-    fun recommendation(renderer: String?): Recommendation? {
+    fun recommendation(renderer: String?): Recommendation? =
+        recommendation(renderer, HeadsetProfile.current)
+
+    /**
+     * [headset] first: a VR headset has its own answer (see [HeadsetProfile.driverRecommendation]),
+     * because the GPU name alone would map a Quest 3's Adreno 740 to a phone's Turnip pack.
+     * Split out from the Build-reading overload so it is testable on the JVM.
+     */
+    fun recommendation(renderer: String?, headset: HeadsetProfile.Headset?): Recommendation? {
+        headset?.let { HeadsetProfile.driverRecommendation(it) }?.let { return it }
         val r = renderer ?: return null
         if (!r.contains("Adreno", ignoreCase = true)) return null
         val model = Regex("""(\d{3,4})""").find(r.substringAfter("Adreno", ""))?.value?.toIntOrNull()

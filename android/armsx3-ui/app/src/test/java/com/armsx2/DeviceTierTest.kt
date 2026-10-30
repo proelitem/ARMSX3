@@ -30,6 +30,15 @@ class DeviceTierTest {
         )
     }
 
+    /** Meta Quest 3, Snapdragon XR2 Gen 2 (Qualcomm part number). */
+    @Test
+    fun sxr2230pIsAnnotated() {
+        assertEquals(
+            "Qualcomm SXR2230P (Snapdragon XR2 Gen 2)",
+            DeviceTier.formatSocIdentity("Qualcomm", "SXR2230P", "eureka"),
+        )
+    }
+
     @Test
     fun unknownModelPassesThroughUnchanged() {
         assertEquals(

@@ -111,6 +111,20 @@ patché. C se lit alors en quelques secondes, dès l'écran de chargement.
 Dans tous les cas, noter le FPS : à 640 MHz, seuls les titres légers seront jouables, et
 les jeux 3D natifs rendent deux fois la scène côté PS3.
 
+## 5 bis. Ce que l'app fait déjà d'un Quest (profil, point 2 du plan)
+
+`com.armsx2.HeadsetProfile` reconnaît un Quest par `Build.MODEL` / `Build.DEVICE` (eureka,
+panther, seacliff, hollywood). Tant que ce spike n'a pas rendu son verdict :
+
+- la section Driver GPU recommande le **driver système** sur Quest 3 / 3S, avec la raison
+  affichée ; les packs Turnip restent installables et sélectionnables ;
+- une installation neuve est épinglée à 720p natif, sans MSAA, sans turbo GPU, file à deux
+  images (la VRAM n'est volontairement pas baissée, c'est un plafond dur VMA) ;
+- la ligne `SoC:` d'ARMSX3.log nomme le casque, ex. `Qualcomm SXR2230P (Snapdragon XR2 Gen 2) · Meta Quest 3 (eureka)`.
+
+Quand un Turnip est validé par les essais, la recommandation se change dans
+`HeadsetProfile.driverRecommendation` (une branche du `when`), rien d'autre.
+
 ## 6. Références
 
 - Issue Quest 3 / Turnip (WoWForeverywhere) : https://github.com/YoruDev-Ryland/WoWForeverywhere/issues/2
