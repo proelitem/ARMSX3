@@ -1066,10 +1066,38 @@ open class MainActivityRuntime : ComponentActivity() {
          * without re-querying gamedb. Pass null when launching from a
          * path that doesn't have a GameInfo (Swap/Boot Disc file picker).
          */
-        fun launchGame(uri: String, info: GameInfo? = null, external: Boolean = false) {
+        /** A launch handed to XrEmulationActivity, which boots it once its OpenXR session is up.
+         *  See [launchGame] and [com.armsx2.xr.XrEmulationActivity]. */
+        @Volatile
+        private var pendingXrLaunch: Pair<String, GameInfo?>? = null
+
+        /** Boots the launch parked by [launchGame] for the XR activity, outside the XR routing.
+         *  Called by the XR activity once its session is up, and also when its OpenXR start
+         *  failed and the game should run on the panel instead. False when nothing was parked. */
+        fun resumeXrLaunch(): Boolean {
+            val (uri, info) = pendingXrLaunch ?: return false
+            pendingXrLaunch = null
+            launchGame(uri, info, bypassXr = true)
+            return true
+        }
+
+        fun launchGame(uri: String, info: GameInfo? = null, external: Boolean = false, bypassXr: Boolean = false) {
             if (uri.isBlank()) {
                 println("@@ANDROID_LAUNCH_REJECT@@ reason=blank_uri title=${info?.title ?: ""}")
                 return
+            }
+            // On a headset with the virtual screen on, the game runs in the immersive activity:
+            // Horizon OS composes OpenXR layers only for an activity carrying the VR category, so
+            // the library (a panel) hands the launch over and the XR activity calls back through
+            // resumeXrLaunch() once its session exists. Everything below then runs there.
+            if (!bypassXr && com.armsx2.xr.XrPresentation.shouldRoute(instance)) {
+                val host = instance
+                if (host != null) {
+                    println("@@ANDROID_LAUNCH_XR@@ title=${info?.title ?: "<direct>"}")
+                    pendingXrLaunch = uri to info
+                    com.armsx2.xr.XrEmulationActivity.start(host)
+                    return
+                }
             }
             // A licence-locked title cannot boot — BootGame fails with DecryptionError — so ask
             // for the key instead of spending a whole VM start-up to say so. The library catches

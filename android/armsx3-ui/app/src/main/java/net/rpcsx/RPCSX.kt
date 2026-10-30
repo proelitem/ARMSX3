@@ -122,6 +122,16 @@ class RPCSX {
      */
     external fun surfaceSizeChanged(width: Int, height: Int)
 
+    /**
+     * OpenXR presentation (com.armsx2.xr). xrStart installs the renderer hooks on the given
+     * immersive activity before a game boots; xrStop tears them down after the emulator stopped.
+     * A core built without OpenXR support, or a device without a runtime, answers false and the
+     * Surface path is used as always. Screen metrics in metres; 0 keeps the core's defaults.
+     */
+    external fun xrStart(activity: android.app.Activity, screenDistanceM: Float, screenWidthM: Float, quadWidth: Int, quadHeight: Int): Boolean
+    external fun xrStop()
+    external fun xrActive(): Boolean
+
     /** SIXAXIS motion. Values are the PS3's own 0..1023 range with 512 at rest. */
     external fun setPadSensor(port: Int, x: Int, y: Int, z: Int, g: Int)
 

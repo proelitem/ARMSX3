@@ -45,6 +45,17 @@ The apk lands in app/build/outputs/apk/release/.
 Note that the core library has to be rebuilt and copied again whenever anything
 under rpcs3/ or android/src/ changes. Gradle does not build it for you.
 
+Headsets (Meta Quest)
+---------------------
+
+On a Quest the game is shown on a virtual screen through OpenXR (android/src/xr/ in the
+core, com.armsx2.xr in the app) when "Virtual screen (OpenXR)" is on in the renderer
+settings, which it is by default there. The core side is compiled in by default
+(`-DARMSX3_XR=OFF` to leave it out) and only needs the vendored headers in
+3rdparty/openxr; the loader comes from Maven with the app
+(org.khronos.openxr:openxr_loader_for_android). android/tools/quest3/ holds the driver
+test protocol for the headset.
+
 The Discord Social SDK is proprietary and is not redistributed here. Get it from
 Discord's developer portal and drop it in app/libs/ and
 app/src/main/cpp/discord_sdk/ if you want that feature. The build skips it

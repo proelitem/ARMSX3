@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "instance.h"
+#include "xr_hooks.h"
 
 #include "Emu/system_config.h"
 
@@ -300,7 +301,15 @@ namespace vk
 		instance_info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
 #endif
 
-		if (VkResult result = vkCreateInstance(&instance_info, nullptr, &m_instance); result != VK_SUCCESS)
+		// ARMSX3: an XR runtime creates the instance itself, adding the extensions it needs
+		// (XR_KHR_vulkan_enable2). Everything above still applies: the runtime is handed this
+		// VkInstanceCreateInfo as is, our layers and extensions included.
+		const auto* xr_hooks = vk::xr::get_hooks();
+		const VkResult create_result = (xr_hooks && xr_hooks->create_instance)
+			? xr_hooks->create_instance(&instance_info, &m_instance)
+			: vkCreateInstance(&instance_info, nullptr, &m_instance);
+
+		if (VkResult result = create_result; result != VK_SUCCESS)
 		{
 			if (result == VK_ERROR_LAYER_NOT_PRESENT)
 			{
@@ -370,6 +379,29 @@ namespace vk
 				return priority(a) < priority(b);
 			});
 
+		// ARMSX3: the XR runtime names the GPU the session runs on. VKGSRender takes gpus[0]
+		// unless the user pinned an adapter by name, so put the runtime's choice first; an
+		// explicit adapter setting still wins, as it does everywhere else.
+		if (const auto* xr_hooks = vk::xr::get_hooks(); xr_hooks && xr_hooks->select_physical_device)
+		{
+			if (const VkPhysicalDevice required = xr_hooks->select_physical_device(m_instance); required != VK_NULL_HANDLE)
+			{
+				const auto it = std::find_if(gpus.begin(), gpus.end(), [required](const physical_device& gpu)
+				{
+					return static_cast<VkPhysicalDevice>(gpu) == required;
+				});
+
+				if (it == gpus.end())
+				{
+					rsx_log.error("The XR runtime requires a physical device the Vulkan instance did not enumerate. Using the first adapter instead.");
+				}
+				else if (it != gpus.begin())
+				{
+					std::rotate(gpus.begin(), it, it + 1);
+				}
+			}
+		}
+
 		return gpus;
 	}
 
@@ -392,6 +424,38 @@ namespace vk
 
 	swapchain_base* instance::create_swapchain(display_handle_t window_handle, vk::physical_device& dev)
 	{
+		// ARMSX3: presenting to an XR compositor. There is no VkSurfaceKHR and no window; the
+		// queue families are chosen on capability alone and the runtime's swapchain takes over
+		// from here. Same selection order as the WSI path below, minus the present test.
+		if (const auto* xr_hooks = vk::xr::get_hooks(); xr_hooks && xr_hooks->create_swapchain)
+		{
+			const u32 family_count = dev.get_queue_count();
+			u32 graphics_queue_idx = umax;
+			u32 transfer_queue_idx = umax;
+
+			for (u32 i = 0; i < family_count; ++i)
+			{
+				const auto flags = dev.get_queue_properties(i).queueFlags;
+
+				if (graphics_queue_idx == umax && (flags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) == (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))
+				{
+					graphics_queue_idx = i;
+				}
+				else if (transfer_queue_idx == umax && (flags & (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT)) == (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT))
+				{
+					transfer_queue_idx = i;
+				}
+			}
+
+			if (graphics_queue_idx == umax)
+			{
+				rsx_log.fatal("Failed to find a suitable graphics queue");
+				return nullptr;
+			}
+
+			return xr_hooks->create_swapchain(dev, graphics_queue_idx, transfer_queue_idx);
+		}
+
 		WSI_config surface_config
 		{
 			.supports_automatic_wm_reports = true

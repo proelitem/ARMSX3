@@ -88,6 +88,9 @@
 #include "util/fixed_typemap.hpp"
 #include "util/logs.hpp"
 #include "saf_device.h"
+#ifdef ARMSX3_XR
+#include "xr/xr_session.h"
+#endif
 #include "util/serialization.hpp"
 #include "util/sysinfo.hpp"
 #include <Emu/Io/pad_config.h>
@@ -458,6 +461,16 @@ struct GraphicsFrame : GSFrameBase {
   ANativeWindow *getNativeWindow() const {
     ANativeWindow *result;
 
+#ifdef ARMSX3_XR
+    // Presenting to OpenXR: there is no Surface to wait for, and the Vulkan backend never
+    // builds a VkSurfaceKHR from handle() while the XR hooks are installed (create_swapchain
+    // takes the XR path before touching the window). Waiting here would park the RSX thread
+    // forever, since the immersive activity has no SurfaceView.
+    if (armsx3::xr::active()) {
+      return nullptr;
+    }
+#endif
+
     // Waiting here is normal for a moment at boot -- the RSX thread usually starts before the
     // SurfaceView has been laid out. Waiting here FOREVER is not, and used to be completely
     // silent: surfaceChanged is a one-shot, so a single missed delivery parked this loop for the
@@ -657,6 +670,15 @@ public:
   // window that has arrived but not yet been measured, which only happens before the first
   // surfaceChanged.
   int client_width() override {
+#ifdef ARMSX3_XR
+    // The quad swapchain's extent, so the present framebuffer and the layer agree and the
+    // per-frame resize check in VKGSRender never fires on a Surface size that is not ours.
+    if (armsx3::xr::active()) {
+      u32 w = 0, h = 0;
+      armsx3::xr::recommended_extent(w, h);
+      return static_cast<int>(w);
+    }
+#endif
     if (const u64 packed = g_native_window_size.load()) {
       return static_cast<int>(packed >> 32);
     }
@@ -665,6 +687,13 @@ public:
     return width;
   }
   int client_height() override {
+#ifdef ARMSX3_XR
+    if (armsx3::xr::active()) {
+      u32 w = 0, h = 0;
+      armsx3::xr::recommended_extent(w, h);
+      return static_cast<int>(h);
+    }
+#endif
     if (const u64 packed = g_native_window_size.load()) {
       return static_cast<int>(packed & 0xffffffffu);
     }
@@ -674,6 +703,11 @@ public:
   }
   f64 client_display_rate() override { return 30.f; }
   bool has_alpha() override {
+#ifdef ARMSX3_XR
+    if (armsx3::xr::active()) {
+      return false;
+    }
+#endif
     return ANativeWindow_getFormat(getNativeWindow()) ==
            WINDOW_FORMAT_RGBA_8888;
   }
@@ -6227,6 +6261,15 @@ extern "C" void _rpcsx_surfaceSizeChanged(int width, int height) {
 }
 
 extern "C" bool _rpcsx_surfaceEvent(JNIEnv *env, jobject surface, jint event) {
+#ifdef ARMSX3_XR
+  // The 2D activity's Surface comes and goes underneath the immersive one (Horizon OS pauses
+  // the panel activity when the VR one is up). None of that concerns a renderer presenting to
+  // OpenXR: a surface loss here would otherwise pause the emulator mid-game.
+  if (armsx3::xr::active()) {
+    rpcsx_android.notice("surface event %d ignored: presenting to OpenXR", event);
+    return true;
+  }
+#endif
   rpcsx_android.warning("surface event %p, %d", surface, event);
 
   if (event == 2) {
@@ -8184,6 +8227,67 @@ extern "C" void *_rpcsx_setCustomDriver(void *driverHandle) {
   }
 
   return previous;
+}
+
+// OpenXR presentation (android/src/xr). Same split as the custom driver above: the JNI glue
+// hands over what only the app has -- the activity -- and the core keeps the runtime.
+//
+// xrStart is called on the immersive activity before the game boots; xrStop after the emulator
+// has stopped. Without ARMSX3_XR, or when the loader AAR is absent, xrStart reports false and
+// the renderer presents to the Android Surface as always.
+extern "C" bool _rpcsx_xrStart(JNIEnv *env, jobject activity, float screenDistanceM,
+                               float screenWidthM, int quadWidth, int quadHeight) {
+#ifdef ARMSX3_XR
+  if (env == nullptr || activity == nullptr) {
+    return false;
+  }
+
+  armsx3_capture_java_vm(env);
+
+  JavaVM *vm = g_java_vm.load(std::memory_order_acquire);
+  if (vm == nullptr) {
+    rpcsx_android.error("xrStart: no JavaVM");
+    return false;
+  }
+
+  // Released by xr::stop(); the runtime keeps the activity for the life of the instance.
+  jobject activityRef = env->NewGlobalRef(activity);
+  if (activityRef == nullptr) {
+    return false;
+  }
+
+  armsx3::xr::screen_config config{};
+  if (screenDistanceM > 0.f) config.distance_m = screenDistanceM;
+  if (screenWidthM > 0.f) config.width_m = screenWidthM;
+  if (quadWidth > 0 && quadHeight > 0) {
+    config.width_px = static_cast<u32>(quadWidth);
+    config.height_px = static_cast<u32>(quadHeight);
+  }
+
+  if (!armsx3::xr::start(vm, activityRef, config)) {
+    env->DeleteGlobalRef(activityRef);
+    return false;
+  }
+
+  return true;
+#else
+  (void)env; (void)activity; (void)screenDistanceM; (void)screenWidthM; (void)quadWidth; (void)quadHeight;
+  return false;
+#endif
+}
+
+extern "C" void _rpcsx_xrStop() {
+#ifdef ARMSX3_XR
+  armsx3::xr::stop();
+#endif
+}
+
+extern "C" bool _rpcsx_xrActive() {
+#ifdef ARMSX3_XR
+  return armsx3::xr::active();
+#else
+  return false;
+#endif
 }
 
 #pragma GCC diagnostic pop

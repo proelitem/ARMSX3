@@ -321,6 +321,10 @@ dependencies {
     // Remote play (com.armsx2.remoteplay): video, audio and player 2's input between two devices.
     implementation(libs.streamWebrtc)
 
+    // OpenXR presentation on standalone headsets (com.armsx2.xr): the Khronos loader .so and
+    // the manifest entries that let it find the runtime. Inert on a phone.
+    implementation(libs.openxrLoader)
+
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)

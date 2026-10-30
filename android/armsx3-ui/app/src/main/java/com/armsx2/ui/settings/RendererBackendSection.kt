@@ -14,7 +14,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.MutableState
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.armsx2.CustomDriver
@@ -46,6 +48,25 @@ fun RendererBackendSection(state: MutableState<Settings>) {
         },
         notDefault = settings.notDefault { it.renderer },
     )
+
+    // Headsets only: the PS3's picture on a virtual screen through OpenXR, or on the 2D panel.
+    // A preference rather than a Settings field: it describes the device, not a title.
+    if (com.armsx2.HeadsetProfile.isHeadset()) {
+        SettingsDivider()
+        val context = androidx.compose.ui.platform.LocalContext.current
+        var virtualScreen by androidx.compose.runtime.remember {
+            androidx.compose.runtime.mutableStateOf(com.armsx2.xr.XrPresentation.enabled(context))
+        }
+        com.armsx2.ui.common.SettingSwitchRow(
+            title = str("backend.xr.virtualScreen.label"),
+            description = str("backend.xr.virtualScreen.description"),
+            checked = virtualScreen,
+            onCheckedChange = { on ->
+                virtualScreen = on
+                com.armsx2.xr.XrPresentation.setEnabled(context, on)
+            },
+        )
+    }
 
     if (settings.renderer == "vulkan") {
         SettingsDivider()

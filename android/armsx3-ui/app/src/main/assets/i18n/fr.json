@@ -285,6 +285,8 @@
  "backend.glDriver.label": "Pilote OpenGL",
  "backend.gpuDriver.description": "Remplacez le pilote système Vulkan par Mesa Turnip ou un autre pilote Adreno, ou sur Mali par un pack PanVK communautaire conçu pour votre appareil. Turnip est recommandé pour les appareils Adreno-6XX sur des pilotes OEM obsolètes.",
  "backend.gpuDriver.label": "Pilote GPU",
+ "backend.xr.virtualScreen.label": "Écran virtuel (OpenXR)",
+ "backend.xr.virtualScreen.description": "Affiche le jeu sur un grand écran devant vous via le compositeur du casque, au lieu du panneau plat. Les jeux avec sortie 3D native auront une image par œil dans une prochaine version.",
  "backend.graphicsApi.label": "API graphique",
  "backend.renderer.auto": "Automatique",
  "backend.renderer.software": "Logiciel",

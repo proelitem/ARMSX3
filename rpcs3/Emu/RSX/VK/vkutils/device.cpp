@@ -5,6 +5,7 @@
 #include "Utilities/File.h"
 #include "util/sysinfo.hpp"
 #include "instance.h"
+#include "xr_hooks.h"
 #include "util/logs.hpp"
 #include "Emu/system_config.h"
 #include <vulkan/vulkan_core.h>
@@ -1336,7 +1337,15 @@ namespace vk
 			device.pNext = &provoking_vertex_info;
 		}
 
-		if (auto error = vkCreateDevice(*pgpu, &device, nullptr, &dev))
+		// ARMSX3: through the XR runtime when one is presenting (xrCreateVulkanDeviceKHR). The
+		// runtime appends the device extensions its swapchain images need; the queue and feature
+		// setup above is what it receives.
+		const auto* xr_hooks = vk::xr::get_hooks();
+		const VkResult device_result = (xr_hooks && xr_hooks->create_device)
+			? xr_hooks->create_device(*pgpu, &device, &dev)
+			: vkCreateDevice(*pgpu, &device, nullptr, &dev);
+
+		if (auto error = device_result)
 		{
 			dump_debug_info(requested_extensions, enabled_features);
 			vk::die_with_error(error);

@@ -175,6 +175,7 @@ def components():
 
         # The app's own native libraries.
         c("libadrenotools", "BSD-2-Clause", lic("libadrenotools-LICENSE.txt")),
+        c("OpenXR SDK (headers and Android loader)", "Apache-2.0", lic("openxr-LICENSE.txt")),
         c("Flurry", "BSD-3-Clause",
           block("android/armsx3-ui/app/src/main/cpp/flurry/flurry.c", r"Copyright \(c\) 2002, Calum Robinson", r"SUCH DAMAGE")),
         c("Really Slick Screensavers", "GPL-2.0-or-later", text_id="gpl-2.0",

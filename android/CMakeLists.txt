@@ -80,6 +80,25 @@ set_target_properties(rpcsx-android PROPERTIES OUTPUT_NAME armsx3-core)
 
 target_compile_features(rpcsx-android PRIVATE cxx_std_23)
 
+# ---------------------------------------------------------------------------
+# OpenXR presentation (Meta Quest and other standalone headsets)
+# ---------------------------------------------------------------------------
+#
+# Header-only dependency: 3rdparty/openxr holds the Khronos headers, and the loader
+# (libopenxr_loader.so) is loaded at run time from the APK, where the Gradle build puts it from
+# the org.khronos.openxr AAR. Nothing links against it, so a phone build is unaffected and a
+# headset build without the AAR reports "OpenXR unavailable" instead of failing to load.
+option(ARMSX3_XR "Present through OpenXR on standalone headsets" ON)
+
+if(ARMSX3_XR)
+    # Compiled in by default; the runtime loader is dlopen()ed, so a device without one just
+    # does not get it. See src/xr/xr_session.h.
+    target_sources(rpcsx-android PRIVATE src/xr/xr_session.cpp)
+    target_include_directories(rpcsx-android PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/openxr/include)
+    target_compile_definitions(rpcsx-android PRIVATE ARMSX3_XR=1)
+    message(STATUS "ARMSX3: OpenXR presentation ON")
+endif()
+
 # The librashader upscaler lives in rpcs3/Emu/RSX/VK/, i.e. it compiles into
 # rpcs3_emu -- not into this target -- so the header search path has to be added
 # there. This directory is processed after add_subdirectory(rpcs3), so the target

@@ -69,6 +69,10 @@ struct RPCSXApi {
   std::string (*getCurrentTrophyName)();
   bool (*surfaceEvent)(JNIEnv *env, jobject surface, jint event);
   void (*surfaceSizeChanged)(int width, int height);
+  // OpenXR presentation (optional: a core built without ARMSX3_XR lacks all three).
+  bool (*xrStart)(JNIEnv *env, jobject activity, float screenDistanceM, float screenWidthM, int quadWidth, int quadHeight);
+  void (*xrStop)();
+  bool (*xrActive)();
   void (*setPadSensor)(int port, int x, int y, int z, int g);
   int (*getPadRumble)(int port);
   void (*setThermals)(float cpu, float gpu, float battery, bool show);
@@ -248,6 +252,10 @@ struct RPCSXLibrary : RPCSXApi {
     result.getCurrentTrophyName = reinterpret_cast<decltype(getCurrentTrophyName)>(dlsym(handle, "_rpcsx_getCurrentTrophyName"));
     result.surfaceEvent = reinterpret_cast<decltype(surfaceEvent)>(dlsym(handle, "_rpcsx_surfaceEvent"));
     result.surfaceSizeChanged = reinterpret_cast<decltype(surfaceSizeChanged)>(dlsym(handle, "_rpcsx_surfaceSizeChanged"));
+    // Optional: a core without OpenXR support presents to the Surface, as it always did.
+    result.xrStart = reinterpret_cast<decltype(xrStart)>(dlsym(handle, "_rpcsx_xrStart"));
+    result.xrStop = reinterpret_cast<decltype(xrStop)>(dlsym(handle, "_rpcsx_xrStop"));
+    result.xrActive = reinterpret_cast<decltype(xrActive)>(dlsym(handle, "_rpcsx_xrActive"));
     result.setPadSensor = reinterpret_cast<decltype(setPadSensor)>(dlsym(handle, "_rpcsx_setPadSensor"));
     result.getPadRumble = reinterpret_cast<decltype(getPadRumble)>(dlsym(handle, "_rpcsx_getPadRumble"));
     result.setThermals = reinterpret_cast<decltype(setThermals)>(dlsym(handle, "_rpcsx_setThermals"));
@@ -869,6 +877,33 @@ Java_net_rpcsx_RPCSX_getCurrentTrophyName(JNIEnv *env, jobject) {
   }
 
   return wrap(env, rpcsxLib.getCurrentTrophyName());
+}
+
+// OpenXR presentation. The activity is the immersive one (XrEmulationActivity): the runtime
+// composes for the activity it is given, and Horizon OS only does so for an activity carrying
+// the VR intent category.
+extern "C" JNIEXPORT jboolean JNICALL Java_net_rpcsx_RPCSX_xrStart(
+    JNIEnv *env, jobject, jobject activity, jfloat screenDistanceM, jfloat screenWidthM,
+    jint quadWidth, jint quadHeight) {
+  if (rpcsxLib.xrStart == nullptr) {
+    __android_log_print(ANDROID_LOG_WARN, "RPCSX-UI",
+                        "xrStart: this core has no OpenXR support");
+    return JNI_FALSE;
+  }
+
+  return rpcsxLib.xrStart(env, activity, screenDistanceM, screenWidthM, quadWidth, quadHeight)
+             ? JNI_TRUE
+             : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT void JNICALL Java_net_rpcsx_RPCSX_xrStop(JNIEnv *, jobject) {
+  if (rpcsxLib.xrStop != nullptr) {
+    rpcsxLib.xrStop();
+  }
+}
+
+extern "C" JNIEXPORT jboolean JNICALL Java_net_rpcsx_RPCSX_xrActive(JNIEnv *, jobject) {
+  return (rpcsxLib.xrActive != nullptr && rpcsxLib.xrActive()) ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL Java_net_rpcsx_RPCSX_surfaceEvent(
