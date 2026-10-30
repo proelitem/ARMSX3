@@ -112,6 +112,7 @@ const stereo_config::stereo_matrices& stereo_config::matrices() const
 	{
 	case stereo_render_mode_options::disabled:
 	case stereo_render_mode_options::side_by_side:
+	case stereo_render_mode_options::side_by_side_full:
 	case stereo_render_mode_options::over_under:
 	case stereo_render_mode_options::interlaced:
 		break;

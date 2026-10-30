@@ -456,6 +456,13 @@ fun RendererTab(state: MutableState<Settings>) {
             ) { apply(s.copy(ps3 = s.ps3.copy(multithreadedRsx = it))) }
             SettingsDivider()
             ToggleRow(
+                str("renderer.stereo3d.label"),
+                s.ps3.stereo3d,
+                description = str("renderer.stereo3d.description"),
+                notDefault = s.notDefault { it.ps3.stereo3d },
+            ) { apply(s.copy(ps3 = s.ps3.copy(stereo3d = it))) }
+            SettingsDivider()
+            ToggleRow(
                 str("renderer.disableZcull.label"),
                 s.ps3.disableZcull,
                 description = str("renderer.disableZcull.description"),

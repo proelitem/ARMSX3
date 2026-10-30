@@ -401,6 +401,10 @@ enum class stereo_render_mode_options
 	anaglyph_trioscopic,
 	anaglyph_amber_blue,
 	anaglyph_custom,
+	// Full side-by-side: each eye at the full output width, the picture twice as wide as one
+	// eye's aspect. For 3D televisions that take full-SBS, and for OpenXR, where the two halves
+	// become one quad layer per eye. Appended so saved configurations keep their values.
+	side_by_side_full,
 };
 
 enum class xfloat_accuracy

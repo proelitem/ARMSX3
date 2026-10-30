@@ -52,5 +52,10 @@ namespace armsx3::xr
 
 	// The extent the quad swapchain is created at. What GSFrameBase::client_width/height
 	// report while active(), so the present framebuffer and the layer agree.
-	void recommended_extent(u32& width, u32& height);
+	//
+	// stereo_output: the game is outputting one image per eye (rsx::avconf::stereo_enabled).
+	// The swapchain is then twice as wide, the renderer composes the eyes side by side at full
+	// size (stereo_render_mode_options::side_by_side_full, set by the swapchain), and present()
+	// hands each half to its eye as its own quad layer.
+	void recommended_extent(u32& width, u32& height, bool stereo_output);
 }

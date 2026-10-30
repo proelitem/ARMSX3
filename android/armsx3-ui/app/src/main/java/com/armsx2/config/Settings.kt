@@ -154,6 +154,14 @@ data class Ps3Settings(
     val multithreadedRsx: Boolean = false,
     val disableZcull: Boolean = false,
     /**
+     * "3D Display Enabled": tell games the display takes stereoscopic 3D, so the ones that
+     * support it render both eyes (Wipeout HD, Super Stardust HD, Killzone 3, the Arkham
+     * games, GT5/6 and some fifty others). Off by default: it halves the frame budget on
+     * every title that honours it, and only a headset (com.armsx2.xr) or a 3D display can
+     * show the result. Needs the output at 720p, which is where the two eyes are packed.
+     */
+    val stereo3d: Boolean = false,
+    /**
      * Relaxed ZCULL sync. OFF.
      *
      * Tried as a fix for 28k "Dubious query data pushed to cond render" stalls.
@@ -1186,6 +1194,7 @@ data class Settings(
         put("PS3/Video", "Read Depth Buffer", "bool", ps3.readDepthBuffer.toString())
         put("PS3/Video", "Strict Rendering Mode", "bool", ps3.strictRendering.toString())
         put("PS3/Video", "Multithreaded RSX", "bool", ps3.multithreadedRsx.toString())
+        put("PS3/Video", "3D Display Enabled", "bool", ps3.stereo3d.toString())
         put("PS3/Video", "Disable ZCull Occlusion Queries", "bool", ps3.disableZcull.toString())
         put("PS3/Video", "Relaxed ZCULL Sync", "bool", ps3.relaxedZcull.toString())
         put("PS3/Video", "Use GPU texture scaling", "bool", ps3.gpuTextureScaling.toString())
@@ -2207,6 +2216,7 @@ data class Settings(
         put("ps3ReadDepthBuffer", ps3.readDepthBuffer)
         put("ps3StrictRendering", ps3.strictRendering)
         put("ps3MultithreadedRsx", ps3.multithreadedRsx)
+        put("ps3Stereo3d", ps3.stereo3d)
         put("ps3DisableZcull", ps3.disableZcull)
         put("ps3RelaxedZcull", ps3.relaxedZcull)
         put("ps3GpuTextureScaling", ps3.gpuTextureScaling)
@@ -2579,6 +2589,7 @@ data class Settings(
                     readDepthBuffer = json.optBoolean("ps3ReadDepthBuffer", def.ps3.readDepthBuffer),
                     strictRendering = json.optBoolean("ps3StrictRendering", def.ps3.strictRendering),
                     multithreadedRsx = json.optBoolean("ps3MultithreadedRsx", def.ps3.multithreadedRsx),
+                    stereo3d = json.optBoolean("ps3Stereo3d", def.ps3.stereo3d),
                     disableZcull = json.optBoolean("ps3DisableZcull", def.ps3.disableZcull),
                     relaxedZcull = json.optBoolean("ps3RelaxedZcull", def.ps3.relaxedZcull),
                     gpuTextureScaling = json.optBoolean("ps3GpuTextureScaling", def.ps3.gpuTextureScaling),
@@ -2925,6 +2936,7 @@ data class Settings(
             if (current.ps3.readDepthBuffer != base.ps3.readDepthBuffer) j.put("ps3ReadDepthBuffer", current.ps3.readDepthBuffer)
             if (current.ps3.strictRendering != base.ps3.strictRendering) j.put("ps3StrictRendering", current.ps3.strictRendering)
             if (current.ps3.multithreadedRsx != base.ps3.multithreadedRsx) j.put("ps3MultithreadedRsx", current.ps3.multithreadedRsx)
+            if (current.ps3.stereo3d != base.ps3.stereo3d) j.put("ps3Stereo3d", current.ps3.stereo3d)
             if (current.ps3.disableZcull != base.ps3.disableZcull) j.put("ps3DisableZcull", current.ps3.disableZcull)
             if (current.ps3.relaxedZcull != base.ps3.relaxedZcull) j.put("ps3RelaxedZcull", current.ps3.relaxedZcull)
             if (current.ps3.gpuTextureScaling != base.ps3.gpuTextureScaling) j.put("ps3GpuTextureScaling", current.ps3.gpuTextureScaling)
@@ -3247,6 +3259,7 @@ data class Settings(
                     readDepthBuffer = if (overrides.has("ps3ReadDepthBuffer")) overrides.getBoolean("ps3ReadDepthBuffer") else base.ps3.readDepthBuffer,
                     strictRendering = if (overrides.has("ps3StrictRendering")) overrides.getBoolean("ps3StrictRendering") else base.ps3.strictRendering,
                     multithreadedRsx = if (overrides.has("ps3MultithreadedRsx")) overrides.getBoolean("ps3MultithreadedRsx") else base.ps3.multithreadedRsx,
+                    stereo3d = if (overrides.has("ps3Stereo3d")) overrides.getBoolean("ps3Stereo3d") else base.ps3.stereo3d,
                     disableZcull = if (overrides.has("ps3DisableZcull")) overrides.getBoolean("ps3DisableZcull") else base.ps3.disableZcull,
                     relaxedZcull = if (overrides.has("ps3RelaxedZcull")) overrides.getBoolean("ps3RelaxedZcull") else base.ps3.relaxedZcull,
                     gpuTextureScaling = if (overrides.has("ps3GpuTextureScaling")) overrides.getBoolean("ps3GpuTextureScaling") else base.ps3.gpuTextureScaling,

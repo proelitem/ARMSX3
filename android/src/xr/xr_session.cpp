@@ -4,6 +4,7 @@
 #include "xr_session.h"
 
 #include "Emu/RSX/VK/VKHelpers.h"
+#include "Emu/system_config.h"
 #include "Emu/RSX/VK/vkutils/device.h"
 #include "Emu/RSX/VK/vkutils/swapchain.h"
 #include "Emu/RSX/VK/vkutils/xr_hooks.h"
@@ -573,8 +574,20 @@ namespace armsx3::xr
 				m_frame_begun = false;
 				m_image_acquired = false;
 
-				xr_log.success("OpenXR swapchain %ux%u, %u images, format %lld (renderer views as %d)",
-					m_width, m_height, ::size32(swapchain_images), static_cast<long long>(m_xr_format), static_cast<int>(m_surface_format));
+				// How the two eyes of a 3D game are laid out in the target: next to each other at
+				// full size, so present() can give each half to its eye. Set here, after the
+				// configuration was loaded for this boot (anything set before Emu.Load is
+				// overwritten by it), and re-asserted on every rebuild since the home menu can
+				// change it. The renderer reads it per frame.
+				if (g_cfg.video.stereo_render_mode != stereo_render_mode_options::side_by_side_full)
+				{
+					g_cfg.video.stereo_render_mode.set(stereo_render_mode_options::side_by_side_full);
+					xr_log.notice("3D Display Mode set to Side-by-Side (Full) for per-eye presentation");
+				}
+
+				xr_log.success("OpenXR swapchain %ux%u, %u images, format %lld (renderer views as %d)%s",
+					m_width, m_height, ::size32(swapchain_images), static_cast<long long>(m_xr_format), static_cast<int>(m_surface_format),
+					is_stereo_layout() ? ", one half per eye" : "");
 				return true;
 			}
 
@@ -682,6 +695,14 @@ namespace armsx3::xr
 			void end_frame(vk::command_buffer& /*cmd*/, u32 /*index*/) override
 			{}
 
+			// True when the swapchain was built at the stereo extent (recommended_extent with
+			// stereo_output): the renderer has composed the left eye in the left half and the
+			// right eye in the right half.
+			bool is_stereo_layout() const
+			{
+				return m_width >= 2 * g_state.screen.width_px && m_width % 2 == 0;
+			}
+
 			VkResult present(VkSemaphore semaphore, u32 index) override
 			{
 				// Consume the renderer's "rendering done" semaphore. Queue order then puts the
@@ -711,30 +732,58 @@ namespace armsx3::xr
 					m_image_acquired = false;
 				}
 
-				// One quad, both eyes, straight ahead at the configured distance. The LOCAL space
-				// is gravity-aligned and re-centred by the system's recentre gesture, so the
-				// screen behaves like a cinema screen rather than following the head.
+				// The screen: a quad straight ahead at the configured distance, in the LOCAL space,
+				// which is gravity-aligned and re-centred by the system's recentre gesture, so it
+				// behaves like a cinema screen rather than following the head.
+				//
+				// Mono: one quad, both eyes, the whole image. Stereo (a 3D game, swapchain at the
+				// double extent): two quads at the same place, one per eye, each showing its half.
+				// The same physical quad seen by each eye with its own image is exactly what a 3D
+				// cinema does; the runtime handles the per-eye projection.
+				const bool stereo = is_stereo_layout();
+				const u32 eye_width = stereo ? m_width / 2 : m_width;
 				const float width_m = g_state.screen.width_m;
-				const float height_m = width_m * static_cast<float>(m_height) / static_cast<float>(std::max<u32>(m_width, 1));
+				const float height_m = width_m * static_cast<float>(m_height) / static_cast<float>(std::max<u32>(eye_width, 1));
 
-				XrCompositionLayerQuad quad{ XR_TYPE_COMPOSITION_LAYER_QUAD };
-				quad.layerFlags = 0;
-				quad.space = m_space;
-				quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-				quad.subImage.swapchain = m_swapchain;
-				quad.subImage.imageRect.offset = { 0, 0 };
-				quad.subImage.imageRect.extent = { static_cast<int32_t>(m_width), static_cast<int32_t>(m_height) };
-				quad.subImage.imageArrayIndex = 0;
-				quad.pose.orientation = { 0.f, 0.f, 0.f, 1.f };
-				quad.pose.position = { 0.f, 0.f, -g_state.screen.distance_m };
-				quad.size = { width_m, height_m };
+				XrCompositionLayerQuad quads[2];
+				u32 layer_count = 0;
 
-				const XrCompositionLayerBaseHeader* layers[] = { reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad) };
+				const auto add_quad = [&](XrEyeVisibility eye, u32 x_offset)
+				{
+					XrCompositionLayerQuad& quad = quads[layer_count++];
+					quad = XrCompositionLayerQuad{ XR_TYPE_COMPOSITION_LAYER_QUAD };
+					quad.layerFlags = 0;
+					quad.space = m_space;
+					quad.eyeVisibility = eye;
+					quad.subImage.swapchain = m_swapchain;
+					quad.subImage.imageRect.offset = { static_cast<int32_t>(x_offset), 0 };
+					quad.subImage.imageRect.extent = { static_cast<int32_t>(eye_width), static_cast<int32_t>(m_height) };
+					quad.subImage.imageArrayIndex = 0;
+					quad.pose.orientation = { 0.f, 0.f, 0.f, 1.f };
+					quad.pose.position = { 0.f, 0.f, -g_state.screen.distance_m };
+					quad.size = { width_m, height_m };
+				};
+
+				if (stereo)
+				{
+					add_quad(XR_EYE_VISIBILITY_LEFT, 0);
+					add_quad(XR_EYE_VISIBILITY_RIGHT, eye_width);
+				}
+				else
+				{
+					add_quad(XR_EYE_VISIBILITY_BOTH, 0);
+				}
+
+				const XrCompositionLayerBaseHeader* layers[2] =
+				{
+					reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quads[0]),
+					reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quads[1]),
+				};
 
 				XrFrameEndInfo end_info{ XR_TYPE_FRAME_END_INFO };
 				end_info.displayTime = m_frame_state.predictedDisplayTime;
 				end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-				end_info.layerCount = 1;
+				end_info.layerCount = layer_count;
 				end_info.layers = layers;
 
 				const XrResult result = g_state.fn.xrEndFrame(m_session, &end_info);
@@ -1075,9 +1124,9 @@ namespace armsx3::xr
 		return g_state.active.load();
 	}
 
-	void recommended_extent(u32& width, u32& height)
+	void recommended_extent(u32& width, u32& height, bool stereo_output)
 	{
-		width = g_state.screen.width_px;
+		width = stereo_output ? g_state.screen.width_px * 2 : g_state.screen.width_px;
 		height = g_state.screen.height_px;
 	}
 }

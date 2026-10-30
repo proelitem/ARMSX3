@@ -217,8 +217,18 @@ namespace rsx
 		const auto virtual_output = video_frame_size();
 		const auto area1 = convert_aspect_ratio_impl(virtual_output, source_aspect);
 
-		// Fit the virtual display into the physical display
-		const auto area2 = convert_aspect_ratio_impl(output_dimensions, get_aspect_ratio());
+		// Fit the virtual display into the physical display.
+		//
+		// Full side-by-side puts both eyes next to each other at full size, so the picture the
+		// output has to fit is twice as wide as the display aspect; the shader then splits the
+		// viewport in two. Plain side-by-side keeps the display aspect and halves each eye.
+		double display_aspect = get_aspect_ratio();
+		if (stereo_enabled && g_cfg.video.stereo_render_mode == stereo_render_mode_options::side_by_side_full)
+		{
+			display_aspect *= 2.;
+		}
+
+		const auto area2 = convert_aspect_ratio_impl(output_dimensions, display_aspect);
 
 		// Merge the two regions. Since aspect ratio was conserved between both transforms, a simple scale can be used
 		const double stretch_x = 1. * area2.width() / virtual_output.width;

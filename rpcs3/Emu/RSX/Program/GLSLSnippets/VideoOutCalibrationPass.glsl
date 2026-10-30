@@ -20,6 +20,8 @@ layout(location=0) out vec4 ocol;
 #define STEREO_MODE_ANAGLYPH_TRIOSCOPIC 8
 #define STEREO_MODE_ANAGLYPH_AMBER_BLUE 9
 #define STEREO_MODE_ANAGLYPH_CUSTOM 10
+// Same split as SIDE_BY_SIDE; the host sizes the viewport twice as wide (rsx_utils.cpp).
+#define STEREO_MODE_SIDE_BY_SIDE_FULL 11
 
 #define TRUE 1
 #define FALSE 0
@@ -98,6 +100,7 @@ vec4 read_source()
 			case STEREO_MODE_ANAGLYPH_CUSTOM:
 				return anaglyph_single_image();
 			case STEREO_MODE_SIDE_BY_SIDE:
+			case STEREO_MODE_SIDE_BY_SIDE_FULL:
 				return (tc0.x < 0.5)
 					? texture(fs0, tc0 * sbs_single_matrix)
 					: texture(fs0, (tc0 * sbs_single_matrix) + vec2(-1.f, 0.510204f));
@@ -127,6 +130,7 @@ vec4 read_source()
 			case STEREO_MODE_ANAGLYPH_CUSTOM:
 				return anaglyph_stereo_image();
 			case STEREO_MODE_SIDE_BY_SIDE:
+			case STEREO_MODE_SIDE_BY_SIDE_FULL:
 				return (tc0.x < 0.5)
 					? texture(fs0, (tc0 * sbs_multi_matrix))
 					: texture(fs1, (tc0 * sbs_multi_matrix) + vec2(-1.f, 0.f));

@@ -90,6 +90,7 @@
 #include "saf_device.h"
 #ifdef ARMSX3_XR
 #include "xr/xr_session.h"
+#include "Emu/RSX/Utils/rsx_utils.h"
 #endif
 #include "util/serialization.hpp"
 #include "util/sysinfo.hpp"
@@ -669,13 +670,22 @@ public:
   // Take the size Android reported for the surface. Falling back to the window is for the
   // window that has arrived but not yet been measured, which only happens before the first
   // surfaceChanged.
+#ifdef ARMSX3_XR
+  // Whether the game is outputting one image per eye. Read where the renderer reads it (it is
+  // the renderer that calls client_width/height, from its own thread, while a game runs), so
+  // a game switching 3D on or off changes the reported extent and the swapchain follows.
+  static bool xrStereoOutput() {
+    return !Emu.IsStopped() && g_fxo->get<rsx::avconf>().stereo_enabled;
+  }
+#endif
+
   int client_width() override {
 #ifdef ARMSX3_XR
     // The quad swapchain's extent, so the present framebuffer and the layer agree and the
     // per-frame resize check in VKGSRender never fires on a Surface size that is not ours.
     if (armsx3::xr::active()) {
       u32 w = 0, h = 0;
-      armsx3::xr::recommended_extent(w, h);
+      armsx3::xr::recommended_extent(w, h, xrStereoOutput());
       return static_cast<int>(w);
     }
 #endif
@@ -690,7 +700,7 @@ public:
 #ifdef ARMSX3_XR
     if (armsx3::xr::active()) {
       u32 w = 0, h = 0;
-      armsx3::xr::recommended_extent(w, h);
+      armsx3::xr::recommended_extent(w, h, xrStereoOutput());
       return static_cast<int>(h);
     }
 #endif
