@@ -5,6 +5,7 @@
 
 #include "Emu/RSX/VK/VKHelpers.h"
 #include "Emu/system_config.h"
+#include "Emu/Io/pad_types.h"
 #include "Emu/RSX/VK/vkutils/device.h"
 #include "Emu/RSX/VK/vkutils/swapchain.h"
 #include "Emu/RSX/VK/vkutils/xr_hooks.h"
@@ -23,13 +24,21 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <mutex>
 #include <thread>
 #include <vector>
 
 LOG_CHANNEL(xr_log, "XR");
+
+// The virtual pad's door, in rpcsx-android.cpp. Declared rather than included: those exports
+// have no header, and this is the same contract the JNI glue uses.
+extern "C" bool _rpcsx_overlayPadData(int port, int digital1, int digital2, int leftStickX, int leftStickY, int rightStickX, int rightStickY);
+extern "C" bool _rpcsx_overlayPadPressure(int port, const int* values, int count);
+extern "C" int _rpcsx_getPadRumble(int port);
 
 namespace armsx3::xr
 {
@@ -64,6 +73,19 @@ namespace armsx3::xr
 	X(xrBeginFrame) \
 	X(xrEndFrame) \
 	X(xrPollEvent) \
+	X(xrStringToPath) \
+	X(xrCreateActionSet) \
+	X(xrDestroyActionSet) \
+	X(xrCreateAction) \
+	X(xrDestroyAction) \
+	X(xrSuggestInteractionProfileBindings) \
+	X(xrAttachSessionActionSets) \
+	X(xrSyncActions) \
+	X(xrGetActionStateBoolean) \
+	X(xrGetActionStateFloat) \
+	X(xrGetActionStateVector2f) \
+	X(xrApplyHapticFeedback) \
+	X(xrStopHapticFeedback) \
 	X(xrGetVulkanGraphicsRequirements2KHR) \
 	X(xrCreateVulkanInstanceKHR) \
 	X(xrGetVulkanGraphicsDevice2KHR) \
@@ -226,6 +248,443 @@ namespace armsx3::xr
 			return vk_result;
 		}
 
+		// ---- Touch controllers -> PS3 pad ----------------------------------------------------
+		//
+		// The controllers reach the game through the same door as the touch overlay and the
+		// Bluetooth pads: the virtual pad on port 0, fed by _rpcsx_overlayPadData (rpcsx-android.cpp).
+		// Polled once per presented frame from the RSX thread, which is where the session's frame
+		// loop already runs; only a changed state is pushed, so a Bluetooth pad held in the other
+		// hand is not overwritten every frame by an idle Touch controller.
+		//
+		// Mapping (the left menu button is the shift key; the right system button is the OS's):
+		//   thumbsticks            left / right analog stick
+		//   A B X Y                Cross Circle Square Triangle
+		//   triggers               L2 / R2, with pressure
+		//   grips                  L1 / R1
+		//   thumbstick clicks      L3 / R3
+		//   menu, tapped           Start
+		//   menu held + left stick D-pad
+		//   menu held + A          Select
+		//   menu held + B          PS (the core's home menu)
+		//   rumble                 both controllers, large motor amplitude
+
+		struct touch_input
+		{
+			enum hand : u32 { left = 0, right = 1 };
+
+			XrActionSet action_set = XR_NULL_HANDLE;
+			XrPath hand_path[2]{};
+
+			// Per hand (subaction paths).
+			XrAction thumbstick = XR_NULL_HANDLE;
+			XrAction thumbstick_click = XR_NULL_HANDLE;
+			XrAction trigger = XR_NULL_HANDLE;
+			XrAction squeeze = XR_NULL_HANDLE;
+			XrAction haptic = XR_NULL_HANDLE;
+			// One controller each.
+			XrAction button_a = XR_NULL_HANDLE;
+			XrAction button_b = XR_NULL_HANDLE;
+			XrAction button_x = XR_NULL_HANDLE;
+			XrAction button_y = XR_NULL_HANDLE;
+			XrAction button_menu = XR_NULL_HANDLE;
+
+			bool attached = false;
+
+			// Menu button tap-vs-shift bookkeeping, in XrTime (ns).
+			bool menu_was_down = false;
+			XrTime menu_down_since = 0;
+			bool menu_used_as_shift = false;
+			XrTime start_pulse_until = 0;
+
+			// What was last pushed to the pad, so only changes are sent.
+			int sent_digital1 = -1;
+			int sent_digital2 = -1;
+			int sent_stick[4] = { -1, -1, -1, -1 };
+			int sent_pressure[12] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
+			bool haptic_active = false;
+
+			static constexpr XrTime k_tap_ns = 400'000'000;    // a menu press shorter than this is Start
+			static constexpr XrTime k_pulse_ns = 150'000'000;  // how long Start stays pressed after the tap
+			static constexpr float k_deadzone = 0.12f;
+			static constexpr float k_dpad_threshold = 0.5f;
+			static constexpr float k_grip_threshold = 0.5f;
+			static constexpr float k_trigger_threshold = 0.08f;
+
+			XrPath path(const char* s) const
+			{
+				XrPath result = XR_NULL_PATH;
+				if (!check(g_state.fn.xrStringToPath(g_state.instance, s, &result), "xrStringToPath"))
+				{
+					return XR_NULL_PATH;
+				}
+				return result;
+			}
+
+			bool make_action(XrAction& out, const char* name, const char* localized, XrActionType type, bool per_hand)
+			{
+				XrActionCreateInfo info{ XR_TYPE_ACTION_CREATE_INFO };
+				info.actionType = type;
+				std::strncpy(info.actionName, name, XR_MAX_ACTION_NAME_SIZE - 1);
+				std::strncpy(info.localizedActionName, localized, XR_MAX_LOCALIZED_ACTION_NAME_SIZE - 1);
+				info.countSubactionPaths = per_hand ? 2 : 0;
+				info.subactionPaths = per_hand ? hand_path : nullptr;
+
+				if (!check(g_state.fn.xrCreateAction(action_set, &info, &out), name))
+				{
+					out = XR_NULL_HANDLE;
+					return false;
+				}
+				return true;
+			}
+
+			bool create(XrSession session)
+			{
+				if (!g_state.fn.xrCreateActionSet || !g_state.fn.xrSyncActions)
+				{
+					xr_log.warning("Touch controllers: the runtime lacks the action entry points; no controller input.");
+					return false;
+				}
+
+				XrActionSetCreateInfo set_info{ XR_TYPE_ACTION_SET_CREATE_INFO };
+				std::strncpy(set_info.actionSetName, "gameplay", XR_MAX_ACTION_SET_NAME_SIZE - 1);
+				std::strncpy(set_info.localizedActionSetName, "Gameplay", XR_MAX_LOCALIZED_ACTION_SET_NAME_SIZE - 1);
+				set_info.priority = 0;
+				if (!check(g_state.fn.xrCreateActionSet(g_state.instance, &set_info, &action_set), "xrCreateActionSet"))
+				{
+					action_set = XR_NULL_HANDLE;
+					return false;
+				}
+
+				hand_path[left] = path("/user/hand/left");
+				hand_path[right] = path("/user/hand/right");
+
+				bool ok = true;
+				ok &= make_action(thumbstick, "thumbstick", "Thumbstick", XR_ACTION_TYPE_VECTOR2F_INPUT, true);
+				ok &= make_action(thumbstick_click, "thumbstick_click", "Thumbstick click", XR_ACTION_TYPE_BOOLEAN_INPUT, true);
+				ok &= make_action(trigger, "trigger", "Trigger", XR_ACTION_TYPE_FLOAT_INPUT, true);
+				ok &= make_action(squeeze, "squeeze", "Grip", XR_ACTION_TYPE_FLOAT_INPUT, true);
+				ok &= make_action(haptic, "haptic", "Rumble", XR_ACTION_TYPE_VIBRATION_OUTPUT, true);
+				ok &= make_action(button_a, "button_a", "A", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
+				ok &= make_action(button_b, "button_b", "B", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
+				ok &= make_action(button_x, "button_x", "X", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
+				ok &= make_action(button_y, "button_y", "Y", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
+				ok &= make_action(button_menu, "button_menu", "Menu", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
+				if (!ok)
+				{
+					return false;
+				}
+
+				// Bindings for the Touch profile. Quest 3's controllers also answer to the
+				// touch_controller_plus profile, but every Meta runtime maps this one onto them.
+				const XrActionSuggestedBinding bindings[] =
+				{
+					{ thumbstick,       path("/user/hand/left/input/thumbstick") },
+					{ thumbstick,       path("/user/hand/right/input/thumbstick") },
+					{ thumbstick_click, path("/user/hand/left/input/thumbstick/click") },
+					{ thumbstick_click, path("/user/hand/right/input/thumbstick/click") },
+					{ trigger,          path("/user/hand/left/input/trigger/value") },
+					{ trigger,          path("/user/hand/right/input/trigger/value") },
+					{ squeeze,          path("/user/hand/left/input/squeeze/value") },
+					{ squeeze,          path("/user/hand/right/input/squeeze/value") },
+					{ haptic,           path("/user/hand/left/output/haptic") },
+					{ haptic,           path("/user/hand/right/output/haptic") },
+					{ button_x,         path("/user/hand/left/input/x/click") },
+					{ button_y,         path("/user/hand/left/input/y/click") },
+					{ button_menu,      path("/user/hand/left/input/menu/click") },
+					{ button_a,         path("/user/hand/right/input/a/click") },
+					{ button_b,         path("/user/hand/right/input/b/click") },
+				};
+
+				XrInteractionProfileSuggestedBinding suggested{ XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
+				suggested.interactionProfile = path("/interaction_profiles/oculus/touch_controller");
+				suggested.countSuggestedBindings = static_cast<u32>(std::size(bindings));
+				suggested.suggestedBindings = bindings;
+				if (!check(g_state.fn.xrSuggestInteractionProfileBindings(g_state.instance, &suggested), "xrSuggestInteractionProfileBindings"))
+				{
+					return false;
+				}
+
+				XrSessionActionSetsAttachInfo attach_info{ XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO };
+				attach_info.countActionSets = 1;
+				attach_info.actionSets = &action_set;
+				if (!check(g_state.fn.xrAttachSessionActionSets(session, &attach_info), "xrAttachSessionActionSets"))
+				{
+					return false;
+				}
+
+				attached = true;
+				xr_log.success("Touch controllers mapped to PS3 pad 1 (menu button is the shift key: +stick D-pad, +A Select, +B PS)");
+				return true;
+			}
+
+			void destroy()
+			{
+				// Actions go with their set.
+				if (action_set != XR_NULL_HANDLE)
+				{
+					g_state.fn.xrDestroyActionSet(action_set);
+					action_set = XR_NULL_HANDLE;
+				}
+				attached = false;
+			}
+
+			bool read_bool(XrAction action, XrPath subaction = XR_NULL_PATH) const
+			{
+				XrActionStateGetInfo info{ XR_TYPE_ACTION_STATE_GET_INFO };
+				info.action = action;
+				info.subactionPath = subaction;
+				XrActionStateBoolean state{ XR_TYPE_ACTION_STATE_BOOLEAN };
+				if (g_state.fn.xrGetActionStateBoolean(g_state_session(), &info, &state) != XR_SUCCESS || !state.isActive)
+				{
+					return false;
+				}
+				return state.currentState == XR_TRUE;
+			}
+
+			float read_float(XrAction action, XrPath subaction) const
+			{
+				XrActionStateGetInfo info{ XR_TYPE_ACTION_STATE_GET_INFO };
+				info.action = action;
+				info.subactionPath = subaction;
+				XrActionStateFloat state{ XR_TYPE_ACTION_STATE_FLOAT };
+				if (g_state.fn.xrGetActionStateFloat(g_state_session(), &info, &state) != XR_SUCCESS || !state.isActive)
+				{
+					return 0.f;
+				}
+				return state.currentState;
+			}
+
+			XrVector2f read_vec2(XrAction action, XrPath subaction) const
+			{
+				XrActionStateGetInfo info{ XR_TYPE_ACTION_STATE_GET_INFO };
+				info.action = action;
+				info.subactionPath = subaction;
+				XrActionStateVector2f state{ XR_TYPE_ACTION_STATE_VECTOR2F };
+				if (g_state.fn.xrGetActionStateVector2f(g_state_session(), &info, &state) != XR_SUCCESS || !state.isActive)
+				{
+					return { 0.f, 0.f };
+				}
+				return state.currentState;
+			}
+
+			// The session the actions were attached to. Kept here rather than passed around.
+			XrSession session_handle = XR_NULL_HANDLE;
+			XrSession g_state_session() const { return session_handle; }
+
+			// -1..1 with a radial dead zone -> the pad's 0..255, 128 at rest. Y is up in OpenXR
+			// and down on a PS3 pad.
+			static void stick_to_pad(XrVector2f v, int& out_x, int& out_y)
+			{
+				const float mag = std::sqrt(v.x * v.x + v.y * v.y);
+				if (mag < k_deadzone)
+				{
+					out_x = 128;
+					out_y = 128;
+					return;
+				}
+
+				const float scale = std::min(1.f, (mag - k_deadzone) / (1.f - k_deadzone)) / mag;
+				const float x = v.x * scale;
+				const float y = -v.y * scale;
+				out_x = std::clamp(static_cast<int>(std::lround(128.f + x * (x < 0.f ? 128.f : 127.f))), 0, 255);
+				out_y = std::clamp(static_cast<int>(std::lround(128.f + y * (y < 0.f ? 128.f : 127.f))), 0, 255);
+			}
+
+			void release_all()
+			{
+				int pressure[12] = {};
+				push(0, 0, 128, 128, 128, 128, pressure);
+			}
+
+			void push(int digital1, int digital2, int lx, int ly, int rx, int ry, const int (&pressure)[12])
+			{
+				bool pressure_changed = false;
+				for (int i = 0; i < 12; ++i)
+				{
+					if (pressure[i] != sent_pressure[i])
+					{
+						pressure_changed = true;
+						break;
+					}
+				}
+
+				if (pressure_changed)
+				{
+					if (_rpcsx_overlayPadPressure(0, pressure, 12))
+					{
+						std::memcpy(sent_pressure, pressure, sizeof(sent_pressure));
+					}
+				}
+
+				const bool changed = pressure_changed || digital1 != sent_digital1 || digital2 != sent_digital2 ||
+					lx != sent_stick[0] || ly != sent_stick[1] || rx != sent_stick[2] || ry != sent_stick[3];
+				if (!changed)
+				{
+					return;
+				}
+
+				if (_rpcsx_overlayPadData(0, digital1, digital2, lx, ly, rx, ry))
+				{
+					sent_digital1 = digital1;
+					sent_digital2 = digital2;
+					sent_stick[0] = lx;
+					sent_stick[1] = ly;
+					sent_stick[2] = rx;
+					sent_stick[3] = ry;
+				}
+			}
+
+			void rumble(XrTime period_ns)
+			{
+				const int packed = _rpcsx_getPadRumble(0);
+				const int large = (packed >> 8) & 0xff;
+				const int small = packed & 0xff;
+				const float amplitude = static_cast<float>(std::max(large, small)) / 255.f;
+
+				if (amplitude <= 0.f)
+				{
+					if (haptic_active)
+					{
+						for (u32 h = 0; h < 2; ++h)
+						{
+							XrHapticActionInfo info{ XR_TYPE_HAPTIC_ACTION_INFO };
+							info.action = haptic;
+							info.subactionPath = hand_path[h];
+							g_state.fn.xrStopHapticFeedback(session_handle, &info);
+						}
+						haptic_active = false;
+					}
+					return;
+				}
+
+				// Re-issued every frame while the game vibrates, a little longer than a frame
+				// so consecutive pulses overlap into one. The large motor's level drives both
+				// controllers; the DualShock's small motor is a faster buzz the Touch cannot do.
+				XrHapticVibration vibration{ XR_TYPE_HAPTIC_VIBRATION };
+				vibration.duration = std::max<XrDuration>(period_ns * 2, 20'000'000);
+				vibration.frequency = XR_FREQUENCY_UNSPECIFIED;
+				vibration.amplitude = amplitude;
+
+				for (u32 h = 0; h < 2; ++h)
+				{
+					XrHapticActionInfo info{ XR_TYPE_HAPTIC_ACTION_INFO };
+					info.action = haptic;
+					info.subactionPath = hand_path[h];
+					g_state.fn.xrApplyHapticFeedback(session_handle, &info, reinterpret_cast<const XrHapticBaseHeader*>(&vibration));
+				}
+				haptic_active = true;
+			}
+
+			// Once per frame, after xrBeginFrame. `now` is the frame's predicted display time.
+			void poll(XrTime now, XrTime period_ns)
+			{
+				if (!attached)
+				{
+					return;
+				}
+
+				XrActiveActionSet active{ action_set, XR_NULL_PATH };
+				XrActionsSyncInfo sync_info{ XR_TYPE_ACTIONS_SYNC_INFO };
+				sync_info.countActiveActionSets = 1;
+				sync_info.activeActionSets = &active;
+
+				const XrResult sync = g_state.fn.xrSyncActions(session_handle, &sync_info);
+				if (sync == XR_SESSION_NOT_FOCUSED)
+				{
+					// The system UI has the controllers. Nothing stays pressed in the game.
+					release_all();
+					menu_was_down = false;
+					menu_used_as_shift = false;
+					return;
+				}
+				if (XR_FAILED(sync))
+				{
+					check(sync, "xrSyncActions");
+					return;
+				}
+
+				const bool menu = read_bool(button_menu);
+				const bool a = read_bool(button_a);
+				const bool b = read_bool(button_b);
+				const bool x = read_bool(button_x);
+				const bool y = read_bool(button_y);
+				const bool l3 = read_bool(thumbstick_click, hand_path[left]);
+				const bool r3 = read_bool(thumbstick_click, hand_path[right]);
+				const float trigger_l = read_float(trigger, hand_path[left]);
+				const float trigger_r = read_float(trigger, hand_path[right]);
+				const float grip_l = read_float(squeeze, hand_path[left]);
+				const float grip_r = read_float(squeeze, hand_path[right]);
+				const XrVector2f stick_l = read_vec2(thumbstick, hand_path[left]);
+				const XrVector2f stick_r = read_vec2(thumbstick, hand_path[right]);
+
+				// Menu: a tap is Start, a hold is the shift key. The tap is decided at release, so
+				// Start is pulsed for a few frames afterwards; a hold that shifted something is
+				// not a tap.
+				if (menu && !menu_was_down)
+				{
+					menu_down_since = now;
+					menu_used_as_shift = false;
+				}
+				else if (!menu && menu_was_down)
+				{
+					if (!menu_used_as_shift && now - menu_down_since < k_tap_ns)
+					{
+						start_pulse_until = now + k_pulse_ns;
+					}
+				}
+				menu_was_down = menu;
+				const bool shift = menu;
+
+				int digital1 = 0;
+				int digital2 = 0;
+
+				if (shift)
+				{
+					if (stick_l.y > k_dpad_threshold) digital1 |= CELL_PAD_CTRL_UP;
+					if (stick_l.y < -k_dpad_threshold) digital1 |= CELL_PAD_CTRL_DOWN;
+					if (stick_l.x < -k_dpad_threshold) digital1 |= CELL_PAD_CTRL_LEFT;
+					if (stick_l.x > k_dpad_threshold) digital1 |= CELL_PAD_CTRL_RIGHT;
+					if (a) digital1 |= CELL_PAD_CTRL_SELECT;
+					if (b) digital1 |= CELL_PAD_CTRL_PS;
+					if (digital1 != 0 || std::fabs(stick_l.x) > k_deadzone || std::fabs(stick_l.y) > k_deadzone)
+					{
+						menu_used_as_shift = true;
+					}
+				}
+				else
+				{
+					if (a) digital2 |= CELL_PAD_CTRL_CROSS;
+					if (b) digital2 |= CELL_PAD_CTRL_CIRCLE;
+					if (l3) digital1 |= CELL_PAD_CTRL_L3;
+					if (r3) digital1 |= CELL_PAD_CTRL_R3;
+				}
+
+				if (x) digital2 |= CELL_PAD_CTRL_SQUARE;
+				if (y) digital2 |= CELL_PAD_CTRL_TRIANGLE;
+				if (grip_l > k_grip_threshold) digital2 |= CELL_PAD_CTRL_L1;
+				if (grip_r > k_grip_threshold) digital2 |= CELL_PAD_CTRL_R1;
+				if (trigger_l > k_trigger_threshold) digital2 |= CELL_PAD_CTRL_L2;
+				if (trigger_r > k_trigger_threshold) digital2 |= CELL_PAD_CTRL_R2;
+				if (now < start_pulse_until) digital1 |= CELL_PAD_CTRL_START;
+
+				int lx = 128, ly = 128, rx = 128, ry = 128;
+				if (!shift)
+				{
+					stick_to_pad(stick_l, lx, ly);
+				}
+				stick_to_pad(stick_r, rx, ry);
+
+				// Pressure, in CELL_PAD press-offset order: only the triggers are analog here.
+				int pressure[12] = {};
+				const auto level = [](float v) { return std::clamp(static_cast<int>(std::lround(v * 255.f)), 1, 255); };
+				pressure[CELL_PAD_BTN_OFFSET_PRESS_L2 - CELL_PAD_BTN_OFFSET_PRESS_RIGHT] = trigger_l > k_trigger_threshold ? level(trigger_l) : 0;
+				pressure[CELL_PAD_BTN_OFFSET_PRESS_R2 - CELL_PAD_BTN_OFFSET_PRESS_RIGHT] = trigger_r > k_trigger_threshold ? level(trigger_r) : 0;
+
+				push(digital1, digital2, lx, ly, rx, ry, pressure);
+				rumble(period_ns);
+			}
+		};
+
 		// ---- The swapchain -----------------------------------------------------------------
 
 		struct swapchain_image_XR
@@ -262,6 +721,8 @@ namespace armsx3::xr
 			int64_t m_xr_format = 0;
 
 			bool m_logged_waiting_for_session = false;
+
+			touch_input m_input{};
 
 			bool ensure_session()
 			{
@@ -300,6 +761,15 @@ namespace armsx3::xr
 				}
 
 				xr_log.success("OpenXR session created on graphics queue family %u", binding.queueFamilyIndex);
+
+				// Controllers: the action set has to be attached before the session begins, which
+				// the READY event triggers from poll_events(), so right here.
+				m_input.session_handle = m_session;
+				if (!m_input.create(m_session))
+				{
+					xr_log.warning("Touch controller input unavailable; a Bluetooth pad still works.");
+					m_input.destroy();
+				}
 				return true;
 			}
 
@@ -594,6 +1064,7 @@ namespace armsx3::xr
 			void destroy(bool /*full*/ = true) override
 			{
 				end_frame_without_layers();
+				m_input.destroy();
 				destroy_xr_swapchain();
 
 				if (m_space != XR_NULL_HANDLE)
@@ -664,6 +1135,9 @@ namespace armsx3::xr
 					return VK_TIMEOUT;
 				}
 				m_frame_begun = true;
+
+				// Controllers, once per frame, now that the frame's time is known.
+				m_input.poll(m_frame_state.predictedDisplayTime, m_frame_state.predictedDisplayPeriod);
 
 				XrSwapchainImageAcquireInfo acquire_info{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
 				u32 index = 0;

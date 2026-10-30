@@ -21,8 +21,9 @@ import kotlinx.coroutines.withContext
  * The immersive half of the app on a headset: the activity Horizon OS composes OpenXR layers
  * for. It owns nothing of the emulator. Main (the panel) stays alive underneath with the
  * runtime, the library and the settings; this activity brings up the OpenXR session, asks the
- * runtime to boot the launch Main parked for it, forwards controller input to Main's handlers
- * and leaves when the game stops.
+ * runtime to boot the launch Main parked for it, forwards Bluetooth controller input to Main's
+ * handlers (the Touch controllers reach the game inside the core, through OpenXR actions) and
+ * leaves when the game stops.
  *
  * Deliberately NOT a MainActivityRuntime: that class's onDestroy shuts the core down and kills
  * the process, which is right for the one activity that hosts the app and wrong for one that

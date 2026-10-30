@@ -52,7 +52,11 @@ On a Quest the game is shown on a virtual screen through OpenXR (android/src/xr/
 core, com.armsx2.xr in the app) when "Virtual screen (OpenXR)" is on in the renderer
 settings, which it is by default there. With "Stereoscopic 3D" on, games with native 3D
 output (Wipeout HD, Super Stardust HD, Killzone 3, GT5/6, the Arkham games...) are shown
-with one image per eye. The core side is compiled in by default
+with one image per eye. The Touch controllers drive PS3 pad 1 through OpenXR actions:
+thumbsticks and A/B/X/Y as you would expect (Cross/Circle/Square/Triangle), triggers L2/R2,
+grips L1/R1, stick clicks L3/R3, a tap on the left menu button is Start, and holding it
+turns the left stick into the D-pad, A into Select and B into PS (the home menu). Game
+rumble reaches both controllers. The core side is compiled in by default
 (`-DARMSX3_XR=OFF` to leave it out) and only needs the vendored headers in
 3rdparty/openxr; the loader comes from Maven with the app
 (org.khronos.openxr:openxr_loader_for_android). android/tools/quest3/ holds the driver

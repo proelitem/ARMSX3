@@ -128,7 +128,9 @@ Quand un Turnip est validé par les essais, la recommandation se change dans
 Points 3 et 4 : la présentation OpenXR (écran virtuel, puis une image par œil avec le
 réglage « 3D stéréoscopique ») vit dans `android/src/xr/` et `com.armsx2.xr`. Son journal
 (canal `XR` d'ARMSX3.log) dit quel runtime, quel format de swapchain et quelle disposition
-(mono ou une moitié par œil) sont en service ; joignez-le aux résultats du spike.
+(mono ou une moitié par œil) sont en service ; joignez-le aux résultats du spike. Les manettes
+Touch pilotent le pad 1 (bouton menu gauche = touche de majuscule : + stick = croix
+directionnelle, + A = Select, + B = PS) ; une manette Bluetooth reste utilisable.
 
 ## 6. Références
 
