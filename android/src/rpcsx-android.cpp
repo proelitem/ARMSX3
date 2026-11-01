@@ -2,6 +2,7 @@
 #include <array>
 #include <charconv>
 #include <fstream>
+#include <cstdio>
 #include <cstring>
 #include "Crypto/unpkg.h"
 #include "Crypto/unself.h"
@@ -6441,7 +6442,7 @@ static std::string android_memory_snapshot() {
           continue;
         }
         const u64 kb = std::strtoull(line + len + 1, nullptr, 10);
-        fmt::append(out, "%s=%lluMB ", key, static_cast<unsigned long long>(kb / 1024));
+        fmt::append(out, "%s=%uMB ", key, kb / 1024);
       }
     }
     std::fclose(f);
@@ -6456,9 +6457,9 @@ static std::string android_memory_snapshot() {
 // for this process. avail/total/threshold are ActivityManager.MemoryInfo in MB; `low` is its
 // lowMemory flag, which is the OS saying it is about to start killing.
 extern "C" void _rpcsx_memoryStatus(long availMb, long totalMb, long thresholdMb, bool low) {
-  rpcsx_android.notice("Memory: avail %ldMB of %ldMB (kill threshold %ldMB%s) | %s",
-                       availMb, totalMb, thresholdMb, low ? ", LOW" : "",
-                       android_memory_snapshot());
+  rpcsx_android.notice("Memory: avail %dMB of %dMB (kill threshold %dMB%s) | %s",
+                       static_cast<s64>(availMb), static_cast<s64>(totalMb), static_cast<s64>(thresholdMb),
+                       low ? ", LOW" : "", android_memory_snapshot());
 }
 
 // Pressure, from onTrimMemory or from the watch above. level 0 moderate, 1 severe.
