@@ -144,6 +144,11 @@ class RPCSX {
      * API for SoC temperatures -- so the core is only ever told the answer.
      */
     external fun setThermals(cpu: Float, gpu: Float, battery: Float, show: Boolean)
+
+    /** System memory, for the core's log (MemoryWatch): ActivityManager.MemoryInfo in MB. */
+    external fun memoryStatus(availMb: Long, totalMb: Long, thresholdMb: Long, low: Boolean)
+    /** Ask the renderer to give memory back: 0 moderate, 1 severe. Applied at its next frame. */
+    external fun memoryPressure(level: Int)
     external fun setRenderPosition(portraitTop: Boolean, topInset: Int)
     external fun setPadDeviceClasses(classes: IntArray)
 

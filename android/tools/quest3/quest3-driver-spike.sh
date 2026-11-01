@@ -76,6 +76,12 @@ cmd_info() {
     *) echo "ATTENTION: ce n'est pas un Quest ($model)";;
   esac
   echo
+  echo "== Mémoire et swap (la question du swap: voir MEMOIRE-QUEST3.md) =="
+  "$ADB" shell 'grep -E "^(MemTotal|MemAvailable|SwapTotal|SwapFree)" /proc/meminfo' | tr -d '\r'
+  echo "swaps            : $("$ADB" shell 'cat /proc/swaps 2>/dev/null | tail -n +2' | tr -d '\r' | tr '\n' ' ')"
+  echo "zram             : $("$ADB" shell 'for z in /sys/block/zram*; do [ -e "$z/disksize" ] && echo "$(basename $z) disksize=$(cat $z/disksize) comp=$(cat $z/comp_algorithm 2>/dev/null)"; done' | tr -d '\r' | tr '\n' ' ')"
+  echo "lmk minfree      : $("$ADB" shell 'cat /sys/module/lowmemorykiller/parameters/minfree 2>/dev/null; getprop ro.lmk.critical; getprop ro.lmk.low' | tr -d '\r' | tr '\n' ' ')"
+  echo
   echo "== GPU (KGSL) =="
   "$ADB" shell 'for f in gpu_model max_gpuclk gpuclk min_clock_mhz max_clock_mhz; do printf "%-14s " $f; cat /sys/class/kgsl/kgsl-3d0/$f 2>/dev/null || echo "?"; done' | tr -d '\r'
   echo

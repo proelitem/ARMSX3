@@ -1228,6 +1228,27 @@ void VKGSRender::on_semaphore_acquire_wait()
 	}
 }
 
+namespace vk
+{
+	// 0 = nothing pending, otherwise severity + 1.
+	static atomic_t<u32> g_host_memory_pressure{ 0 };
+
+	void request_host_memory_pressure(rsx::problem_severity severity)
+	{
+		const u32 encoded = static_cast<u32>(severity) + 1;
+		g_host_memory_pressure.atomic_op([encoded](u32& value)
+		{
+			value = std::max(value, encoded);
+		});
+	}
+
+	u32 take_host_memory_pressure()
+	{
+		const u32 encoded = g_host_memory_pressure.exchange(0);
+		return encoded ? encoded - 1 : UINT32_MAX;
+	}
+}
+
 bool VKGSRender::on_vram_exhausted(rsx::problem_severity severity)
 {
 	ensure(rsx::get_current_renderer()->is_current_thread());

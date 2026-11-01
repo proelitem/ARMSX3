@@ -10,6 +10,7 @@
 #include "Emu/Audio/Cubeb/CubebBackend.h"
 #include "Emu/Cell/Modules/cellAudio.h"
 #include "Emu/RSX/VK/VKFrameGen.h"
+#include "Emu/RSX/VK/VKHelpers.h"
 #include "Emu/Audio/Oboe/OboeBackend.h"
 #include "Emu/Audio/Null/NullAudioBackend.h"
 #include "Emu/Cell/PPUAnalyser.h"
@@ -6409,6 +6410,70 @@ extern "C" void _rpcsx_setPadSensor(int port, int x, int y, int z, int g) {
 
 // Device temperatures, pushed from the app layer -- see the note in overlay_perf_metrics.h for
 // why discovery lives there and not here. Values are degrees Celsius, or the 'none' sentinel.
+// ---------------------------------------------------------------------------
+// System memory: telemetry and pressure (android/tools/quest3/MEMOIRE-QUEST3.md)
+//
+// A phone or headset has no swap an app can add (swapon needs privileges this process does not
+// have), and its GPU memory IS system memory. So the two things this process can do about
+// memory are know where it goes, and give back what it can when the OS asks: the renderer's
+// texture and surface caches, through the eviction path the allocator already uses.
+// ---------------------------------------------------------------------------
+
+// One line per call: where this process's memory sits, from the kernel's own accounting.
+// RssAnon is heap and JIT code (not swappable without swap), RssShmem is the guest memory
+// (memfd: zram-swappable where the OS has zram), RssFile is clean file pages the kernel can
+// drop on its own. VmSwap says whether the OS is swapping us at all.
+static std::string android_memory_snapshot() {
+  std::string out;
+
+  // Plain stdio: /proc files report a size of 0, which fs::file turns into an empty read.
+  const auto grab = [&](const char *path, std::initializer_list<const char *> keys) {
+    FILE *f = std::fopen(path, "r");
+    if (f == nullptr) {
+      return;
+    }
+
+    char line[256];
+    while (std::fgets(line, sizeof(line), f) != nullptr) {
+      for (const char *key : keys) {
+        const usz len = std::strlen(key);
+        if (std::strncmp(line, key, len) != 0 || line[len] != ':') {
+          continue;
+        }
+        const u64 kb = std::strtoull(line + len + 1, nullptr, 10);
+        fmt::append(out, "%s=%lluMB ", key, static_cast<unsigned long long>(kb / 1024));
+      }
+    }
+    std::fclose(f);
+  };
+
+  grab("/proc/self/status", {"VmRSS", "RssAnon", "RssFile", "RssShmem", "VmSwap"});
+  grab("/proc/meminfo", {"MemAvailable", "SwapTotal", "SwapFree"});
+  return out;
+}
+
+// Periodic, from the app (MemoryWatch.kt): what Android reports, beside what the kernel reports
+// for this process. avail/total/threshold are ActivityManager.MemoryInfo in MB; `low` is its
+// lowMemory flag, which is the OS saying it is about to start killing.
+extern "C" void _rpcsx_memoryStatus(long availMb, long totalMb, long thresholdMb, bool low) {
+  rpcsx_android.notice("Memory: avail %ldMB of %ldMB (kill threshold %ldMB%s) | %s",
+                       availMb, totalMb, thresholdMb, low ? ", LOW" : "",
+                       android_memory_snapshot());
+}
+
+// Pressure, from onTrimMemory or from the watch above. level 0 moderate, 1 severe.
+extern "C" void _rpcsx_memoryPressure(int level) {
+  const auto severity = level >= 1 ? rsx::problem_severity::severe : rsx::problem_severity::moderate;
+  rpcsx_android.warning("Memory pressure from the system (%s) | %s",
+                        level >= 1 ? "severe" : "moderate", android_memory_snapshot());
+
+  // Only the Vulkan renderer has caches worth asking for; applied on its thread at the next
+  // flip. Harmless when no game runs: the request simply waits for the next renderer.
+  if (g_cfg.video.renderer == video_renderer::vulkan) {
+    vk::request_host_memory_pressure(severity);
+  }
+}
+
 extern "C" void _rpcsx_setThermals(float cpu, float gpu, float battery, bool show) {
   rsx::overlays::thermals::g_cpu = cpu;
   rsx::overlays::thermals::g_gpu = gpu;

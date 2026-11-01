@@ -1395,6 +1395,18 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
 		}
 	}
 
+	// ARMSX3: pressure on system memory, reported by the app. Applied here because eviction
+	// has to run on this thread, and clamped below fatal: fatal hard-syncs the queue, which is
+	// the allocator's last resort, not a response to the OS asking politely.
+	if (const u32 pending = vk::take_host_memory_pressure(); pending != UINT32_MAX)
+	{
+		const auto severity = std::min(static_cast<rsx::problem_severity>(pending), rsx::problem_severity::severe);
+		const bool relieved = on_vram_exhausted(severity);
+		rsx_log.warning("Host memory pressure (%s): %s.",
+			severity == rsx::problem_severity::severe ? "severe" : severity == rsx::problem_severity::moderate ? "moderate" : "low",
+			relieved ? "released GPU resources" : "found nothing to release");
+	}
+
 	m_profiler.start();
 
 	ensure(m_current_frame, "Invalid swapchain setup. Resizing the game window failed.");

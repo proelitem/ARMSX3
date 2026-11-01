@@ -76,6 +76,9 @@ struct RPCSXApi {
   void (*setPadSensor)(int port, int x, int y, int z, int g);
   int (*getPadRumble)(int port);
   void (*setThermals)(float cpu, float gpu, float battery, bool show);
+  // Optional: system memory telemetry and pressure (a core without them just does not trim).
+  void (*memoryStatus)(long availMb, long totalMb, long thresholdMb, bool low);
+  void (*memoryPressure)(int level);
   void (*setRenderPosition)(bool portraitTop, int topInset);
   void (*setPadDeviceClasses)(const int *classes, int count);
   bool (*usbDeviceEvent)(int fd, int vendorId, int productId, int event);
@@ -259,6 +262,8 @@ struct RPCSXLibrary : RPCSXApi {
     result.setPadSensor = reinterpret_cast<decltype(setPadSensor)>(dlsym(handle, "_rpcsx_setPadSensor"));
     result.getPadRumble = reinterpret_cast<decltype(getPadRumble)>(dlsym(handle, "_rpcsx_getPadRumble"));
     result.setThermals = reinterpret_cast<decltype(setThermals)>(dlsym(handle, "_rpcsx_setThermals"));
+    result.memoryStatus = reinterpret_cast<decltype(memoryStatus)>(dlsym(handle, "_rpcsx_memoryStatus"));
+    result.memoryPressure = reinterpret_cast<decltype(memoryPressure)>(dlsym(handle, "_rpcsx_memoryPressure"));
     // Optional: a core built before this simply centres the image, as it always did.
     result.setRenderPosition = reinterpret_cast<decltype(setRenderPosition)>(dlsym(handle, "_rpcsx_setRenderPosition"));
     // Optional: a core without it reports every port as a standard pad, as it always did.
@@ -939,6 +944,24 @@ extern "C" JNIEXPORT jint JNICALL Java_net_rpcsx_RPCSX_getPadRumble(
 // Device temperatures for the perf overlay. Discovery is the app's job -- Android exposes no
 // supported API for SoC temperatures, so it reads the thermal sysfs, whose zone naming and units
 // are vendor-specific -- and this only carries the result across.
+extern "C" JNIEXPORT void JNICALL Java_net_rpcsx_RPCSX_memoryStatus(
+    JNIEnv *, jobject, jlong availMb, jlong totalMb, jlong thresholdMb, jboolean low) {
+  if (rpcsxLib.memoryStatus == nullptr) {
+    return;
+  }
+
+  rpcsxLib.memoryStatus(static_cast<long>(availMb), static_cast<long>(totalMb),
+                        static_cast<long>(thresholdMb), low == JNI_TRUE);
+}
+
+extern "C" JNIEXPORT void JNICALL Java_net_rpcsx_RPCSX_memoryPressure(JNIEnv *, jobject, jint level) {
+  if (rpcsxLib.memoryPressure == nullptr) {
+    return;
+  }
+
+  rpcsxLib.memoryPressure(level);
+}
+
 extern "C" JNIEXPORT void JNICALL Java_net_rpcsx_RPCSX_setThermals(
     JNIEnv *, jobject, jfloat cpu, jfloat gpu, jfloat battery, jboolean show) {
   if (rpcsxLib.setThermals == nullptr) {

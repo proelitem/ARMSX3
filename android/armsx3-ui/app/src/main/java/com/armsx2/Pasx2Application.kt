@@ -33,6 +33,13 @@ class Pasx2Application : Application(), ImageLoaderFactory {
 		super.onCreate()
 		appContext = applicationContext
 		installCrashLogging()
+		MemoryWatch.start(this)
+	}
+
+	/** The OS asking for memory back. Forwarded to the core, which trims the renderer's caches. */
+	override fun onTrimMemory(level: Int) {
+		super.onTrimMemory(level)
+		MemoryWatch.onTrimMemory(level)
 	}
 
 	companion object {

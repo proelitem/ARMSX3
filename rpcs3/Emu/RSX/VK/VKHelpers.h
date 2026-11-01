@@ -148,6 +148,16 @@ namespace vk
 
 	void advance_completed_frame_counter();
 	void advance_frame_counter();
+
+	// ARMSX3: system-memory pressure reported by the host (Android's onTrimMemory, or the app's
+	// own watch on MemAvailable). GPU memory on a phone or headset is system memory, so the
+	// renderer's caches are the biggest thing this process can give back. The request is
+	// recorded from any thread and applied by the RSX thread at its next flip, through the same
+	// eviction path the allocator uses when a Vulkan allocation fails (on_vram_exhausted).
+	// A higher pending severity is never lowered by a later, milder request.
+	void request_host_memory_pressure(rsx::problem_severity severity);
+	// The pending request, cleared. UINT32_MAX when there is none. RSX thread only.
+	u32 take_host_memory_pressure();
 	u64 get_current_frame_id();
 	u64 get_last_completed_frame_id();
 
