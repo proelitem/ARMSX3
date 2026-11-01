@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.22)
+project(memprobe CXX)
+set(CMAKE_CXX_STANDARD 20)
+add_library(memprobe SHARED memprobe.cpp)
+target_compile_options(memprobe PRIVATE -O2 -Wall)
+target_link_libraries(memprobe log)
