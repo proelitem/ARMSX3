@@ -44,10 +44,11 @@ class XrEmulationActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        // System back: leave the game. The runtime's own menu is reached from the pad.
+        // System back: close the game the way every other close route does (closeGame is the
+        // chokepoint that remembers an external launch). The runtime's own menu is on the pad.
         onBackPressedDispatcher.addCallback(this) {
             if (MainActivityRuntime.eState.value != EmuState.STOPPED) {
-                MainActivityRuntime.stop()
+                MainActivityRuntime.closeGame()
             } else {
                 leave()
             }
@@ -97,6 +98,9 @@ class XrEmulationActivity : ComponentActivity() {
             if (xrStarted) withContext(Dispatchers.IO) { XrPresentation.stop() }
             xrStarted = false
             finish()
+            // A game that came from a frontend goes back to it: Main's task is finished as well,
+            // once this activity is on its way out, so what remains on screen is the frontend.
+            MainActivityRuntime.returnToLauncherAfterExternalGame()
         }
     }
 
@@ -104,7 +108,7 @@ class XrEmulationActivity : ComponentActivity() {
         // Destroyed by the system with the game still up (task swipe, OS). Stop the game; the
         // core's swapchain goes with it and the session can then be torn down.
         if (!leaving && MainActivityRuntime.eState.value != EmuState.STOPPED) {
-            MainActivityRuntime.stop()
+            MainActivityRuntime.closeGame()
         }
         if (xrStarted) {
             xrStarted = false

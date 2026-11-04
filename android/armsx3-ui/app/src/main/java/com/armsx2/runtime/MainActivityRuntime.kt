@@ -1069,16 +1069,31 @@ open class MainActivityRuntime : ComponentActivity() {
         /** A launch handed to XrEmulationActivity, which boots it once its OpenXR session is up.
          *  See [launchGame] and [com.armsx2.xr.XrEmulationActivity]. */
         @Volatile
-        private var pendingXrLaunch: Pair<String, GameInfo?>? = null
+        private var pendingXrLaunch: Triple<String, GameInfo?, Boolean>? = null
 
         /** Boots the launch parked by [launchGame] for the XR activity, outside the XR routing.
          *  Called by the XR activity once its session is up, and also when its OpenXR start
          *  failed and the game should run on the panel instead. False when nothing was parked. */
         fun resumeXrLaunch(): Boolean {
-            val (uri, info) = pendingXrLaunch ?: return false
+            val (uri, info, external) = pendingXrLaunch ?: return false
             pendingXrLaunch = null
-            launchGame(uri, info, bypassXr = true)
+            // `external` rides along: it is what sends the app back to the frontend (WFGEmu,
+            // ES-DE...) when the game ends, and the first version dropped it here.
+            launchGame(uri, info, external = external, bypassXr = true)
             return true
+        }
+
+        /** After a game that came from an external frontend has stopped, leave the app so the
+         *  frontend regains focus, when the opt-in says so. The XR activity calls this once it
+         *  has torn down its session: the panel activity's own STOPPED branch only does it for a
+         *  close that went through closeGame(), and a game that ends from the core's menu or on
+         *  its own never does. */
+        @JvmStatic
+        fun returnToLauncherAfterExternalGame() {
+            if (!launchedExternally) return
+            if (!prefs.getBoolean("ui.exitToLauncherExternal", true)) return
+            launchedExternally = false
+            instance?.runOnUiThread { instance?.finishAndRemoveTask() }
         }
 
         fun launchGame(uri: String, info: GameInfo? = null, external: Boolean = false, bypassXr: Boolean = false) {
@@ -1093,8 +1108,8 @@ open class MainActivityRuntime : ComponentActivity() {
             if (!bypassXr && com.armsx2.xr.XrPresentation.shouldRoute(instance)) {
                 val host = instance
                 if (host != null) {
-                    println("@@ANDROID_LAUNCH_XR@@ title=${info?.title ?: "<direct>"}")
-                    pendingXrLaunch = uri to info
+                    println("@@ANDROID_LAUNCH_XR@@ title=${info?.title ?: "<direct>"} external=$external")
+                    pendingXrLaunch = Triple(uri, info, external)
                     com.armsx2.xr.XrEmulationActivity.start(host)
                     return
                 }

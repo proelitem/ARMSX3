@@ -1,4 +1,4 @@
-# Compiler ARMSX3 pour la Quest 3 (branche `quest3/touch-input`)
+# Compiler ARMSX3 pour la Quest 3 (branche `master` du fork)
 
 Ce guide est écrit pour être exécuté par un agent (Claude Code, Cowork) sur un PC
 Windows, ou à la main. Les scripts du dépôt (`android/configure.sh`,
@@ -32,15 +32,32 @@ export PATH="$ANDROID_HOME/cmake/3.30.5/bin:$ANDROID_HOME/platform-tools:$PATH"
 ## 2. Sources
 
 ```bash
-git clone --recursive -b quest3/touch-input https://github.com/proelitem/armsx3.git
+git clone --recursive https://github.com/proelitem/armsx3.git
 cd armsx3
 git clone https://github.com/SnowflakePowered/librashader 3rdparty/librashader
-git clone https://github.com/bylaws/libadrenotools android/armsx3-ui/app/src/main/cpp/libadrenotools
+git clone --recursive https://github.com/bylaws/libadrenotools android/armsx3-ui/app/src/main/cpp/libadrenotools
 ```
 
-La branche `quest3/touch-input` contient les cinq étapes Quest (spike drivers, profil
-casque, présentation OpenXR, stéréo par œil, manettes Touch). Le sous-module LLVM est
-gros (plusieurs Go) ; `--recursive` est obligatoire.
+`master` du fork contient tout le travail Quest (les branches `quest3/*` en sont les
+étapes : spike drivers, profil casque, présentation OpenXR, stéréo par œil, manettes
+Touch, gouverneur mémoire). Le sous-module LLVM est gros (plusieurs Go) ; `--recursive`
+est obligatoire, pour ce dépôt comme pour libadrenotools (voir 2 bis).
+
+## 2 bis. Particularités Windows, constatées à la première compilation
+
+Trois choses que la première compilation sous Windows a demandées :
+
+- **Compilateur hôte pour LLVM.** La construction de LLVM en croisé a besoin d'outils natifs
+  (tablegen) compilés pour le PC. Sous Windows, le NDK ne fournit pas de compilateur hôte
+  utilisable par ce CMake ; installer [LLVM-MinGW](https://github.com/mstorsjo/llvm-mingw)
+  et le mettre dans le PATH avant de configurer, pour que CMake trouve un `clang++` hôte.
+- **Triplet LLVM explicite.** Passer `-DLLVM_HOST_TRIPLE=aarch64-none-linux-android33` à
+  `configure.sh` (en argument supplémentaire, transmis à cmake), sinon LLVM déduit un
+  triplet Windows du compilateur hôte et génère du code pour la mauvaise cible.
+- **Sous-module de libadrenotools.** `libadrenotools` a lui-même un sous-module,
+  `lib/linkernsbypass`, sans lequel le glue JNI ne se lie pas. D'où le `--recursive`
+  ci-dessus ; sur un clone existant :
+  `git -C android/armsx3-ui/app/src/main/cpp/libadrenotools submodule update --init`.
 
 ## 3. Le core (libarmsx3-core.so)
 
@@ -50,8 +67,11 @@ armv8.2 avec dotprod et fp16, celle que la Quest 3 installe) :
 ```bash
 bash android/stamp-git-version.sh
 NDK_VERSION=29.0.14206865 ANDROID_API=33 BUILD_DIR="$PWD/build-a13" \
-  bash android/configure.sh "-DARMSX3_ARM_MARCH=armv8.2-a+dotprod+fp16"
+  bash android/configure.sh "-DARMSX3_ARM_MARCH=armv8.2-a+dotprod+fp16" \
+  "-DLLVM_HOST_TRIPLE=aarch64-none-linux-android33"
 ```
+
+(`LLVM_HOST_TRIPLE` est nécessaire sous Windows, voir 2 bis, et sans effet ailleurs.)
 
 Vérifier que la sortie de cmake contient `ARMSX3: OpenXR presentation ON`. Puis :
 
@@ -125,7 +145,8 @@ voir le casque depuis WSL (usbipd) ou l'APK est installé depuis Windows.
 ## 7. Prompt prêt à coller pour l'agent local
 
 > Compile ARMSX3 pour ma Meta Quest 3 en suivant `android/tools/quest3/BUILD-QUEST3.md`
-> de la branche `quest3/touch-input` du dépôt https://github.com/proelitem/armsx3.
+> de la branche `master` du dépôt https://github.com/proelitem/armsx3 (section 2 bis pour
+> les particularités Windows).
 > Installe les outils manquants (Android Studio SDK avec NDK 29.0.14206865 et CMake
 > 3.30.5, JDK 21, Git), clone les sources avec les sous-modules et les deux dépôts
 > annexes, construis le core avec la configuration a13 (API 33, armv8.2+dotprod+fp16),
