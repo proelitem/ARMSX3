@@ -35,6 +35,10 @@ namespace armsx3::xr
 		float width_m    = 2.4f;
 		u32 width_px     = 1920;
 		u32 height_px    = 1080;
+		// Display refresh rate to ask the runtime for, when it offers one that close. The PS3
+		// outputs 59.94 Hz (50 for PAL): 60 shows each game frame once, or twice at 30 fps,
+		// with none of the 3:2 cadence a 72 or 90 Hz display adds. 0 keeps the runtime's default.
+		float refresh_hz = 60.f;
 	};
 
 	// Bring up the loader, the XrInstance and the system, and install the renderer hooks.

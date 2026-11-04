@@ -20,6 +20,7 @@
 #include <openxr/openxr_platform.h>
 
 #include <dlfcn.h>
+#include <pthread.h>
 
 #include <algorithm>
 #include <atomic>
@@ -91,6 +92,25 @@ namespace armsx3::xr
 	X(xrGetVulkanGraphicsDevice2KHR) \
 	X(xrCreateVulkanDeviceKHR)
 
+		// Extension entry points a runtime may lack. Resolved after the instance exists; a
+		// missing one is a null pointer, never an error.
+		struct optional_entry_points
+		{
+			PFN_xrEnumerateDisplayRefreshRatesFB xrEnumerateDisplayRefreshRatesFB = nullptr;
+			PFN_xrGetDisplayRefreshRateFB xrGetDisplayRefreshRateFB = nullptr;
+			PFN_xrRequestDisplayRefreshRateFB xrRequestDisplayRefreshRateFB = nullptr;
+
+			void resolve(PFN_xrGetInstanceProcAddr gipa, XrInstance instance, bool refresh_rate)
+			{
+				if (refresh_rate)
+				{
+					gipa(instance, "xrEnumerateDisplayRefreshRatesFB", reinterpret_cast<PFN_xrVoidFunction*>(&xrEnumerateDisplayRefreshRatesFB));
+					gipa(instance, "xrGetDisplayRefreshRateFB", reinterpret_cast<PFN_xrVoidFunction*>(&xrGetDisplayRefreshRateFB));
+					gipa(instance, "xrRequestDisplayRefreshRateFB", reinterpret_cast<PFN_xrVoidFunction*>(&xrRequestDisplayRefreshRateFB));
+				}
+			}
+		};
+
 		struct entry_points
 		{
 			PFN_xrGetInstanceProcAddr xrGetInstanceProcAddr = nullptr;
@@ -121,6 +141,7 @@ namespace armsx3::xr
 
 			void* loader_handle = nullptr;
 			entry_points fn;
+			optional_entry_points fn_optional;
 
 			JavaVM* vm = nullptr;
 			jobject activity = nullptr; // global reference
@@ -694,22 +715,55 @@ namespace armsx3::xr
 
 		class swapchain final : public vk::abstract_swapchain_impl<swapchain_image_XR>
 		{
+			// Two threads touch this object.
+			//
+			// The RSX thread (the renderer) calls init(), acquire, present and destroy: it only
+			// ever acquires, waits for and releases swapchain images, as it would with a
+			// VkSwapchainKHR. The pump thread owns the OpenXR frame loop: xrWaitFrame, xrBeginFrame
+			// and xrEndFrame at the display's rate, every frame, whether or not the renderer has
+			// produced a new image -- the compositor shows the most recently released image of the
+			// swapchain, so a 30 fps game on a 60 Hz display is simply shown twice, reprojected to
+			// the head's current pose both times. Tying the frame loop to the renderer's flip, as the
+			// first version did, made every flip wait for a compositor slot and every long frame
+			// miss one, which is a stutter the game itself did not have.
+			//
+			// The pump also owns the event queue (session state), the controllers (xrSyncActions
+			// is a frame-rate thing) and the refresh-rate request.
+			//
+			// m_mutex guards the state both threads read: session running/lost, the swapchain
+			// handle and the layer description. m_xr_mutex serialises the short OpenXR calls that
+			// touch the swapchain or the frame (acquire/release on one side, begin/end frame on the
+			// other); it is never held across xrWaitFrame or xrWaitSwapchainImage, which block.
+
 			XrSession m_session = XR_NULL_HANDLE;
 			XrSpace m_space = XR_NULL_HANDLE;
 			XrSwapchain m_swapchain = XR_NULL_HANDLE;
 
-			// Session state machine, driven by xrPollEvent from acquire().
+			std::mutex m_mutex;
+			std::mutex m_xr_mutex;
+
+			// Session state machine, driven by xrPollEvent from the pump.
 			XrSessionState m_session_state = XR_SESSION_STATE_UNKNOWN;
 			bool m_session_running = false;
 			bool m_session_lost = false;
 
-			// Frame pairing. xrWaitFrame/xrBeginFrame run in acquire(), xrEndFrame in present().
-			// A frame the renderer acquired and never presented (a dropped flip) is ended with no
-			// layers by the next acquire, which is what the spec allows and what keeps the pairs
-			// balanced.
-			XrFrameState m_frame_state{ XR_TYPE_FRAME_STATE };
-			bool m_frame_begun = false;
+			// The pump.
+			std::thread m_pump;
+			std::atomic<bool> m_pump_stop{ false };
+			std::atomic<u64> m_pump_frames{ 0 };
+			std::atomic<u64> m_pump_frames_blank{ 0 };
+			std::atomic<s64> m_display_period_ns{ 0 };
+
+			// The layer the pump submits: what the swapchain holds, once something was released
+			// into it. Guarded by m_mutex.
+			bool m_has_released_image = false;
+			u32 m_layer_width = 0;
+			u32 m_layer_height = 0;
+			bool m_layer_stereo = false;
+
+			// Image bookkeeping, RSX thread only.
 			bool m_image_acquired = false;
+			bool m_image_waited = false;
 			u32 m_acquired_index = 0;
 
 			// What the compositor is told the image holds. The XrSwapchain is created in the sRGB
@@ -721,6 +775,7 @@ namespace armsx3::xr
 			int64_t m_xr_format = 0;
 
 			bool m_logged_waiting_for_session = false;
+			bool m_refresh_rate_requested = false;
 
 			touch_input m_input{};
 
@@ -763,13 +818,16 @@ namespace armsx3::xr
 				xr_log.success("OpenXR session created on graphics queue family %u", binding.queueFamilyIndex);
 
 				// Controllers: the action set has to be attached before the session begins, which
-				// the READY event triggers from poll_events(), so right here.
+				// the READY event triggers from the pump, so right here, before the pump starts.
 				m_input.session_handle = m_session;
 				if (!m_input.create(m_session))
 				{
 					xr_log.warning("Touch controller input unavailable; a Bluetooth pad still works.");
 					m_input.destroy();
 				}
+
+				m_pump_stop = false;
+				m_pump = std::thread([this]() { pump(); });
 				return true;
 			}
 
@@ -824,8 +882,17 @@ namespace armsx3::xr
 				return false;
 			}
 
+			// RSX thread. Takes m_xr_mutex: the pump may be submitting a layer that names this
+			// swapchain.
 			void destroy_xr_swapchain()
 			{
+				std::lock_guard xr_lock(m_xr_mutex);
+
+				{
+					std::lock_guard lock(m_mutex);
+					m_has_released_image = false;
+				}
+
 				if (m_swapchain != XR_NULL_HANDLE)
 				{
 					// An image still acquired would make the destroy fail on some runtimes.
@@ -834,6 +901,7 @@ namespace armsx3::xr
 						XrSwapchainImageReleaseInfo release_info{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
 						g_state.fn.xrReleaseSwapchainImage(m_swapchain, &release_info);
 						m_image_acquired = false;
+						m_image_waited = false;
 					}
 
 					g_state.fn.xrDestroySwapchain(m_swapchain);
@@ -843,7 +911,9 @@ namespace armsx3::xr
 				swapchain_images.clear();
 			}
 
-			// xrPollEvent, and the session state transitions the renderer has to answer.
+			// Pump thread. xrPollEvent, and the session state transitions to answer. The pump is
+			// the only caller of xrBeginFrame/xrEndFrame, so when STOPPING arrives here no frame is
+			// in flight and xrEndSession is legal at once.
 			void poll_events()
 			{
 				XrEventDataBuffer event{ XR_TYPE_EVENT_DATA_BUFFER };
@@ -860,6 +930,7 @@ namespace armsx3::xr
 							break;
 						}
 
+						std::lock_guard lock(m_mutex);
 						m_session_state = changed.state;
 						xr_log.notice("OpenXR session state %d", static_cast<int>(m_session_state));
 
@@ -873,13 +944,12 @@ namespace armsx3::xr
 							{
 								m_session_running = true;
 								xr_log.success("OpenXR session running");
+								request_refresh_rate();
 							}
 							break;
 						}
 						case XR_SESSION_STATE_STOPPING:
 						{
-							// Any frame in flight has to be ended before the session can.
-							end_frame_without_layers();
 							check(g_state.fn.xrEndSession(m_session), "xrEndSession");
 							m_session_running = false;
 							xr_log.notice("OpenXR session stopped (headset idle or app in background)");
@@ -901,9 +971,16 @@ namespace armsx3::xr
 					}
 					case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
 					{
+						std::lock_guard lock(m_mutex);
 						m_session_running = false;
 						m_session_lost = true;
 						xr_log.error("OpenXR instance loss pending; presentation ends here.");
+						break;
+					}
+					case XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB:
+					{
+						const auto& changed = *reinterpret_cast<const XrEventDataDisplayRefreshRateChangedFB*>(&event);
+						xr_log.notice("Display refresh rate changed: %.1f -> %.1f Hz", changed.fromDisplayRefreshRate, changed.toDisplayRefreshRate);
 						break;
 					}
 					default:
@@ -914,27 +991,207 @@ namespace armsx3::xr
 				}
 			}
 
-			void end_frame_without_layers()
+			// Pump thread, with m_mutex held. The PS3 outputs 59.94 or 50 Hz; a 60 Hz display shows
+			// each game frame once (or twice at 30 fps) with no 3:2 cadence, which 72 and 90 Hz
+			// cannot do. Also the cheapest rate for the compositor, on a sealed 640 MHz SoC.
+			// Optional extension: a runtime without it keeps its default rate.
+			void request_refresh_rate()
 			{
-				if (!m_frame_begun)
+				if (m_refresh_rate_requested || g_state.screen.refresh_hz <= 0.f ||
+					!g_state.fn_optional.xrEnumerateDisplayRefreshRatesFB || !g_state.fn_optional.xrRequestDisplayRefreshRateFB)
+				{
+					return;
+				}
+				m_refresh_rate_requested = true;
+
+				u32 count = 0;
+				if (!check(g_state.fn_optional.xrEnumerateDisplayRefreshRatesFB(m_session, 0, &count, nullptr), "xrEnumerateDisplayRefreshRatesFB") || !count)
 				{
 					return;
 				}
 
-				if (m_image_acquired)
+				std::vector<float> rates(count);
+				if (!check(g_state.fn_optional.xrEnumerateDisplayRefreshRatesFB(m_session, count, &count, rates.data()), "xrEnumerateDisplayRefreshRatesFB"))
 				{
-					XrSwapchainImageReleaseInfo release_info{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
-					g_state.fn.xrReleaseSwapchainImage(m_swapchain, &release_info);
-					m_image_acquired = false;
+					return;
 				}
 
-				XrFrameEndInfo end_info{ XR_TYPE_FRAME_END_INFO };
-				end_info.displayTime = m_frame_state.predictedDisplayTime;
-				end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-				end_info.layerCount = 0;
-				end_info.layers = nullptr;
-				g_state.fn.xrEndFrame(m_session, &end_info);
-				m_frame_begun = false;
+				std::string listed;
+				float chosen = 0.f;
+				for (const float rate : rates)
+				{
+					fmt::append(listed, "%.0f ", rate);
+					if (std::fabs(rate - g_state.screen.refresh_hz) < 0.5f)
+					{
+						chosen = rate;
+					}
+				}
+
+				float current = 0.f;
+				if (g_state.fn_optional.xrGetDisplayRefreshRateFB)
+				{
+					g_state.fn_optional.xrGetDisplayRefreshRateFB(m_session, &current);
+				}
+
+				if (chosen == 0.f)
+				{
+					xr_log.notice("Display refresh rates offered: %s(current %.1f); %.0f Hz is not among them, keeping the default", listed, current, g_state.screen.refresh_hz);
+					return;
+				}
+
+				if (check(g_state.fn_optional.xrRequestDisplayRefreshRateFB(m_session, chosen), "xrRequestDisplayRefreshRateFB"))
+				{
+					xr_log.success("Display refresh rate requested: %.0f Hz (offered: %s, was %.1f)", chosen, listed, current);
+				}
+			}
+
+			// The frame loop. One xrWaitFrame/xrBeginFrame/xrEndFrame per display frame for as
+			// long as the session runs, with whatever the swapchain holds.
+			void pump()
+			{
+				pthread_setname_np(pthread_self(), "xr-pump");
+
+				s64 last_report_ns = 0;
+
+				while (!m_pump_stop.load(std::memory_order_relaxed))
+				{
+					poll_events();
+
+					bool running = false;
+					{
+						std::lock_guard lock(m_mutex);
+						running = m_session_running && !m_session_lost;
+					}
+
+					if (!running)
+					{
+						std::this_thread::sleep_for(std::chrono::milliseconds(10));
+						continue;
+					}
+
+					XrFrameWaitInfo wait_info{ XR_TYPE_FRAME_WAIT_INFO };
+					XrFrameState frame_state{ XR_TYPE_FRAME_STATE };
+					const XrResult waited = g_state.fn.xrWaitFrame(m_session, &wait_info, &frame_state);
+					if (waited == XR_ERROR_SESSION_NOT_RUNNING)
+					{
+						continue; // STOPPING raced us; the next poll sees it
+					}
+					if (!check(waited, "xrWaitFrame"))
+					{
+						std::this_thread::sleep_for(std::chrono::milliseconds(10));
+						continue;
+					}
+					m_display_period_ns = frame_state.predictedDisplayPeriod;
+
+					// Layer description and frame, serialised against the renderer's acquire/release.
+					{
+						std::lock_guard xr_lock(m_xr_mutex);
+
+						XrFrameBeginInfo begin_info{ XR_TYPE_FRAME_BEGIN_INFO };
+						const XrResult begun = g_state.fn.xrBeginFrame(m_session, &begin_info);
+						if (begun == XR_ERROR_SESSION_NOT_RUNNING)
+						{
+							continue;
+						}
+						check(begun, "xrBeginFrame");
+
+						m_input.poll(frame_state.predictedDisplayTime, frame_state.predictedDisplayPeriod);
+
+						XrCompositionLayerQuad quads[2];
+						u32 layer_count = 0;
+						{
+							std::lock_guard lock(m_mutex);
+							if (frame_state.shouldRender && m_has_released_image && m_swapchain != XR_NULL_HANDLE)
+							{
+								layer_count = build_layers(quads);
+							}
+						}
+
+						const XrCompositionLayerBaseHeader* layers[2] =
+						{
+							reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quads[0]),
+							reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quads[1]),
+						};
+
+						XrFrameEndInfo end_info{ XR_TYPE_FRAME_END_INFO };
+						end_info.displayTime = frame_state.predictedDisplayTime;
+						end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+						end_info.layerCount = layer_count;
+						end_info.layers = layer_count ? layers : nullptr;
+
+						const XrResult ended = g_state.fn.xrEndFrame(m_session, &end_info);
+						if (ended != XR_ERROR_SESSION_NOT_RUNNING)
+						{
+							check(ended, "xrEndFrame");
+						}
+
+						++m_pump_frames;
+						if (!layer_count) ++m_pump_frames_blank;
+					}
+
+					// A line every 10 s, so a log says how the compositor side kept up.
+					if (frame_state.predictedDisplayTime - last_report_ns > 10'000'000'000ll)
+					{
+						last_report_ns = frame_state.predictedDisplayTime;
+						xr_log.notice("XR pump: %llu frames, %llu without an image, display period %.2f ms",
+							static_cast<unsigned long long>(m_pump_frames.load()), static_cast<unsigned long long>(m_pump_frames_blank.load()),
+							frame_state.predictedDisplayPeriod / 1'000'000.0);
+					}
+				}
+			}
+
+			// With m_mutex held. The screen: a quad straight ahead at the configured distance, in
+			// the LOCAL space, which is gravity-aligned and re-centred by the system's recentre
+			// gesture, so it behaves like a cinema screen rather than following the head.
+			//
+			// Mono: one quad, both eyes, the whole image. Stereo (a 3D game, swapchain at the
+			// double extent): two quads at the same place, one per eye, each showing its half.
+			// The same physical quad seen by each eye with its own image is exactly what a 3D
+			// cinema does; the runtime handles the per-eye projection.
+			u32 build_layers(XrCompositionLayerQuad (&quads)[2]) const
+			{
+				const bool stereo = m_layer_stereo;
+				const u32 eye_width = stereo ? m_layer_width / 2 : m_layer_width;
+				const float width_m = g_state.screen.width_m;
+				const float height_m = width_m * static_cast<float>(m_layer_height) / static_cast<float>(std::max<u32>(eye_width, 1));
+
+				u32 layer_count = 0;
+				const auto add_quad = [&](XrEyeVisibility eye, u32 x_offset)
+				{
+					XrCompositionLayerQuad& quad = quads[layer_count++];
+					quad = XrCompositionLayerQuad{ XR_TYPE_COMPOSITION_LAYER_QUAD };
+					quad.layerFlags = 0;
+					quad.space = m_space;
+					quad.eyeVisibility = eye;
+					quad.subImage.swapchain = m_swapchain;
+					quad.subImage.imageRect.offset = { static_cast<int32_t>(x_offset), 0 };
+					quad.subImage.imageRect.extent = { static_cast<int32_t>(eye_width), static_cast<int32_t>(m_layer_height) };
+					quad.subImage.imageArrayIndex = 0;
+					quad.pose.orientation = { 0.f, 0.f, 0.f, 1.f };
+					quad.pose.position = { 0.f, 0.f, -g_state.screen.distance_m };
+					quad.size = { width_m, height_m };
+				};
+
+				if (stereo)
+				{
+					add_quad(XR_EYE_VISIBILITY_LEFT, 0);
+					add_quad(XR_EYE_VISIBILITY_RIGHT, eye_width);
+				}
+				else
+				{
+					add_quad(XR_EYE_VISIBILITY_BOTH, 0);
+				}
+
+				return layer_count;
+			}
+
+			void stop_pump()
+			{
+				if (m_pump.joinable())
+				{
+					m_pump_stop = true;
+					m_pump.join();
+				}
 			}
 
 			// An empty submission on the graphics queue, to signal or consume the renderer's
@@ -1000,6 +1257,7 @@ namespace armsx3::xr
 
 			~swapchain() override
 			{
+				stop_pump();
 				g_state.swapchain_alive = false;
 			}
 
@@ -1009,7 +1267,7 @@ namespace armsx3::xr
 			bool init() override
 			{
 				// Called with m_width / m_height set by swapchain_base::init(w, h); recreating
-				// the XrSwapchain is the resize path, the session persists.
+				// the XrSwapchain is the resize path, the session (and its pump) persist.
 				if (!ensure_session())
 				{
 					return false;
@@ -1034,18 +1292,28 @@ namespace armsx3::xr
 				swapchain_info.arraySize = 1;
 				swapchain_info.mipCount = 1;
 
-				if (!check(g_state.fn.xrCreateSwapchain(m_session, &swapchain_info, &m_swapchain), "xrCreateSwapchain"))
+				XrSwapchain created = XR_NULL_HANDLE;
+				if (!check(g_state.fn.xrCreateSwapchain(m_session, &swapchain_info, &created), "xrCreateSwapchain"))
 				{
-					m_swapchain = XR_NULL_HANDLE;
 					return false;
 				}
 
+				{
+					std::lock_guard xr_lock(m_xr_mutex);
+					std::lock_guard lock(m_mutex);
+					m_swapchain = created;
+					m_layer_width = m_width;
+					m_layer_height = m_height;
+					m_layer_stereo = is_stereo_layout();
+					m_has_released_image = false;
+				}
+
 				init_swapchain_images(dev, 0);
-				m_frame_begun = false;
 				m_image_acquired = false;
+				m_image_waited = false;
 
 				// How the two eyes of a 3D game are laid out in the target: next to each other at
-				// full size, so present() can give each half to its eye. Set here, after the
+				// full size, so the pump can give each half to its eye. Set here, after the
 				// configuration was loaded for this boot (anything set before Emu.Load is
 				// overwritten by it), and re-asserted on every rebuild since the home menu can
 				// change it. The renderer reads it per frame.
@@ -1063,7 +1331,8 @@ namespace armsx3::xr
 
 			void destroy(bool /*full*/ = true) override
 			{
-				end_frame_without_layers();
+				// The pump first: nothing may touch the session once it goes.
+				stop_pump();
 				m_input.destroy();
 				destroy_xr_swapchain();
 
@@ -1091,11 +1360,19 @@ namespace armsx3::xr
 				}
 			}
 
+			// RSX thread. No frame calls here any more: an image, waited for, and the semaphore
+			// the renderer's frame context expects signalled.
 			VkResult acquire_next_swapchain_image(VkSemaphore semaphore, u64 /*timeout*/, u32* result, VkFence fence) override
 			{
-				poll_events();
+				bool lost = false;
+				bool ready = false;
+				{
+					std::lock_guard lock(m_mutex);
+					lost = m_session_lost;
+					ready = m_session_running && m_swapchain != XR_NULL_HANDLE;
+				}
 
-				if (m_session_lost)
+				if (lost)
 				{
 					// Nothing to present to any more. The renderer treats this as a swapchain it
 					// cannot rebuild and drops frames until the emulator stops, which the app does
@@ -1104,7 +1381,7 @@ namespace armsx3::xr
 					return VK_ERROR_SURFACE_LOST_KHR;
 				}
 
-				if (!m_session_running)
+				if (!ready)
 				{
 					// Headset off, app behind the system UI, or the runtime not ready yet. The
 					// renderer spins on TIMEOUT, so pace it here and say so once.
@@ -1119,40 +1396,44 @@ namespace armsx3::xr
 				}
 				m_logged_waiting_for_session = false;
 
-				// A frame the renderer began and never presented.
-				end_frame_without_layers();
-
-				XrFrameWaitInfo wait_info{ XR_TYPE_FRAME_WAIT_INFO };
-				m_frame_state = XrFrameState{ XR_TYPE_FRAME_STATE };
-				if (!check(g_state.fn.xrWaitFrame(m_session, &wait_info, &m_frame_state), "xrWaitFrame"))
+				if (!m_image_acquired)
 				{
-					return VK_TIMEOUT;
+					std::lock_guard xr_lock(m_xr_mutex);
+
+					XrSwapchainImageAcquireInfo acquire_info{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+					u32 index = 0;
+					const XrResult acquired = g_state.fn.xrAcquireSwapchainImage(m_swapchain, &acquire_info, &index);
+					if (acquired == XR_ERROR_CALL_ORDER_INVALID)
+					{
+						// Every image is out (acquired and not released), which the renderer's
+						// dropped-flip path can produce. Nothing to do but wait for a present.
+						return VK_NOT_READY;
+					}
+					if (!check(acquired, "xrAcquireSwapchainImage"))
+					{
+						return VK_TIMEOUT;
+					}
+					m_image_acquired = true;
+					m_image_waited = false;
+					m_acquired_index = index;
 				}
 
-				XrFrameBeginInfo begin_info{ XR_TYPE_FRAME_BEGIN_INFO };
-				if (!check(g_state.fn.xrBeginFrame(m_session, &begin_info), "xrBeginFrame"))
+				if (!m_image_waited)
 				{
-					return VK_TIMEOUT;
-				}
-				m_frame_begun = true;
-
-				// Controllers, once per frame, now that the frame's time is known.
-				m_input.poll(m_frame_state.predictedDisplayTime, m_frame_state.predictedDisplayPeriod);
-
-				XrSwapchainImageAcquireInfo acquire_info{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
-				u32 index = 0;
-				if (!check(g_state.fn.xrAcquireSwapchainImage(m_swapchain, &acquire_info, &index), "xrAcquireSwapchainImage"))
-				{
-					return VK_TIMEOUT;
-				}
-				m_image_acquired = true;
-				m_acquired_index = index;
-
-				XrSwapchainImageWaitInfo image_wait{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
-				image_wait.timeout = 1'000'000'000; // 1 s; the compositor releases images at display rate
-				if (!check(g_state.fn.xrWaitSwapchainImage(m_swapchain, &image_wait), "xrWaitSwapchainImage"))
-				{
-					return VK_TIMEOUT;
+					// Not under m_xr_mutex: this blocks until the compositor has finished reading
+					// the image, which it does at display rate.
+					XrSwapchainImageWaitInfo image_wait{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+					image_wait.timeout = 100'000'000; // 100 ms, then the renderer's own retry
+					const XrResult waited = g_state.fn.xrWaitSwapchainImage(m_swapchain, &image_wait);
+					if (waited == XR_TIMEOUT_EXPIRED)
+					{
+						return VK_TIMEOUT;
+					}
+					if (!check(waited, "xrWaitSwapchainImage"))
+					{
+						return VK_TIMEOUT;
+					}
+					m_image_waited = true;
 				}
 
 				// The runtime guarantees the image is ready; tell the renderer's frame context so
@@ -1162,7 +1443,7 @@ namespace armsx3::xr
 					queue_sync(VK_NULL_HANDLE, semaphore, fence);
 				}
 
-				*result = index;
+				*result = m_acquired_index;
 				return VK_SUCCESS;
 			}
 
@@ -1177,6 +1458,7 @@ namespace armsx3::xr
 				return m_width >= 2 * g_state.screen.width_px && m_width % 2 == 0;
 			}
 
+			// RSX thread. Hand the image back; the pump shows it from its next frame on.
 			VkResult present(VkSemaphore semaphore, u32 index) override
 			{
 				// Consume the renderer's "rendering done" semaphore. Queue order then puts the
@@ -1187,89 +1469,29 @@ namespace armsx3::xr
 					queue_sync(semaphore, VK_NULL_HANDLE, VK_NULL_HANDLE);
 				}
 
-				if (!m_frame_begun || !m_session_running)
+				if (!m_image_acquired)
 				{
-					// Presenting a frame whose xrBeginFrame never happened (the session stopped in
-					// between). Nothing more to do; the semaphore is already consumed.
+					// The swapchain was rebuilt between acquire and present, or the session went.
 					return VK_SUCCESS;
 				}
 
-				if (m_image_acquired)
+				if (index != m_acquired_index)
 				{
-					if (index != m_acquired_index)
-					{
-						xr_log.error("Present of image %u while image %u is the one acquired", index, m_acquired_index);
-					}
-
-					XrSwapchainImageReleaseInfo release_info{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
-					check(g_state.fn.xrReleaseSwapchainImage(m_swapchain, &release_info), "xrReleaseSwapchainImage");
-					m_image_acquired = false;
+					xr_log.error("Present of image %u while image %u is the one acquired", index, m_acquired_index);
 				}
 
-				// The screen: a quad straight ahead at the configured distance, in the LOCAL space,
-				// which is gravity-aligned and re-centred by the system's recentre gesture, so it
-				// behaves like a cinema screen rather than following the head.
-				//
-				// Mono: one quad, both eyes, the whole image. Stereo (a 3D game, swapchain at the
-				// double extent): two quads at the same place, one per eye, each showing its half.
-				// The same physical quad seen by each eye with its own image is exactly what a 3D
-				// cinema does; the runtime handles the per-eye projection.
-				const bool stereo = is_stereo_layout();
-				const u32 eye_width = stereo ? m_width / 2 : m_width;
-				const float width_m = g_state.screen.width_m;
-				const float height_m = width_m * static_cast<float>(m_height) / static_cast<float>(std::max<u32>(eye_width, 1));
+				std::lock_guard xr_lock(m_xr_mutex);
+				XrSwapchainImageReleaseInfo release_info{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+				const bool released = check(g_state.fn.xrReleaseSwapchainImage(m_swapchain, &release_info), "xrReleaseSwapchainImage");
+				m_image_acquired = false;
+				m_image_waited = false;
 
-				XrCompositionLayerQuad quads[2];
-				u32 layer_count = 0;
-
-				const auto add_quad = [&](XrEyeVisibility eye, u32 x_offset)
+				if (released)
 				{
-					XrCompositionLayerQuad& quad = quads[layer_count++];
-					quad = XrCompositionLayerQuad{ XR_TYPE_COMPOSITION_LAYER_QUAD };
-					quad.layerFlags = 0;
-					quad.space = m_space;
-					quad.eyeVisibility = eye;
-					quad.subImage.swapchain = m_swapchain;
-					quad.subImage.imageRect.offset = { static_cast<int32_t>(x_offset), 0 };
-					quad.subImage.imageRect.extent = { static_cast<int32_t>(eye_width), static_cast<int32_t>(m_height) };
-					quad.subImage.imageArrayIndex = 0;
-					quad.pose.orientation = { 0.f, 0.f, 0.f, 1.f };
-					quad.pose.position = { 0.f, 0.f, -g_state.screen.distance_m };
-					quad.size = { width_m, height_m };
-				};
-
-				if (stereo)
-				{
-					add_quad(XR_EYE_VISIBILITY_LEFT, 0);
-					add_quad(XR_EYE_VISIBILITY_RIGHT, eye_width);
-				}
-				else
-				{
-					add_quad(XR_EYE_VISIBILITY_BOTH, 0);
+					std::lock_guard lock(m_mutex);
+					m_has_released_image = true;
 				}
 
-				const XrCompositionLayerBaseHeader* layers[2] =
-				{
-					reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quads[0]),
-					reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quads[1]),
-				};
-
-				XrFrameEndInfo end_info{ XR_TYPE_FRAME_END_INFO };
-				end_info.displayTime = m_frame_state.predictedDisplayTime;
-				end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-				end_info.layerCount = layer_count;
-				end_info.layers = layers;
-
-				const XrResult result = g_state.fn.xrEndFrame(m_session, &end_info);
-				m_frame_begun = false;
-
-				if (result == XR_ERROR_SESSION_NOT_RUNNING)
-				{
-					// Raced a STOPPING we have not polled yet; harmless, the next acquire sees it.
-					return VK_SUCCESS;
-				}
-
-				check(result, "xrEndFrame");
 				return VK_SUCCESS;
 			}
 
@@ -1387,6 +1609,13 @@ namespace armsx3::xr
 				extensions.push_back(name);
 			}
 
+			// Optional: pick the display rate (Meta runtimes). Without it the default rate stays.
+			const bool has_refresh_rate = extension_available(available, XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+			if (has_refresh_rate)
+			{
+				extensions.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+			}
+
 			XrInstanceCreateInfoAndroidKHR android_info{ XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR };
 			android_info.applicationVM = vm;
 			android_info.applicationActivity = activity;
@@ -1415,6 +1644,7 @@ namespace armsx3::xr
 			{
 				return false;
 			}
+			g_state.fn_optional.resolve(g_state.fn.xrGetInstanceProcAddr, g_state.instance, has_refresh_rate);
 
 			XrInstanceProperties properties{ XR_TYPE_INSTANCE_PROPERTIES };
 			if (check(g_state.fn.xrGetInstanceProperties(g_state.instance, &properties), "xrGetInstanceProperties"))
