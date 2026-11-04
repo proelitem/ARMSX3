@@ -165,6 +165,12 @@ namespace armsx3::xr
 			std::atomic<bool> swapchain_alive{ false };
 			std::atomic<bool> active{ false };
 			std::atomic<bool> lightgun{ false };
+			// A trigger that is not a Touch controller's: a WonderFitter's shot frames or a
+			// Bluetooth gun's button, held by the app (set_gun_trigger). Shoots with the gun hand.
+			std::atomic<bool> gun_trigger{ false };
+			// -1: the gun hand follows the last trigger pulled; 0/1: left/right, fixed (a gun
+			// holding one controller, whose Touch trigger is out of reach).
+			std::atomic<int> gun_hand{ -1 };
 
 			vk::xr::hooks hooks{};
 		};
@@ -364,6 +370,7 @@ namespace armsx3::xr
 			// with. A gun stock or a left-handed player need nothing set.
 			u32 aim_hand = right;
 			bool trigger_was_down[2]{ false, false };
+			bool gun_trigger_was_down = false;
 
 			// Per-hand aim correction, for a stock that holds the controller at an angle to the
 			// barrel: a rotation applied in the controller's own frame. Identity until calibrated
@@ -935,8 +942,12 @@ namespace armsx3::xr
 				else
 				{
 					// The gun is whichever controller pulled its trigger last (a stock holds one of
-					// them; a left-handed player holds the other). Its trigger is Cross, the
-					// GunCon 3's trigger; the other hand's trigger keeps its pad meaning.
+					// them; a left-handed player holds the other), unless the app fixed the hand (a
+					// WonderFitter: the controller sits in the gun, its trigger out of reach, the
+					// gun's own trigger arrives as gun_trigger). Its trigger is Cross, the GunCon 3's
+					// trigger; the other hand's trigger keeps its pad meaning.
+					const int fixed_hand = g_state.gun_hand.load();
+					if (fixed_hand == 0 || fixed_hand == 1) aim_hand = static_cast<u32>(fixed_hand);
 					for (u32 h = 0; h < 2; ++h)
 					{
 						if (trigger_down[h] && !trigger_was_down[h])
@@ -949,7 +960,7 @@ namespace armsx3::xr
 								calibrate(h, now, screen);
 								calibrate_armed = true;
 							}
-							else if (aim_hand != h)
+							else if (aim_hand != h && fixed_hand < 0)
 							{
 								aim_hand = h;
 								xr_log.notice("Lightgun: the %s controller is the gun now", h == left ? "left" : "right");
@@ -958,8 +969,20 @@ namespace armsx3::xr
 						trigger_was_down[h] = trigger_down[h];
 					}
 
-					if (!trigger_down[aim_hand]) calibrate_armed = false;
-					if (trigger_down[aim_hand] && !calibrate_armed) digital2 |= CELL_PAD_CTRL_CROSS;
+					// The external trigger shoots with the gun hand, and calibrates it the same
+					// way: the menu button of either controller held while the gun fires.
+					const bool gun_trigger_down = g_state.gun_trigger.load();
+					if (gun_trigger_down && !gun_trigger_was_down && shift)
+					{
+						menu_used_as_shift = true;
+						calibrate(aim_hand, now, screen);
+						calibrate_armed = true;
+					}
+					gun_trigger_was_down = gun_trigger_down;
+
+					const bool shooting = trigger_down[aim_hand] || gun_trigger_down;
+					if (!shooting) calibrate_armed = false;
+					if (shooting && !calibrate_armed) digital2 |= CELL_PAD_CTRL_CROSS;
 					if (trigger_down[aim_hand ^ 1u]) digital2 |= aim_hand == right ? CELL_PAD_CTRL_L2 : CELL_PAD_CTRL_R2;
 				}
 				if (now < start_pulse_until) digital1 |= CELL_PAD_CTRL_START;
@@ -2153,6 +2176,20 @@ namespace armsx3::xr
 	bool lightgun()
 	{
 		return g_state.lightgun.load();
+	}
+
+	void set_gun_trigger(bool down)
+	{
+		g_state.gun_trigger.store(down);
+	}
+
+	void set_gun_hand(int hand)
+	{
+		const int h = hand < 0 ? -1 : hand > 1 ? 1 : hand;
+		if (g_state.gun_hand.exchange(h) != h)
+		{
+			xr_log.notice("Lightgun hand: %s", h < 0 ? "follows the trigger" : h == 0 ? "left, fixed" : "right, fixed");
+		}
 	}
 
 	void recommended_extent(u32& width, u32& height, bool stereo_output)

@@ -45,14 +45,30 @@ l'invité.
   configuration. Nécessaire pour un stock dont le canon n'est pas l'axe de visée de la
   manette, utile pour quiconque tient l'arme de travers. Refaire la calibration remplace
   l'ancienne.
-- **Pistolet physique (WonderFitter en mode VR, ou tout pistolet HID)** : s'il se présente
-  au casque comme un périphérique de pointage (souris, écran tactile ou stylet absolu),
-  l'activité immersive prend sa position sur sa fenêtre comme visée et son bouton principal
-  comme gâchette, quand le mode pistolet est actif. Chaque périphérique inconnu est décrit
-  une fois dans le journal (nom, sources, identifiants) : la première session avec le
-  pistolet dit comment il apparaît, et s'il faut un mappage particulier. Le WonderFitter est
-  un système autonome à caméra dont le mode VR n'est pas documenté publiquement ; cette prise
-  en charge est générique et à confirmer sur l'appareil.
+- **Main fixe** : réglage « Main du pistolet » (Auto / Gauche / Droite) sous l'interrupteur
+  pistolet. Auto suit la gâchette ; avec un WonderFitter connecté, Auto veut dire droite, comme
+  il est monté dans Tremu.
+- **WonderFitter (M17, M416)** : ce n'est pas un périphérique HID mais un accessoire Bluetooth
+  LE qui tient une manette Touch. La manette vise ; le pistolet n'envoie que ce que sa
+  mécanique fait, en notifications sur la caractéristique FFF1 du service FFF0 (le protocole
+  que Tremu parle déjà, `WonderFitterGun.java`) : tir `5B SS 07 07 CK 5D` (trois fois par
+  coup, dédoublonné par le numéro de séquence), chargeur `5C MM CK 5D` (00 retiré, 01 inséré),
+  culasse `60 MM CK 5D`. Pas de trame « relâché » : la gâchette compte comme tenue 150 ms après
+  la dernière trame de tir, ce qui couvre le tir automatique (une trame toutes les 100 ms).
+  Côté ARMSX3 (`com.armsx2.xr.WonderFitterGun`) : le tir passe par la gâchette externe du
+  core XR (`_armsx3_xrGunTrigger`), donc il tire avec la main du pistolet et sert au geste de
+  calibration (menu + tir au centre) ; le chargeur retiré maintient A1 (L1, la pédale relâchée
+  de Time Crisis 4 : on se cache et on recharge) ; la culasse tape A1 150 ms. Le pistolet
+  n'accepte qu'un client : Tremu le lâche avant de lancer ARMSX3, l'activité immersive le prend
+  dans `onResume` et le rend dans `onStop`, et Tremu le reprend. Permissions `BLUETOOTH_SCAN`
+  (neverForLocation) et `BLUETOOTH_CONNECT`, demandées par l'activité immersive quand le mode
+  pistolet est actif.
+- **Autre pistolet Bluetooth/USB (Arkade, Gun4IR, Samco, OpenFIRE...)** : vu par le casque
+  comme manette ou souris. La manette Touch montée dessus vise ; sa gâchette est prise sur les
+  dispositions courantes (bouton 1 de souris, R2, A, axe gâchette droite) et passe par la même
+  gâchette externe ; ses autres boutons arrivent au pad par les gestionnaires de Main (L1/R1 =
+  A1/B1 du GunCon 3, Start, Select). Chaque périphérique inconnu est décrit une fois dans le
+  journal (nom, sources, identifiants) pour ajuster si une disposition diffère.
 
 ## 3. Ce que la latence impose
 

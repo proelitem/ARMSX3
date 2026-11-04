@@ -97,6 +97,22 @@ fun RendererBackendSection(state: MutableState<Settings>) {
                 com.armsx2.xr.XrPresentation.setLightgun(context, on)
             },
         )
+        if (xrLightgun) {
+            // -1 auto, 0 left, 1 right: stored as is, shown as index + 1.
+            var gunHand by androidx.compose.runtime.remember {
+                androidx.compose.runtime.mutableStateOf(com.armsx2.xr.XrPresentation.gunHand(context))
+            }
+            SegmentedRow(
+                label = str("backend.xr.gunHand.label"),
+                description = str("backend.xr.gunHand.description"),
+                options = listOf(str("backend.xr.gunHand.auto"), str("backend.xr.gunHand.left"), str("backend.xr.gunHand.right")),
+                selectedIndex = (gunHand + 1).coerceIn(0, 2),
+                onChange = { index ->
+                    gunHand = index - 1
+                    com.armsx2.xr.XrPresentation.setGunHand(context, index - 1)
+                },
+            )
+        }
     }
 
     if (settings.renderer == "vulkan") {

@@ -87,6 +87,8 @@ struct CoreApi {
   void (*mouseButton)(int index, int button, bool down);
   void (*setPadLightgun)(int port, bool on);
   void (*xrSetLightgun)(bool on);
+  void (*xrGunTrigger)(bool down);
+  void (*xrSetGunHand)(int hand);
   void (*setRenderPosition)(bool portraitTop, int topInset);
   void (*setPadDeviceClasses)(const int *classes, int count);
   bool (*usbDeviceEvent)(int fd, int vendorId, int productId, int event);
@@ -292,6 +294,8 @@ struct CoreLibrary : CoreApi {
     result.mouseButton = reinterpret_cast<decltype(mouseButton)>(dlsym(handle, "_armsx3_mouseButton"));
     result.setPadLightgun = reinterpret_cast<decltype(setPadLightgun)>(dlsym(handle, "_armsx3_setPadLightgun"));
     result.xrSetLightgun = reinterpret_cast<decltype(xrSetLightgun)>(dlsym(handle, "_armsx3_xrSetLightgun"));
+    result.xrGunTrigger = reinterpret_cast<decltype(xrGunTrigger)>(dlsym(handle, "_armsx3_xrGunTrigger"));
+    result.xrSetGunHand = reinterpret_cast<decltype(xrSetGunHand)>(dlsym(handle, "_armsx3_xrSetGunHand"));
     // Optional: a core built before this simply centres the image, as it always did.
     result.setRenderPosition = reinterpret_cast<decltype(setRenderPosition)>(dlsym(handle, "_armsx3_setRenderPosition"));
     // Optional: a core without it reports every port as a standard pad, as it always did.
@@ -1025,6 +1029,18 @@ extern "C" JNIEXPORT void JNICALL Java_com_armsx3_core_ARMSX3_setPadLightgun(JNI
 extern "C" JNIEXPORT void JNICALL Java_com_armsx3_core_ARMSX3_xrSetLightgun(JNIEnv *, jobject, jboolean on) {
   if (coreLib.xrSetLightgun != nullptr) {
     coreLib.xrSetLightgun(on == JNI_TRUE);
+  }
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_armsx3_core_ARMSX3_xrGunTrigger(JNIEnv *, jobject, jboolean down) {
+  if (coreLib.xrGunTrigger != nullptr) {
+    coreLib.xrGunTrigger(down == JNI_TRUE);
+  }
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_armsx3_core_ARMSX3_xrSetGunHand(JNIEnv *, jobject, jint hand) {
+  if (coreLib.xrSetGunHand != nullptr) {
+    coreLib.xrSetGunHand(hand);
   }
 }
 

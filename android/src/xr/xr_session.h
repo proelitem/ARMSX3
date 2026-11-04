@@ -60,6 +60,14 @@ namespace armsx3::xr
 	void set_lightgun(bool on);
 	bool lightgun();
 
+	// A trigger the controllers do not know about: a WonderFitter's shot frames (held for a
+	// moment after each frame by the app, since the gun sends no release) or a Bluetooth gun's
+	// button. Fires with the gun hand, and takes part in its calibration gesture.
+	void set_gun_trigger(bool down);
+	// Which controller is the gun: -1 follows the last trigger pulled (default), 0 left, 1 right.
+	// Fixed when the controller rides in a physical gun, whose own trigger is the one pulled.
+	void set_gun_hand(int hand);
+
 	// The extent the quad swapchain is created at. What GSFrameBase::client_width/height
 	// report while active(), so the present framebuffer and the layer agree.
 	//

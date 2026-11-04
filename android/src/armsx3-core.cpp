@@ -8753,6 +8753,25 @@ extern "C" void _armsx3_xrSetLightgun(bool on) {
 #endif
 }
 
+// A physical gun's trigger (WonderFitter shot frames, a Bluetooth gun's button): fires with
+// the controller that is the gun. The app holds it for a moment after each shot frame.
+extern "C" void _armsx3_xrGunTrigger(bool down) {
+#ifdef ARMSX3_XR
+  armsx3::xr::set_gun_trigger(down);
+#else
+  (void)down;
+#endif
+}
+
+// -1: the gun hand follows the last trigger pulled; 0: left, 1: right (fixed).
+extern "C" void _armsx3_xrSetGunHand(int hand) {
+#ifdef ARMSX3_XR
+  armsx3::xr::set_gun_hand(hand);
+#else
+  (void)hand;
+#endif
+}
+
 extern "C" bool _armsx3_xrActive() {
 #ifdef ARMSX3_XR
   return armsx3::xr::active();

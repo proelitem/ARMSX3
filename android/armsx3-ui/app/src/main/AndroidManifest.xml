@@ -3,6 +3,9 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!-- A WonderFitter gun is a Bluetooth LE device found by scanning for its service (never
+         for location). Asked for at runtime by the headset activity when lightgun mode is on. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <!-- Rumble for a PlayStation pad is written to it directly over USB, because a handheld
          that bridges the controller through its own HID node reports motors it never drives.

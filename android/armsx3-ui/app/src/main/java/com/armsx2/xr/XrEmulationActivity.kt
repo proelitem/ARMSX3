@@ -120,71 +120,129 @@ class XrEmulationActivity : ComponentActivity() {
     // Controller input: Main's handlers hold the pad routing, hotkeys and stick mapping, and
     // they act on process-wide state, so an event is handed to them as if Main had received it.
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (externalGunKey(event)) return true
         val host = MainActivityRuntime.instance
         if (host != null && host !== (this as Any) && host.dispatchKeyEvent(event)) return true
         return super.dispatchKeyEvent(event)
     }
 
     override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {
-        if (externalGun(ev)) return true
+        if (externalGunMotion(ev)) return true
         val host = MainActivityRuntime.instance
         if (host != null && host !== (this as Any) && host.dispatchGenericMotionEvent(ev)) return true
         return super.dispatchGenericMotionEvent(ev)
     }
 
-    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
-        if (externalGun(ev)) return true
-        return super.dispatchTouchEvent(ev)
-    }
+    // ---- physical guns -------------------------------------------------------------------
+    //
+    // In the headset the Touch controller aims, whatever it is mounted on: a physical gun only
+    // contributes its controls. Two kinds exist:
+    //  - the WonderFitter, a Bluetooth LE accessory with its own protocol (WonderFitterGun);
+    //  - any gun the Quest sees as a Bluetooth/USB gamepad or mouse (Arkade, Gun4IR, Samco,
+    //    OpenFIRE...). Its trigger is taken here from the usual layouts (mouse button 1, R2, A,
+    //    the right trigger axis) and fired through the core's XR input, so it shoots with the
+    //    gun hand; every other button reaches the pad through Main's handlers as it would from
+    //    a controller (L1/R1 are the GunCon 3's A1/B1, Start, Select).
+    // Each new input device is described in the log once, which tells how a gun enumerates.
 
-    // A physical lightgun paired to the headset (a Bluetooth/USB HID gun such as a WonderFitter
-    // in its VR mode) shows up as a pointer device: an absolute pointer (touchscreen/stylus
-    // source) or a mouse. Its position over this activity's window is the aim, its primary
-    // button the trigger. Only with the lightgun mode on, and never for the Touch controllers,
-    // which drive the gun inside the core. Every new device is described in the log once, so
-    // the first session with a real gun tells how it enumerates.
     private val seenInputDevices = HashSet<Int>()
-    private var externalGunTrigger = false
+    private var externalKeyTrigger = false
+    private var externalAxisTrigger = false
+    private var externalMouseTrigger = false
 
-    private fun externalGun(ev: MotionEvent): Boolean {
-        if (!XrPresentation.lightgun(this)) return false
-        val device = ev.device ?: return false
-        if (device.isVirtual) return false
+    private fun describe(device: android.view.InputDevice) {
         if (seenInputDevices.add(device.id)) {
             Log.i(TAG, "input device ${device.id}: '${device.name}' sources=0x${Integer.toHexString(device.sources)} " +
                 "vendor=0x${Integer.toHexString(device.vendorId)} product=0x${Integer.toHexString(device.productId)} " +
                 "external=${device.isExternal}")
         }
-        val pointer = ev.isFromSource(android.view.InputDevice.SOURCE_TOUCHSCREEN) ||
-            ev.isFromSource(android.view.InputDevice.SOURCE_STYLUS) ||
-            ev.isFromSource(android.view.InputDevice.SOURCE_MOUSE)
-        if (!pointer || !device.isExternal) return false
+    }
 
-        val w = window.decorView.width.toFloat()
-        val h = window.decorView.height.toFloat()
-        if (w <= 0f || h <= 0f) return false
-        val x = (ev.x / w).coerceIn(0f, 1f)
-        val y = (ev.y / h).coerceIn(0f, 1f)
-        runCatching { com.armsx3.core.ARMSX3.instance.mouseAim(0, x, y) }
+    private fun pushExternalTrigger() {
+        val down = externalKeyTrigger || externalAxisTrigger || externalMouseTrigger
+        runCatching { com.armsx3.core.ARMSX3.instance.xrGunTrigger(down) }
+    }
 
-        val pressed = when (ev.actionMasked) {
-            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_BUTTON_PRESS -> true
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_BUTTON_RELEASE -> false
-            // A touch-type pointer only reports MOVE while it is down; a mouse reports it while
-            // any button is held, so there the primary button decides.
-            MotionEvent.ACTION_MOVE -> !ev.isFromSource(android.view.InputDevice.SOURCE_MOUSE) ||
-                (ev.buttonState and MotionEvent.BUTTON_PRIMARY) != 0
-            else -> (ev.buttonState and MotionEvent.BUTTON_PRIMARY) != 0
+    private fun externalGunKey(event: KeyEvent): Boolean {
+        if (!XrPresentation.lightgun(this)) return false
+        val device = event.device ?: return false
+        if (device.isVirtual) return false
+        describe(device)
+        if (!device.isExternal) return false
+        when (event.keyCode) {
+            KeyEvent.KEYCODE_BUTTON_R2, KeyEvent.KEYCODE_BUTTON_A -> {}
+            else -> return false
         }
-        if (pressed != externalGunTrigger) {
-            externalGunTrigger = pressed
-            runCatching { com.armsx3.Rpcs3Bridge.setPadButton(0, KeyEvent.KEYCODE_BUTTON_A, 0, pressed) }
-        }
+        if (event.repeatCount > 0) return true
+        externalKeyTrigger = event.action == KeyEvent.ACTION_DOWN
+        pushExternalTrigger()
         return true
+    }
+
+    private fun externalGunMotion(ev: MotionEvent): Boolean {
+        if (!XrPresentation.lightgun(this)) return false
+        val device = ev.device ?: return false
+        if (device.isVirtual) return false
+        describe(device)
+        if (!device.isExternal) return false
+        if (ev.isFromSource(android.view.InputDevice.SOURCE_MOUSE)) {
+            val down = (ev.buttonState and MotionEvent.BUTTON_PRIMARY) != 0
+            if (down != externalMouseTrigger) {
+                externalMouseTrigger = down
+                pushExternalTrigger()
+            }
+            // The pointer position means nothing here (the window is never shown); the
+            // event is consumed so it does not become a stray click on Main.
+            return true
+        }
+        if (ev.isFromSource(android.view.InputDevice.SOURCE_JOYSTICK)) {
+            val pull = maxOf(ev.getAxisValue(MotionEvent.AXIS_RTRIGGER), ev.getAxisValue(MotionEvent.AXIS_GAS))
+            val down = pull > 0.55f
+            if (down != externalAxisTrigger) {
+                externalAxisTrigger = down
+                pushExternalTrigger()
+            }
+            // Not consumed: the sticks still go to Main's pad mapping.
+        }
+        return false
+    }
+
+    // ---- the WonderFitter's lifetime -----------------------------------------------------
+    //
+    // The gun accepts one client: Tremu releases it before starting us, we hold it while this
+    // activity is in front and release it in onStop, so Tremu gets it back after the game.
+
+    override fun onResume() {
+        super.onResume()
+        if (XrPresentation.lightgun(this)) {
+            if (WonderFitterGun.permitted(this)) {
+                WonderFitterGun.start(this)
+            } else if (!askedGunPermissions) {
+                askedGunPermissions = true
+                requestPermissions(WonderFitterGun.PERMISSIONS, REQUEST_GUN_PERMISSIONS)
+            }
+        }
+    }
+
+    override fun onStop() {
+        WonderFitterGun.stop()
+        super.onStop()
+    }
+
+    private var askedGunPermissions = false
+
+    @Deprecated("Deprecated in Java")
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        @Suppress("DEPRECATION")
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_GUN_PERMISSIONS && WonderFitterGun.permitted(this) && XrPresentation.lightgun(this)) {
+            WonderFitterGun.start(this)
+        }
     }
 
     companion object {
         private const val TAG = "XrEmulationActivity"
+        private const val REQUEST_GUN_PERMISSIONS = 0x5746
 
         /** Horizon OS composes OpenXR layers only for an activity carrying this category. */
         private const val VR_CATEGORY = "com.oculus.intent.category.VR"

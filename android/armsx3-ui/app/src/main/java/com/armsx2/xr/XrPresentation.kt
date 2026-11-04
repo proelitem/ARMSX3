@@ -19,6 +19,12 @@ object XrPresentation {
     private const val PREFS = "ARMSX2"
     private const val KEY_ENABLED = "xr.virtualScreen"
     private const val KEY_LIGHTGUN = "xr.lightgun"
+    private const val KEY_GUN_HAND = "xr.gunHand"
+
+    /** Gun hand values: the last trigger pulled, or one controller for good. */
+    const val GUN_HAND_AUTO = -1
+    const val GUN_HAND_LEFT = 0
+    const val GUN_HAND_RIGHT = 1
 
     /** Screen placement, metres. 2.4 m wide at 2 m is a large television at couch distance. */
     const val SCREEN_DISTANCE_M = 2.0f
@@ -47,6 +53,24 @@ object XrPresentation {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_LIGHTGUN, on).apply()
     }
 
+    /** Which controller is the gun ([GUN_HAND_AUTO], [GUN_HAND_LEFT] or [GUN_HAND_RIGHT]).
+     *  Auto follows the last trigger pulled, which a controller riding in a WonderFitter never
+     *  is: with that gun connected, auto means the right hand, the way it is mounted. */
+    fun gunHand(context: Context): Int =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getInt(KEY_GUN_HAND, GUN_HAND_AUTO).coerceIn(-1, 1)
+
+    fun setGunHand(context: Context, hand: Int) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putInt(KEY_GUN_HAND, hand.coerceIn(-1, 1)).apply()
+        runCatching { ARMSX3.instance.xrSetGunHand(hand) }
+    }
+
+    /** Pushes the hand choice to the core, with the WonderFitter rule applied. */
+    fun applyGunHand(context: Context, physicalGun: Boolean) {
+        var hand = gunHand(context)
+        if (hand == GUN_HAND_AUTO && physicalGun) hand = GUN_HAND_RIGHT
+        runCatching { ARMSX3.instance.xrSetGunHand(hand) }
+    }
+
     /** Whether a launch from [host] should go through XrEmulationActivity. */
     fun shouldRoute(host: Context?): Boolean = host != null && enabled(host)
 
@@ -65,7 +89,10 @@ object XrPresentation {
             // chosen at boot from this, and the GunCon identity is read when the pads are built.
             val gun = lightgun(activity)
             runCatching { ARMSX3.instance.xrSetLightgun(gun) }
-            if (gun) runCatching { ARMSX3.instance.setPadLightgun(0, true) }
+            if (gun) {
+                runCatching { ARMSX3.instance.setPadLightgun(0, true) }
+                applyGunHand(activity, WonderFitterGun.connected())
+            }
         }
         return ok
     }

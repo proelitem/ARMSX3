@@ -161,6 +161,10 @@ class ARMSX3 {
     external fun setPadLightgun(port: Int, on: Boolean)
     /** Headset: the right controller's aim ray drives mouse 0 and its trigger is Cross. */
     external fun xrSetLightgun(on: Boolean)
+    /** Headset: a physical gun's trigger (WonderFitter, Bluetooth gun), fired with the gun hand. */
+    external fun xrGunTrigger(down: Boolean)
+    /** Headset: which controller is the gun. -1 follows the last trigger pulled, 0 left, 1 right. */
+    external fun xrSetGunHand(hand: Int)
     external fun setRenderPosition(portraitTop: Boolean, topInset: Int)
     external fun setPadDeviceClasses(classes: IntArray)
 
