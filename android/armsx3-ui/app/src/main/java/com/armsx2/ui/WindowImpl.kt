@@ -158,7 +158,13 @@ object WindowImpl {
             }
 
             if (overlayVisible.value) {
-                com.armsx2.ui.emulation.EmulationMenuScreen()
+                // XMB mode: the XMB, as the console shows it over a game; Quick Menu there opens this
+                // pause menu instead until it next closes.
+                if (com.armsx2.ui.xmb.XmbMode.active.value && !com.armsx2.ui.xmb.XmbInGame.classic.value) {
+                    com.armsx2.ui.xmb.XmbInGameMenu()
+                } else {
+                    com.armsx2.ui.emulation.EmulationMenuScreen()
+                }
             }
 
             // Full manager screen over the paused game; dismiss (back or the screen's
@@ -247,9 +253,19 @@ object WindowImpl {
                 // above the one other full-screen layer that opens it.
                 com.armsx2.ui.home.LibraryKeyboard.Overlay(this)
 
+                // Leaving XMB mode: the XMB powering down and ARMSX3's intro, over every screen,
+                // since the XMB itself goes away behind it.
+                com.armsx2.ui.xmb.XmbShutdownOverlay()
+
                 // Transient top-left "Welcome Back!" banner (and any future brief note) — hosted
-                // here for the same reason as the keyboard: reachable above every surface.
-                com.armsx2.ui.WelcomeBannerOverlay(this)
+                // here for the same reason as the keyboard: reachable above every surface. In XMB
+                // mode, the console's notices in the top right instead, the friends', invites' and
+                // compiling ones with it (XmbNotices).
+                if (com.armsx2.ui.xmb.XmbMode.active.value) com.armsx2.ui.xmb.XmbNotices()
+                else com.armsx2.ui.WelcomeBannerOverlay(this)
+
+                // "Compiling PPU modules" while a game compiles code during play (CompileBanner.kt).
+                com.armsx2.ui.CompileBannerOverlay(this)
 
                 // App-wide confirmation prompts. Hosted last so the scrim covers everything,
                 // and here rather than at the call site because a prompt raised from inside a

@@ -224,6 +224,27 @@ internal object SettingsControllerNav {
         registry[id] = Item(id, onConfirm, onLeft, onRight, layer, onSecondary)
         if (selectedId.value == id)
             selectedIndex.intValue = orderedIds().indexOf(id)
+        lateFocus?.let { late ->
+            when {
+                // The pad has moved since, or another layer is on top: that selection stands
+                late.layer != activeLayer.value || selectedId.value != late.fallback -> lateFocus = null
+                id == late.id && layer == late.layer -> {
+                    lateFocus = null
+                    selectById(id)
+                }
+            }
+        }
+    }
+
+    /** A control to select once it registers, for a screen whose controls compose a frame after it asks: the
+     *  in-game menu reopening on the control it was left on (MenuPlace). [fallback] is what was selected when
+     *  it was asked for; if the pad has moved off it by then, that selection stands. */
+    private class LateFocus(val layer: String?, val id: String, val fallback: String?)
+    private var lateFocus: LateFocus? = null
+
+    /** Select [id] in [layer] (null for the base screen) as soon as it registers, unless the pad moves first. */
+    fun focusWhenRegistered(layer: String?, id: String) {
+        lateFocus = LateFocus(layer, id, selectedId.value)
     }
 
     fun unregister(id: String) {
@@ -476,6 +497,18 @@ internal fun Modifier.controllerFocusable(
     // shows the control, and a second scroll at once cancels the list's (the avatar grid's Down)
     scrollIntoView: Boolean = true,
 ): Modifier = composed {
+    // In the XMB (a settings tab composed for its lists, see XmbCollector), a button is an item
+    // that does what the button does, named as the button is: by its id, which for most buttons
+    // is its label's key. One that is not named so is left out of the list.
+    com.armsx2.ui.xmb.LocalXmbCollector.current?.let { collector ->
+        val label = controllerId?.let { com.armsx2.i18n.I18n.find(it) }
+        if (label == null || onConfirm == null) return@composed Modifier
+        val id = remember { Any() }
+        val node = com.armsx2.ui.xmb.XmbNode.Action("c$controllerId", label, collector.icon) { onConfirm() }
+        SideEffect { collector.put(id, node) }
+        DisposableEffect(collector) { onDispose { collector.remove(id) } }
+        return@composed Modifier.onGloballyPositioned { collector.place(id, it.positionInRoot().y) }
+    }
     val navLayer = layer ?: LocalNavLayer.current
     var focused by remember { mutableStateOf(false) }
     val bringIntoView = remember { BringIntoViewRequester() }
@@ -552,8 +585,8 @@ internal fun Modifier.controllerFocusable(
                 // under controller nav, which is what sets `selected`; touch never does).
                 // Borders render identically on every driver.
                 Modifier
-                    .border(3.dp, focusBlue.copy(alpha = 0.30f), shape)
-                    .border(1.5.dp, focusBlue, shape)
+                    .border(3.dp, ringColor().copy(alpha = 0.30f), shape)
+                    .border(1.5.dp, ringColor(), shape)
             } else {
                 Modifier
             }
@@ -565,6 +598,7 @@ internal fun Modifier.controllerFocusable(
  *  MenuDivider so settings rows tie visually into the existing overlay. */
 @Composable
 fun SettingsDivider() {
+    if (com.armsx2.ui.xmb.LocalXmbCollector.current != null) return
     Box(
         Modifier
             .fillMaxWidth()
@@ -596,6 +630,11 @@ fun CollapsibleSection(
     initiallyExpanded: Boolean = false,
     content: @Composable () -> Unit,
 ) {
+    // In the XMB: a list of its own, holding the section's rows.
+    com.armsx2.ui.xmb.LocalXmbCollector.current?.let { c ->
+        com.armsx2.ui.xmb.XmbCollectedSection(c, "c${androidx.compose.runtime.currentCompositeKeyHash}", title, content = content)
+        return
+    }
     var expanded by androidx.compose.runtime.saveable.rememberSaveable(title) {
         mutableStateOf(initiallyExpanded)
     }
@@ -635,6 +674,7 @@ fun CollapsibleSection(
 
 @Composable
 fun HelpText(text: String, modifier: Modifier = Modifier) {
+    if (com.armsx2.ui.xmb.LocalXmbCollector.current != null) return
     Text(
         text = text,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -657,6 +697,23 @@ fun ToggleRow(
     notDefault: Boolean = false,
     onChange: (Boolean) -> Unit,
 ) {
+    // In the XMB: a setting with On and Off.
+    com.armsx2.ui.xmb.LocalXmbCollector.current?.let { c ->
+        com.armsx2.ui.xmb.XmbCollected(
+            c,
+            com.armsx2.ui.xmb.XmbNode.Setting(
+                key = "c${androidx.compose.runtime.currentCompositeKeyHash}",
+                title = label,
+                icon = c.icon,
+                // The XMB plays its own sounds.
+                editor = com.armsx2.ui.xmb.XmbEditor.Toggle({ value }, onChange),
+                value = { if (value) c.on else c.off },
+                description = description,
+                changed = { notDefault },
+            ),
+        )
+        return
+    }
     // Menu SFX: a distinct on/off blip on every flip. Touch, the switch, and the controller's
     // confirm/left/right all route through this, so one wrapper covers every input path; the
     // left/right guards below keep it silent when nothing actually changes.
@@ -737,6 +794,29 @@ fun IntSliderRow(
     notDefault: Boolean = false,
     onChange: (Int) -> Unit,
 ) {
+    // In the XMB: a slider in the side panel.
+    com.armsx2.ui.xmb.LocalXmbCollector.current?.let { c ->
+        com.armsx2.ui.xmb.XmbCollected(
+            c,
+            com.armsx2.ui.xmb.XmbNode.Setting(
+                key = "c${androidx.compose.runtime.currentCompositeKeyHash}",
+                title = label,
+                icon = c.icon,
+                editor = com.armsx2.ui.xmb.XmbEditor.Range(
+                    min = min.toFloat(),
+                    max = max.toFloat(),
+                    step = com.armsx2.ui.xmb.xmbIntStep(min, max),
+                    get = { value.toFloat() },
+                    set = { v -> onChange(Math.round(v).coerceIn(min, max)) },
+                    format = { v -> valueFormatter(Math.round(v).coerceIn(min, max)) },
+                ),
+                value = { valueFormatter(value) },
+                description = description,
+                changed = { notDefault },
+            ),
+        )
+        return
+    }
     // Include the call-site composite-key hash so two sliders that happen to share a
     // label (e.g. the OSD-scale and border-scale rows both labelled "UI Size") get
     // DISTINCT registry ids — otherwise one overwrites the other and the controller
@@ -1039,6 +1119,10 @@ fun SegmentedRow(
     notDefault: Boolean = false,
     onChange: (Int) -> Unit,
 ) {
+    com.armsx2.ui.xmb.LocalXmbCollector.current?.let { c ->
+        xmbChoice(c, label, options, selectedIndex, description, notDefault, onChange)
+        return
+    }
     // Menu SFX: a select blip when the chosen option changes — covers the chip tap and the
     // controller's confirm/left/right, which all route through onChange.
     val emit: (Int) -> Unit = { com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.SELECT); onChange(it) }
@@ -1135,6 +1219,10 @@ fun SegmentedGridRow(
     notDefault: Boolean = false,
     onChange: (Int) -> Unit,
 ) {
+    com.armsx2.ui.xmb.LocalXmbCollector.current?.let { c ->
+        xmbChoice(c, label, options, selectedIndex, description, notDefault, onChange)
+        return
+    }
     Box(
         Modifier
             .fillMaxWidth()
@@ -1345,3 +1433,31 @@ fun Modifier.verticalScrollbar(
     // Reserve the gutter: this padding is the INNER node, so it insets the
     // scrollable rows (not the bar) and keeps them out from under the indicator.
     .padding(end = gutter)
+
+/** A row of choices, in the XMB: a setting whose choices open in the side panel. */
+@Composable
+private fun xmbChoice(
+    c: com.armsx2.ui.xmb.XmbCollector,
+    label: String,
+    options: List<String>,
+    selectedIndex: Int,
+    description: String?,
+    notDefault: Boolean,
+    onChange: (Int) -> Unit,
+) {
+    com.armsx2.ui.xmb.XmbCollected(
+        c,
+        com.armsx2.ui.xmb.XmbNode.Setting(
+            key = "c${androidx.compose.runtime.currentCompositeKeyHash}",
+            title = label,
+            icon = c.icon,
+            editor = com.armsx2.ui.xmb.XmbEditor.Choice(options, { selectedIndex }, onChange),
+            value = { options.getOrNull(selectedIndex).orEmpty() },
+            description = description,
+            changed = { notDefault },
+        ),
+    )
+}
+
+/** The selection ring: the app's blue, or white in XMB mode as the console marks what is selected. */
+private fun ringColor(): Color = if (com.armsx2.ui.xmb.XmbMode.active.value) Color.White else focusBlue

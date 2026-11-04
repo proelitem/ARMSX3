@@ -713,13 +713,9 @@ DECLARE(spu_runtime::tr_all) = []
 			// Load g_dispatcher
 			c.mov(a64::x4, Imm(reinterpret_cast<u64>(g_dispatcher)));
 			// Update block hash
-			c.mov(a64::x5, Imm(0));
-			c.str(a64::x5, arm::Mem(a64::x19, ::offset32(&spu_thread::block_hash))); // REG_Base + offset(spu_thread::block_hash)
+			c.str(a64::xzr, arm::Mem(a64::x19, ::offset32(&spu_thread::block_hash))); // REG_Base + offset(spu_thread::block_hash)
 			// Jump to [g_dispatcher + idx * 8]
-			c.mov(a64::x6, Imm(8));
-			c.mul(a64::x6, a64::x3, a64::x6);
-			c.add(a64::x4, a64::x4, a64::x6);
-			c.ldr(a64::x4, arm::Mem(a64::x4));
+			c.ldr(a64::x4, arm::Mem(a64::x4, a64::x3, arm::lsl(3)));
 			c.br(a64::x4);
 			// Unreachable guard
 			c.brk(0x42);
@@ -1401,28 +1397,6 @@ void spu_cache::initialize(bool build_existing_cache)
 			const u32 start = func.lower_bound;
 			const u32 size0 = ::size32(func.data);
 
-			be_t<u64> hash_start;
-			{
-				sha1_context ctx;
-				u8 output[20];
-
-				sha1_starts(&ctx);
-				sha1_update(&ctx, reinterpret_cast<const u8*>(func.data.data()), func.data.size() * 4);
-				sha1_finish(&ctx, output);
-				std::memcpy(&hash_start, output, sizeof(hash_start));
-			}
-
-			// Check hash against allowed bounds
-			const bool inverse_bounds = g_cfg.core.spu_llvm_lower_bound > g_cfg.core.spu_llvm_upper_bound;
-
-			if ((!inverse_bounds && (hash_start < g_cfg.core.spu_llvm_lower_bound || hash_start > g_cfg.core.spu_llvm_upper_bound)) ||
-				(inverse_bounds && (hash_start < g_cfg.core.spu_llvm_lower_bound && hash_start > g_cfg.core.spu_llvm_upper_bound)))
-			{
-				spu_log.error("[Debug] Skipped function %s", fmt::base57(hash_start));
-				result++;
-				continue;
-			}
-
 			// Initialize LS with function data only
 			for (u32 i = 0, pos = start; i < size0; i++, pos += 4)
 			{
@@ -1794,7 +1768,7 @@ spu_runtime::spu_runtime()
 	// the HW feature bits is worse still (a -sha3 core loading a +sha3 object executes an
 	// illegal instruction). Bump SPU_OBJ_CACHE_VERSION whenever SPU codegen itself changes,
 	// including compile-time switches such as ARMSX3_SPU_ARM64_BYTE_GATHER.
-	// Ported from ouroboros420/rpcsx (8430a6558), key re-derived against our config surface.
+	// Ported from an earlier Android fork (8430a6558), key re-derived against our config surface.
 	{
 		// v3 retires every object written by the ARM64 cache while it was enabled. Those carry an
 		// absolute host address baked in as movz/movk immediates with no relocation covering them,
@@ -10633,15 +10607,7 @@ struct spu_fast : public spu_recompiler_base
 		// Install pointer carefully
 		const bool added = !add_loc->compiled && add_loc->compiled.compare_and_swap_test(nullptr, fn);
 
-		// Check hash against allowed bounds
-		const bool inverse_bounds = g_cfg.core.spu_llvm_lower_bound > g_cfg.core.spu_llvm_upper_bound;
-
-		if ((!inverse_bounds && (m_hash_start < g_cfg.core.spu_llvm_lower_bound || m_hash_start > g_cfg.core.spu_llvm_upper_bound)) ||
-			(inverse_bounds && (m_hash_start < g_cfg.core.spu_llvm_lower_bound && m_hash_start > g_cfg.core.spu_llvm_upper_bound)))
-		{
-			spu_log.error("[Debug] Skipped function %s", fmt::base57(be_t<u64>{m_hash_start}));
-		}
-		else if (added)
+		if (added)
 		{
 			// Send work to LLVM compiler thread
 			g_fxo->get<spu_llvm_thread>().registered.push(m_hash_start, add_loc);

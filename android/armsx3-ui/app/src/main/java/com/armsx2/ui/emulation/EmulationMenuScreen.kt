@@ -955,6 +955,22 @@ private fun SessionPane(state: EmulationMenuUiState, viewModel: EmulationMenuVie
 @Composable
 private fun GraphicsPane(state: EmulationMenuUiState, viewModel: EmulationMenuViewModel) {
     val settings = state.settings
+    // The in-game XMB has the API, the driver and Apply and Restart in a node of their own, which
+    // asks to restart after a change; its Renderer list starts at the resolution.
+    if (com.armsx2.ui.xmb.LocalXmbCollector.current == null) GraphicsBackendRows(settings, viewModel)
+    HorizontalOptions(
+        title = str("renderer.upscale.label"),
+        // Share the full settings-tab list so the sub-native 0.25/0.5/0.75/Native
+        // options aren't dropped in the in-game quick menu.
+        options = com.armsx2.ui.settings.UPSCALE_OPTIONS.map { it.value to it.label },
+        selected = settings.upscaleFloat,
+        onSelect = viewModel::setUpscale,
+    )
+    GraphicsPaneRest(settings, viewModel)
+}
+
+@Composable
+private fun GraphicsBackendRows(settings: com.armsx2.config.Settings, viewModel: EmulationMenuViewModel) {
     HorizontalOptions(
         title = str("tab.renderer"),
         // No "auto" or "software": RPCS3 has no PS3 software rasteriser, and
@@ -987,14 +1003,10 @@ private fun GraphicsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVi
     // looking at the framerate.
     // Removed: PS2 GS dithering.
     CompactAction(str("backend.applyRestart"), "↻", Modifier.fillMaxWidth(), MainActivityRuntime::restart)
-    HorizontalOptions(
-        title = str("renderer.upscale.label"),
-        // Share the full settings-tab list so the sub-native 0.25/0.5/0.75/Native
-        // options aren't dropped in the in-game quick menu.
-        options = com.armsx2.ui.settings.UPSCALE_OPTIONS.map { it.value to it.label },
-        selected = settings.upscaleFloat,
-        onSelect = viewModel::setUpscale,
-    )
+}
+
+@Composable
+private fun GraphicsPaneRest(settings: com.armsx2.config.Settings, viewModel: EmulationMenuViewModel) {
     // Custom internal resolution, same control as the settings tab — the quick menu only offered
     // the preset steps, so a value between them (or set per-game) could be neither seen nor
     // changed from in-game. Percentage of native: 107% is roughly true 480p height.
@@ -1145,7 +1157,7 @@ private fun GraphicsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVi
         // live, not just at the next renderer start.
         MenuSwitchRow(str("renderer.gpuTurbo.label"), settings.ps3.gpuTurbo) { v ->
             viewModel.updateSettings { it.copy(ps3 = it.ps3.copy(gpuTurbo = v)) }
-            runCatching { net.rpcsx.RPCSX.instance.setGpuTurbo(v) }
+            runCatching { com.armsx3.core.ARMSX3.instance.setGpuTurbo(v) }
         }
     // Overlay artwork, switchable from in-game — trying bezels means seeing them ON the game, and
     // having to leave for All Settings each time made that unusable. Import still lives in the
@@ -1208,6 +1220,8 @@ private fun GraphicsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVi
         onEnabledChange = { on -> viewModel.updateSettings { it.copy(shaderChainEnabled = on) } },
         onPresetChange = { path -> viewModel.updateSettings { it.copy(shaderChainPreset = path) } },
         onParamsChange = { next -> viewModel.updateSettings { it.copy(shaderChainParams = next) } },
+        scale = settings.shaderChainScale,
+        onScaleChange = { percent -> viewModel.updateSettings { it.copy(shaderChainScale = percent) } },
     )
     com.armsx2.ui.common.ShaderManagerSection()
 }
@@ -1216,7 +1230,11 @@ private fun GraphicsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVi
 private fun PerformancePane(state: EmulationMenuUiState, viewModel: EmulationMenuViewModel) {
     val settings = state.settings
     SectionCard(str("perf.speedLimit.label")) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        if (com.armsx2.ui.xmb.LocalXmbCollector.current != null) {
+            MenuSwitchRow(str("perf.speedLimit.label"), settings.frameLimitEnable) { enabled ->
+                viewModel.updateSettings { it.copy(frameLimitEnable = enabled) }
+            }
+        } else Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
                 if (settings.frameLimitEnable) "${settings.ps3.clocksScale}%" else str("setup.toggle.off"),
                 modifier = Modifier.weight(1f),
@@ -1477,16 +1495,26 @@ private fun ControlsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVi
         onSelect = { com.armsx2.PadDeviceClass.set(0, it) },
     )
     Spacer(Modifier.height(6.dp))
-    CompactAction(str("pad.controllerMapping"), "⌁", Modifier.fillMaxWidth(), viewModel::openControlsManager)
+    com.armsx2.ui.xmb.LocalXmbCollector.current?.let { c ->
+        com.armsx2.ui.xmb.XmbCollected(c, com.armsx2.ui.xmb.xmbControllerMappingNode())
+    } ?: CompactAction(str("pad.controllerMapping"), "⌁", Modifier.fillMaxWidth(), viewModel::openControlsManager)
     Spacer(Modifier.height(6.dp))
     CompactAction(str("pad.editTouchLayout"), "✥", Modifier.fillMaxWidth(), viewModel::editTouchControls)
     Spacer(Modifier.height(6.dp))
     // Sits with the touch layout because it's the same job: what the on-screen pad LOOKS
     // like, right after where it's laid out. Full-screen like Controller mapping.
-    CompactAction(str("tab.skins"), "◈", Modifier.fillMaxWidth(), viewModel::openSkins)
+    com.armsx2.ui.xmb.LocalXmbCollector.current?.let { c ->
+        com.armsx2.ui.xmb.XmbCollected(c, com.armsx2.ui.xmb.xmbTabFolder("ingame.skins", str("tab.skins"), "tex_thema") {
+            com.armsx2.ui.settings.SkinsTab(com.armsx2.ui.InGameOverlay.settingsState)
+        })
+    } ?: CompactAction(str("tab.skins"), "◈", Modifier.fillMaxWidth(), viewModel::openSkins)
     Spacer(Modifier.height(6.dp))
     // Hotkeys, under Skins: All Settings' Hotkeys page, opened straight over the game.
-    CompactAction(str("tab.hotkeys"), "⌘", Modifier.fillMaxWidth(), viewModel::openHotkeys)
+    com.armsx2.ui.xmb.LocalXmbCollector.current?.let { c ->
+        com.armsx2.ui.xmb.XmbCollected(c, com.armsx2.ui.xmb.xmbTabFolder("ingame.hotkeys", str("tab.hotkeys"), "tex_remote") {
+            com.armsx2.ui.settings.HotkeysTab(com.armsx2.ui.InGameOverlay.settingsState)
+        })
+    } ?: CompactAction(str("tab.hotkeys"), "⌘", Modifier.fillMaxWidth(), viewModel::openHotkeys)
     // Motion / gyroscope controls in-game (mode, sensitivity, smoothing, invert). Global scope
     // to match the rumble toggle above; the per-game scope lives in All Settings › Controls.
     com.armsx2.ui.settings.GyroSection()
@@ -1500,14 +1528,16 @@ private fun OptionsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVie
     val settings = state.settings
     // Item 3: gateway to the full per-game settings (all categories the compact menu omits:
     // OSD, Skins, Audio, Hotkeys, Network, Recompiler, ...).
-    CompactAction(str("action.allSettings"), "⚙", Modifier.fillMaxWidth(), viewModel::openFullSettings)
+    // The in-game XMB has its own Settings column and Core Settings, and no screen to open over it.
+    val xmb = com.armsx2.ui.xmb.LocalXmbCollector.current != null
+    if (!xmb) CompactAction(str("action.allSettings"), "⚙", Modifier.fillMaxWidth(), viewModel::openFullSettings)
     Spacer(Modifier.height(6.dp))
     // ...and the whole core config beneath it, scoped to this game. The rows in this pane are
     // the handful of RPCS3 switches worth flipping mid-session; everything else lived behind
     // the library drawer, where it could only be set globally.
     // Glyph is one already proven to render in the shipped font: "▩" (U+25A9) and "⏻" (U+23FB)
     // come out as tofu boxes on device, while "▣" is used by the BIOS/onboarding screens.
-    CompactAction(str("core.settings.title"), "▣", Modifier.fillMaxWidth(), viewModel::openCoreSettings)
+    if (!xmb) CompactAction(str("core.settings.title"), "▣", Modifier.fillMaxWidth(), viewModel::openCoreSettings)
     Spacer(Modifier.height(6.dp))
     // In-game access to the manager screens. Memory cards and PNACH are gone
     // (no PS3 equivalent); patches now have their own per-game list above.
@@ -1529,7 +1559,7 @@ private fun OptionsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVie
     // Patches for THIS game only. Desktop RPCS3 scopes the in-game patch list to
     // the running title, and the global list is ~2000 entries -- unusable mid
     // session and not what you want anyway.
-    com.armsx2.ui.patches.Ps3PatchesTab(
+    if (!xmb) com.armsx2.ui.patches.Ps3PatchesTab(
         serial = com.armsx2.runtime.MainActivityRuntime.currentGame.value?.serial.orEmpty(),
     )
     Spacer(Modifier.height(6.dp))
@@ -1935,6 +1965,11 @@ private fun DiscSection(viewModel: EmulationMenuViewModel, swap: Boolean) {
 
 @Composable
 internal fun SectionCard(title: String, content: @Composable ColumnScope.() -> Unit) {
+    // In the in-game XMB (a pane composed for its lists, see XmbPauseTab): a list of its own.
+    com.armsx2.ui.xmb.LocalXmbCollector.current?.let { c ->
+        com.armsx2.ui.xmb.XmbCollectedSection(c, "p${androidx.compose.runtime.currentCompositeKeyHash}", title) { Column { content() } }
+        return
+    }
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(17.dp),
@@ -1956,9 +1991,38 @@ internal fun <T> HorizontalOptions(
     selected: T,
     onSelect: (T) -> Unit,
 ) {
+    // In the XMB a choice is one setting, not a list holding one.
+    com.armsx2.ui.xmb.LocalXmbCollector.current?.let { c ->
+        xmbPauseChoice(c, title, options, selected, onSelect)
+        return
+    }
     SectionCard(title) {
         HorizontalOptionRow(options, selected, keyPrefix = title, onSelect = onSelect)
     }
+}
+
+/** A row of chips in the in-game XMB: a setting whose choices are the chips. */
+@Composable
+private fun <T> xmbPauseChoice(
+    c: com.armsx2.ui.xmb.XmbCollector,
+    title: String,
+    options: List<Pair<T, String>>,
+    selected: T,
+    onSelect: (T) -> Unit,
+) {
+    val labels = options.map { it.second }
+    val index = options.indexOfFirst { it.first == selected }
+    com.armsx2.ui.xmb.XmbCollected(
+        c,
+        com.armsx2.ui.xmb.XmbNode.Setting(
+            key = "p${androidx.compose.runtime.currentCompositeKeyHash}",
+            title = title,
+            icon = c.icon,
+            editor = com.armsx2.ui.xmb.XmbEditor.Choice(labels, { index.coerceAtLeast(0) }) { i -> options.getOrNull(i)?.let { onSelect(it.first) } },
+            // A value the chips do not offer (one set in Settings) reads as itself.
+            value = { labels.getOrNull(index) ?: selected.toString() },
+        ),
+    )
 }
 
 // Free-choice framerate slider (20–120 Hz) instead of a couple of fixed chips.
@@ -2002,6 +2066,10 @@ private fun <T> HorizontalOptionRow(
     keyPrefix: String,
     onSelect: (T) -> Unit,
 ) {
+    com.armsx2.ui.xmb.LocalXmbCollector.current?.let { c ->
+        xmbPauseChoice(c, keyPrefix, options, selected, onSelect)
+        return
+    }
     Row(
         Modifier
             .fillMaxWidth()
@@ -2048,6 +2116,21 @@ internal fun MenuSwitchRow(
     description: String? = null,
     onCheckedChange: (Boolean) -> Unit,
 ) {
+    com.armsx2.ui.xmb.LocalXmbCollector.current?.let { c ->
+        if (!enabled) return
+        com.armsx2.ui.xmb.XmbCollected(
+            c,
+            com.armsx2.ui.xmb.XmbNode.Setting(
+                key = "p${androidx.compose.runtime.currentCompositeKeyHash}",
+                title = title,
+                icon = c.icon,
+                editor = com.armsx2.ui.xmb.XmbEditor.Toggle({ checked }, onCheckedChange),
+                value = { if (checked) c.on else c.off },
+                description = description,
+            ),
+        )
+        return
+    }
     Surface(
         onClick = { if (enabled) onCheckedChange(!checked) },
         modifier = Modifier
@@ -2098,6 +2181,13 @@ private fun MenuButtonRow(
     glyph: String,
     onClick: () -> Unit,
 ) {
+    com.armsx2.ui.xmb.LocalXmbCollector.current?.let { c ->
+        com.armsx2.ui.xmb.XmbCollected(
+            c,
+            com.armsx2.ui.xmb.XmbNode.Action("p${androidx.compose.runtime.currentCompositeKeyHash}", title, c.icon, description) { onClick() },
+        )
+        return
+    }
     Surface(
         onClick = onClick,
         modifier = Modifier
@@ -2135,6 +2225,14 @@ private fun MenuCycleRow(
     valueLabel: String,
     onStep: (Int) -> Unit,
 ) {
+    // In the XMB: an item showing the value, which X steps on.
+    com.armsx2.ui.xmb.LocalXmbCollector.current?.let { c ->
+        com.armsx2.ui.xmb.XmbCollected(
+            c,
+            com.armsx2.ui.xmb.XmbNode.Action("p${androidx.compose.runtime.currentCompositeKeyHash}", title, c.icon, valueLabel) { onStep(1) },
+        )
+        return
+    }
     Surface(
         onClick = { onStep(1) },
         modifier = Modifier
@@ -2172,6 +2270,10 @@ private fun MenuCycleRow(
 
 @Composable
 private fun CompactAction(title: String, glyph: String, modifier: Modifier, onClick: () -> Unit) {
+    com.armsx2.ui.xmb.LocalXmbCollector.current?.let { c ->
+        com.armsx2.ui.xmb.XmbCollected(c, com.armsx2.ui.xmb.XmbNode.Action("p${androidx.compose.runtime.currentCompositeKeyHash}", title, c.icon) { onClick() })
+        return
+    }
     Surface(
         onClick = onClick,
         modifier = modifier.controllerFocusable("pause.compact.$title", onConfirm = onClick),
@@ -2202,5 +2304,28 @@ private fun Modifier.bleedHorizontal(edge: androidx.compose.ui.unit.Dp): Modifie
     )
     layout(constraints.maxWidth, placeable.height) {
         placeable.placeRelative(-edgePx, 0)
+    }
+}
+
+/**
+ * A pause menu tab for the in-game XMB: the same pane, composed out of sight with an XmbCollector
+ * set, so its rows become the XMB's lists and change the same settings the same way.
+ */
+@Composable
+internal fun XmbPauseTab(tab: EmulationMenuTab) {
+    val viewModel: EmulationMenuViewModel = viewModel()
+    // The pane reads the menu's snapshot of the settings, which the pause menu takes as it opens.
+    LaunchedEffect(Unit) { viewModel.load(null) }
+    val state = viewModel.state.value
+    when (tab) {
+        EmulationMenuTab.Graphics -> GraphicsPane(state, viewModel)
+        EmulationMenuTab.Performance -> PerformancePane(state, viewModel)
+        EmulationMenuTab.Controls -> ControlsPane(state, viewModel)
+        EmulationMenuTab.Options -> OptionsPane(state, viewModel)
+        EmulationMenuTab.Fixes -> {
+            DatabaseSection()
+            com.armsx2.ui.settings.FixesTab(InGameOverlay.settingsState)
+        }
+        else -> Unit
     }
 }

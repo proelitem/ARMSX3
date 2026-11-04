@@ -15,6 +15,7 @@
 #include "Emu/RSX/Overlays/overlay_message.h"
 #include "Emu/VFS.h"
 #include "Emu/system_progress.hpp"
+#include "Emu/android_app_state.h"
 #include "Emu/system_utils.hpp"
 #include "Emu/System.h"
 #include "PPUThread.h"
@@ -217,7 +218,7 @@ extern bool jit_run_recoverable(const std::function<void()>& func, std::string& 
 
 static void ppu_break(ppu_thread&, ppu_opcode_t, be_t<u32>*, ppu_intrp_func*);
 
-extern void do_cell_atomic_128_store(u32 addr, const void* to_write);
+extern void do_cell_atomic_128_store(u32 addr, const void* to_write, bool lock_rsx = true);
 
 const auto ppu_gateway = build_function_asm<void(*)(ppu_thread*)>("ppu_gateway", [](native_asm& c, auto& args)
 {
@@ -5421,7 +5422,7 @@ extern void ppu_precompile(std::vector<std::string>& dir_queue, std::vector<ppu_
 }
 
 // Compile each startup calloc helper after validating its reachable instructions.
-static void ppu_initialize_patch_helpers(const ppu_module<lv2_obj>& owner)
+static void ppu_initialize_patch_helpers()
 {
 	if (g_cfg.core.ppu_decoder != ppu_decoder_type::llvm || !g_fxo->is_init<ppu_patch_block_registry_t>())
 	{
@@ -5569,9 +5570,11 @@ static void ppu_initialize_patch_helpers(const ppu_module<lv2_obj>& owner)
 
 		ppu_module<lv2_obj> helper;
 		helper.name = fmt::format("patch-helper-%x", start);
-		helper.path = owner.path;
-		helper.cache = owner.cache;
-		std::memcpy(helper.sha1, owner.sha1, sizeof(helper.sha1));
+		helper.cache = rpcs3::utils::get_cache_dir() + "patches/";
+		if (!fs::create_path(helper.cache))
+		{
+			fmt::throw_exception("Failed to create cache directory: %s (%s)", helper.cache, fs::g_tls_error);
+		}
 		helper.segs.push_back({start, size, 1, 5, size, vm::base(start)});
 		helper.addr_to_seg_index.emplace(start, 0);
 
@@ -5746,7 +5749,7 @@ extern void ppu_initialize()
 		ppu_initialize(*ptr);
 	}
 
-	ppu_initialize_patch_helpers(_main);
+	ppu_initialize_patch_helpers();
 }
 
 // Run chosen guest functions through the interpreter while everything else stays compiled.
@@ -5956,57 +5959,53 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 	// Difference between function name and current location
 	const u32 reloc = info.is_relocatable ? ::at32(info.segs, 0).addr : 0;
 
-	// Info sent to threads
-	std::vector<std::pair<std::string, ppu_module<lv2_obj>>> workload;
-
 	// Info to load to main JIT instance (true - compiled)
-	std::vector<std::pair<std::string, bool>> link_workload;
-
-	bool compiled_new = false;
-
-	bool has_mfvscr = false;
+	struct link_entry
+	{
+		std::string obj_name;
+		bool is_compiled = false;
+		bool drop = false;
+		std::unique_ptr<llvm::MemoryBuffer> object;
+		ppu_module<lv2_obj> part;
+	};
+	std::vector<link_entry> link_workload;
 
 	const bool is_being_used_in_emulation = vm::base(info.segs[0].addr) == info.segs[0].ptr;
 
 	const cpu_thread* cpu = cpu_thread::get_current();
 
-	for (auto& func : info.get_funcs())
+	// MFVSCR only matters for codegen with accurate SAT bit
+	const bool has_mfvscr = g_cfg.core.ppu_set_sat_bit && [&info]()
 	{
-		if (func.size == 0)
+		for (const auto& func : info.get_funcs())
 		{
-			continue;
-		}
-
-		for (const auto [addr, size] : func)
-		{
-			if (size == 0)
+			if (func.size == 0)
 			{
 				continue;
 			}
 
-			auto i_ptr = ensure(info.get_ptr<u32>(addr));
-
-			for (u32 i = addr; i < addr + size; i += 4, i_ptr++)
+			for (const auto [addr, size] : func)
 			{
-				if (g_ppu_itype.decode(*i_ptr) == ppu_itype::MFVSCR)
+				if (size == 0)
 				{
-					ppu_log.warning("MFVSCR found");
-					has_mfvscr = true;
-					break;
+					continue;
+				}
+
+				auto i_ptr = ensure(info.get_ptr<u32>(addr));
+
+				for (u32 i = addr; i < addr + size; i += 4, i_ptr++)
+				{
+					if (g_ppu_itype.decode(*i_ptr) == ppu_itype::MFVSCR)
+					{
+						ppu_log.warning("MFVSCR found");
+						return true;
+					}
 				}
 			}
-
-			if (has_mfvscr)
-			{
-				break;
-			}
 		}
 
-		if (has_mfvscr)
-		{
-			break;
-		}
-	}
+		return false;
+	}();
 
 	// Limit how many modules are per JIt instance
 	// Advantage to lower the limit:
@@ -6304,12 +6303,14 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 		return code_ptr;
 	};
 
-	if (has_mfvscr && g_cfg.core.ppu_set_sat_bit)
+	if (has_mfvscr)
 	{
 		info.attr += ppu_attr::has_mfvscr;
 	}
 
-	while (!jit_mod.init && fpos < info.get_funcs().size())
+	const auto all_funcs = info.get_funcs();
+
+	while (!jit_mod.init && fpos < all_funcs.size())
 	{
 		// Copy module information
 		ppu_module<lv2_obj> part;
@@ -6320,9 +6321,9 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 		usz bcount = 0;
 		usz interp_funcs = 0;
 
-		while (fpos < info.get_funcs().size())
+		while (fpos < all_funcs.size())
 		{
-			auto& func = info.get_funcs()[fpos];
+			auto& func = all_funcs[fpos];
 
 			if (!func.size)
 			{
@@ -6486,7 +6487,9 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 				sha1_update(&ctx, ensure(info.get_ptr<const u8>(func.addr)), func.size);
 			}
 
-			if (fpos >= info.get_funcs().size() || (module_counter % c_modules_per_jit) == (c_modules_per_jit - 1))
+			const bool has_symbol_resolver = fpos >= all_funcs.size() || (module_counter % c_modules_per_jit) == (c_modules_per_jit - 1);
+
+			if (has_symbol_resolver)
 			{
 				// Hash the entire function grouped addresses for the integrity of the symbol resolver function
 				// Potentially occuring during patches
@@ -6602,7 +6605,7 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 				settings += ppu_settings::accurate_cache_line_stores;
 			if (g_cfg.core.ppu_128_reservations_loop_max_length)
 				settings += ppu_settings::reservations_128_byte;
-			if (has_mfvscr && g_cfg.core.ppu_set_sat_bit)
+			if (has_mfvscr)
 				settings += ppu_settings::accurate_sat;
 			if (g_cfg.core.ppu_set_fpcc)
 				settings += ppu_settings::accurate_fpcc, fmt::throw_exception("FPCC Not implemented");
@@ -6610,7 +6613,7 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 				settings += ppu_settings::accurate_vnan, settings -= ppu_settings::fixup_vnan, fmt::throw_exception("VNAN Not implemented");
 			if (g_cfg.core.ppu_use_nj_bit)
 				settings += ppu_settings::accurate_nj_mode, fmt::throw_exception("NJ Not implemented");
-			if (fpos >= info.get_funcs().size() || (module_counter % c_modules_per_jit) == (c_modules_per_jit - 1))
+			if (has_symbol_resolver)
 				settings += ppu_settings::contains_symbol_resolver; // Avoid invalidating all modules for this purpose
 			if (g_cfg.core.set_daz_and_ftz)
 				settings += ppu_settings::daz_and_ftz;
@@ -6625,43 +6628,90 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 		}
 
 		module_counter++;
+		link_workload.push_back(link_entry{
+			.obj_name = std::move(obj_name),
+			.is_compiled = false,
+			.drop = false,
+			.object = nullptr,
+			.part = std::move(part)
+		});
+	}
 
-		if (!check_only)
-		{
-			link_workload.emplace_back(obj_name, false);
-		}
+	// Multithreaded load_object
+	atomic_t<bool> compiled_new = false;
+	{
+		atomic_t<bool> check_only_needs_compilation = false;
 
-		// Check object file
-		if (jit_compiler::check(cache_path + obj_name))
+		const usz thread_count = std::min<usz>(link_workload.size(), rpcs3::utils::get_max_threads());
+		const usz num_threads_succeeded = map_workload("PPU Loader "sv, thread_count, link_workload.size(), [&](usz index)
 		{
-			if (!is_being_used_in_emulation && !check_only)
+			if (check_only_needs_compilation || (cpu ? cpu->state.all_of(cpu_flag::exit) : Emu.IsStopped()))
 			{
-				ppu_log.success("LLVM: Module exists: %s", obj_name);
-				link_workload.pop_back();
+				return;
 			}
 
-			continue;
+			link_entry& entry = ::at32(link_workload, index);
+
+			// Check object file
+			if (auto object = jit_compiler::load_object(cache_path + entry.obj_name))
+			{
+				if (!check_only)
+				{
+					if (is_being_used_in_emulation)
+					{
+						entry.object = std::move(object);
+					}
+					else
+					{
+						ppu_log.success("LLVM: Module exists: %s", entry.obj_name);
+						entry.drop = true;
+					}
+				}
+
+				return;
+			}
+
+			if (check_only || check_only_needs_compilation)
+			{
+				check_only_needs_compilation = true;
+				return;
+			}
+
+			// Remember, used in ppu_initialize(void)
+			compiled_new = true;
+
+			// Adjust information (is_compiled)
+			entry.is_compiled = true;
+		});
+
+		if (thread_count != num_threads_succeeded)
+		{
+			ppu_log.error("%d PPU Loader thread(s) failed with an exception!", thread_count - num_threads_succeeded);
 		}
 
 		if (check_only)
 		{
-			return true;
+			return check_only_needs_compilation;
 		}
-
-		// Remember, used in ppu_initialize(void)
-		compiled_new = true;
-
-		// Adjust information (is_compiled)
-		link_workload.back().second = true;
-
-		// Fill workload list for compilation
-		workload.emplace_back(std::move(obj_name), std::move(part));
 	}
 
-	if (check_only)
+	// Remove dropped entries
+	std::erase_if(link_workload, [](const link_entry& entry) { return entry.drop; });
+
+	// Fill workload list for compilation
+	std::vector<std::pair<std::string, ppu_module<lv2_obj>>> workload;
+
+	for (link_entry& entry : link_workload)
 	{
-		return false;
+		if (entry.is_compiled)
+		{
+			workload.emplace_back(entry.obj_name, std::move(entry.part));
+		}
 	}
+
+	// Compile the parts containing a symbol resolver first (only those have jit_bounds).
+	// They take by far the longest, so starting them last would leave a long single-threaded tail.
+	std::stable_partition(workload.begin(), workload.end(), FN(!!x.second.jit_bounds));
 
 	if (g_progr_ftotal_bits && file_size)
 	{
@@ -6671,6 +6721,22 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 	// Create worker threads for compilation
 	if (!workload.empty())
 	{
+		// ARMSX3: a compile in flight during play, for the app's banner (Emu/android_app_state.h)
+		struct play_compile_scope
+		{
+			bool on;
+
+			explicit play_compile_scope(bool on_) : on(on_)
+			{
+				if (on) g_android_play_compiling++;
+			}
+
+			~play_compile_scope()
+			{
+				if (on) g_android_play_compiling--;
+			}
+		} play_compile{g_fxo->get<progress_dialog_workaround>().show_overlay_message_only};
+
 		// Sync variable to acquire workloads
 		atomic_t<u64> work_cv = 0;
 		atomic_t<u64> work_done = 0;
@@ -7110,7 +7176,7 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 
 		ppu_log.notice("Loading %u modules", link_workload.size());
 
-		for (const auto& [obj_name, is_compiled] : link_workload)
+		for (link_entry& entry : link_workload)
 		{
 			mod_index++;
 
@@ -7132,9 +7198,18 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 			// Skipping only the module that failed is safe for the same reason excluded_funcs is:
 			// a guest function with no compiled code keeps its dispatcher entry and is interpreted.
 			// So the cost of a bad module is its own functions, not the whole executable.
-			if (!jits[mod_index / c_modules_per_jit]->add(cache_path + obj_name))
+			//
+			// A module the cache check already read is added from that buffer instead of being read from
+			// disk a second time; a module compiled just now is read from its file.
+			auto& jit = jits[mod_index / c_modules_per_jit];
+
+			const bool ok = entry.object
+				? jit->add(std::move(entry.object), cache_path + entry.obj_name)
+				: jit->add(cache_path + entry.obj_name);
+
+			if (!ok)
 			{
-				ppu_log.error("LLVM: Failed to load module %s; its functions will be interpreted", obj_name);
+				ppu_log.error("LLVM: Failed to load module %s; its functions will be interpreted", entry.obj_name);
 				failed_module_count++;
 			}
 
@@ -7144,9 +7219,9 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 				g_progr_pdone++;
 			}
 
-			if (!is_compiled)
+			if (ok && !entry.is_compiled)
 			{
-				ppu_log.success("LLVM: Loaded module #%u %s", mod_index, obj_name);
+				ppu_log.success("LLVM: Loaded module #%u %s", mod_index, entry.obj_name);
 			}
 		}
 	}
@@ -7357,6 +7432,12 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 	{
 		// Done
 		g_progr_pdone++;
+	}
+
+	// ARMSX3: one more module compiled during play, for the app's banner (Emu/android_app_state.h)
+	if (compiled_new && g_fxo->get<progress_dialog_workaround>().show_overlay_message_only)
+	{
+		g_android_play_compile_done++;
 	}
 
 	return compiled_new;

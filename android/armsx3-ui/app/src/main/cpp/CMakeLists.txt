@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.10)
 # The JNI GLUE, not the emulator core. Produces libarmsx3-jni.so, which
 # System.loadLibrary("armsx3-jni") brings up; it then dlopen()s the core
 # (libarmsx3-core.so, shipped as a prebuilt in jniLibs) and forwards to its
-# _rpcsx_* entry points. adrenotools lives HERE rather than in the core, so the
+# _armsx3_* entry points. adrenotools lives HERE rather than in the core, so the
 # emulator stays free of a Qualcomm-specific dependency.
 project("armsx3-jni")
 
@@ -174,3 +174,21 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64"
     target_compile_features(armsx2_discord PRIVATE cxx_std_17)
     target_link_libraries(armsx2_discord discord_partner_sdk log android)
 endif()
+
+# ---------------------------------------------------------------------------
+# XMB mode's video shaders -> libxmbvideo.so
+#
+# A video's picture through a RetroArch (.slangp) shader chain: the decoder writes into an image
+# reader, Vulkan imports each frame's hardware buffer (YUV through a sampler conversion), and
+# librashader runs the chain onto the player's surface. librashader.so is dlopen()ed through its
+# permissive loader header, as the core does for games, so nothing MPL links in. Its own target
+# because it is the one Vulkan user here and has nothing to share with the glue.
+# ---------------------------------------------------------------------------
+add_library(xmbvideo SHARED xmbvideo/xmb_video_shader.cpp)
+target_include_directories(xmbvideo PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/xmbvideo
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../3rdparty/librashader/include
+)
+target_compile_features(xmbvideo PRIVATE cxx_std_20)
+target_compile_options(xmbvideo PRIVATE -Wall)
+target_link_libraries(xmbvideo android nativewindow mediandk vulkan log)

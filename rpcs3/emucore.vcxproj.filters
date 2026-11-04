@@ -915,6 +915,9 @@
     <ClCompile Include="Emu\RSX\Overlays\overlay_edit_text.cpp">
       <Filter>Emu\GPU\RSX\Overlays</Filter>
     </ClCompile>
+    <ClCompile Include="Emu\RSX\Overlays\overlay_gauge_button.cpp">
+      <Filter>Emu\GPU\RSX\Overlays</Filter>
+    </ClCompile>
     <ClCompile Include="Emu\RSX\Overlays\overlay_progress_bar.cpp">
       <Filter>Emu\GPU\RSX\Overlays</Filter>
     </ClCompile>
@@ -958,6 +961,9 @@
       <Filter>Emu\Io</Filter>
     </ClCompile>
     <ClCompile Include="Emu\Io\GunCon3.cpp">
+      <Filter>Emu\Io</Filter>
+    </ClCompile>
+    <ClCompile Include="Emu\Io\nfc_reader.cpp">
       <Filter>Emu\Io</Filter>
     </ClCompile>
     <ClCompile Include="Emu\Io\Buzz.cpp">
@@ -2337,7 +2343,16 @@
     <ClInclude Include="Emu\Io\LogitechG27Config.h">
       <Filter>Emu\Io</Filter>
     </ClInclude>
+    <ClInclude Include="Emu\Io\mifare_types.h">
+      <Filter>Emu\Io</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\Io\nfc_reader.h">
+      <Filter>Emu\Io</Filter>
+    </ClInclude>
     <ClInclude Include="Emu\Io\usio.h">
+      <Filter>Emu\Io</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\Io\usio_types.h">
       <Filter>Emu\Io</Filter>
     </ClInclude>
     <ClInclude Include="Emu\NP\np_handler.h">
@@ -2486,6 +2501,9 @@
       <Filter>Emu\GPU\RSX\Overlays</Filter>
     </ClInclude>
     <ClInclude Include="Emu\RSX\Overlays\overlay_edit_text.hpp">
+      <Filter>Emu\GPU\RSX\Overlays</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\RSX\Overlays\overlay_gauge_button.h">
       <Filter>Emu\GPU\RSX\Overlays</Filter>
     </ClInclude>
     <ClInclude Include="Emu\RSX\Overlays\overlay_progress_bar.hpp">

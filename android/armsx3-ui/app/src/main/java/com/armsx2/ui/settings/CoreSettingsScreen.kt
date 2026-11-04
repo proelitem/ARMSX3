@@ -37,7 +37,7 @@ import com.armsx2.i18n.str
 import com.armsx2.ui.common.ArmsBackdrop
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import net.rpcsx.RPCSX
+import com.armsx3.core.ARMSX3
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -48,7 +48,7 @@ import org.json.JSONObject
  * player actually touches. But the PS3 config is far larger than any hand-written screen
  * can track, and a static UI silently goes stale the moment upstream adds or renames a
  * node (which is exactly how 176 of the 245 search-index entries ended up naming PCSX2
- * settings). Nothing here is hardcoded: _rpcsx_settingsGet("") walks g_cfg and emits the
+ * settings). Nothing here is hardcoded: _armsx3_settingsGet("") walks g_cfg and emits the
  * whole tree with each node's type, current value, default, enum variants and range, and
  * this renders whatever it finds.
  *
@@ -57,10 +57,10 @@ import org.json.JSONObject
  */
 
 /** One firmware library Libraries Control can name, and how it runs when it is not named. */
-private data class FirmwareLibrary(val name: String, val defaultHle: Boolean)
+internal data class FirmwareLibrary(val name: String, val defaultHle: Boolean)
 
 /** One editable leaf of the core config tree. */
-private data class CoreSetting(
+internal data class CoreSetting(
     val path: String,
     val name: String,
     val section: String,
@@ -79,7 +79,7 @@ private data class CoreSetting(
 )
 
 /** Flatten the tree the core emits into a list of leaves, remembering each one's path. */
-private fun flatten(
+internal fun flatten(
     node: JSONObject,
     prefix: String,
     section: String,
@@ -132,13 +132,13 @@ private fun flatten(
 
 /** A value as settingsSet takes it (JSON) in the form the tree reports it: bools and numbers bare,
  *  strings unquoted, sets as their array. */
-private fun decodeJson(json: String): String =
+internal fun decodeJson(json: String): String =
     runCatching { JSONArray("[$json]").get(0).toString() }.getOrDefault(json)
 
 /** Whether two values of a node read the same. By number where both are one, since the curated
  *  push writes a float as "1.0" and the tree can report the same value as "1"; by membership for a
  *  set, which has no order. */
-private fun sameValue(type: String, a: String, b: String): Boolean {
+internal fun sameValue(type: String, a: String, b: String): Boolean {
     if (a == b) return true
     if (type == "set") {
         fun members(json: String) = runCatching {
@@ -209,7 +209,7 @@ fun CoreSettingsScreen(onBack: () -> Unit, scope: SettingsScope, serial: String?
     LaunchedEffect(revision) {
         val loaded = withContext(Dispatchers.IO) {
             runCatching {
-                val raw = RPCSX.instance.settingsGet("")
+                val raw = ARMSX3.instance.settingsGet("")
                 if (raw.isBlank()) return@runCatching emptyList<CoreSetting>()
                 buildList { flatten(JSONObject(raw), "", "", this) }
             }
@@ -264,7 +264,7 @@ fun CoreSettingsScreen(onBack: () -> Unit, scope: SettingsScope, serial: String?
         // Defaults first, curated second: applyTo below rewrites every node it owns, so the
         // only ones this actually decides are the nodes no curated screen touches.
         settings.forEach {
-            runCatching { RPCSX.instance.settingsSet(it.path, encode(it.type, it.default)) }
+            runCatching { ARMSX3.instance.settingsSet(it.path, encode(it.type, it.default)) }
         }
         reapplyCurated()
     }
@@ -291,7 +291,7 @@ fun CoreSettingsScreen(onBack: () -> Unit, scope: SettingsScope, serial: String?
 
     fun write(setting: CoreSetting, raw: String) {
         val encoded = encode(setting.type, raw)
-        runCatching { RPCSX.instance.settingsSet(setting.path, encoded) }
+        runCatching { ARMSX3.instance.settingsSet(setting.path, encoded) }
         // Remember it, or applyTo will write the curated store back over this node the next
         // time any setting changes or the next time a game boots. Into this screen's tier:
         // a node set from the in-game menu belongs to the title being played, not to the

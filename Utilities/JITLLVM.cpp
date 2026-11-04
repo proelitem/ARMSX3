@@ -672,21 +672,36 @@ public:
 		{
 			const std::vector<u8> cached_data = cached.to_vector<u8>();
 
-			if (cached_data.empty()) [[unlikely]]
+			if (cached_data.size() < 18) [[unlikely]] // gzip header + trailer
 			{
 				return nullptr;
 			}
 
-			const std::vector<u8> out = unzip(cached_data);
+			std::unique_ptr<llvm::WritableMemoryBuffer> buf;
 
-			if (out.empty())
+			// Get out size from trailer
+			const u32 out_size = read_from_ptr<u32>(cached_data, cached_data.size() - 4);
+			if (out_size != 0 && out_size <= cached_data.size() * 1032) // Check for impossible sizes
 			{
-				jit_log.error("LLVM: Failed to unzip module: '%s'", path);
-				return nullptr;
+				buf = llvm::WritableMemoryBuffer::getNewUninitMemBuffer(out_size);
 			}
 
-			auto buf = llvm::WritableMemoryBuffer::getNewUninitMemBuffer(out.size());
-			std::memcpy(buf->getBufferStart(), out.data(), out.size());
+			if (!buf || !unzip(cached_data.data(), cached_data.size(), reinterpret_cast<u8*>(buf->getBufferStart()), out_size))
+			{
+				jit_log.error("LLVM: Failed to unzip module directly into the buffer: '%s'", path);
+
+				// Try again with old unzip method
+				const std::vector<u8> out = unzip(cached_data);
+				if (out.empty())
+				{
+					jit_log.error("LLVM: Failed to unzip module: '%s'", path);
+					return nullptr;
+				}
+
+				buf = llvm::WritableMemoryBuffer::getNewUninitMemBuffer(out.size());
+				std::memcpy(buf->getBufferStart(), out.data(), out.size());
+			}
+
 			return buf;
 		}
 
@@ -740,7 +755,7 @@ std::string jit_compiler::cpu(std::string_view _cpu)
 		// smallest one is the wrong default -- fall back to the same wide out-of-order baseline
 		// used when detection fails outright. Only the schedule/cost model is affected: the
 		// instruction set still comes from setMAttrs (HWCAP-gated), so this can never emit an
-		// illegal instruction. Ported from ouroboros420/rpcsx (cc3a18e29), widened to the
+		// illegal instruction. Ported from an earlier Android fork (cc3a18e29), widened to the
 		// A5xx little cores that modern SoCs actually ship.
 		if (m_cpu == "cortex-a34" || m_cpu == "cortex-a35" || m_cpu == "cortex-a53" ||
 			m_cpu == "cortex-a55" || m_cpu == "cortex-a510" || m_cpu == "cortex-a520")
@@ -894,7 +909,7 @@ jit_compiler::jit_compiler(const std::unordered_map<std::string, u64>& _link, st
 		// recoverable path as the fatal handler, so a guarded compile survives and anything
 		// else at least says why it died. Allocating inside a bad-alloc handler is
 		// best-effort, but the failures here are huge single allocations, so a short log
-		// string still succeeds. Ported from ouroboros420/rpcsx (39a6a4c36).
+		// string still succeeds. Ported from an earlier Android fork (39a6a4c36).
 		llvm::remove_bad_alloc_error_handler();
 		llvm::install_bad_alloc_error_handler([](void*, const char* msg, bool)
 		{
@@ -999,7 +1014,8 @@ jit_compiler::jit_compiler(const std::unordered_map<std::string, u64>& _link, st
 	std::vector<std::string> attributes;
 
 #if defined(ARCH_ARM64)
-	if (utils::has_sha3())
+	// LLVM groups FEAT_SHA3 and FEAT_SHA512 under the same target feature
+	if (utils::has_sha512() && utils::has_sha3())
 		attributes.push_back("+sha3");
 	else
 		attributes.push_back("-sha3");
@@ -1191,35 +1207,54 @@ bool jit_compiler::add(const std::string& path)
 		return false;
 	}
 
-	if (auto object_file = llvm::object::ObjectFile::createObjectFile(*cache))
+	return add(std::move(cache), path);
+}
+
+bool jit_compiler::add(std::unique_ptr<llvm::MemoryBuffer> object, const std::string& path)
+{
+	if (!object)
 	{
-		m_engine->addObjectFile(llvm::object::OwningBinary<llvm::object::ObjectFile>(std::move(*object_file), std::move(cache)));
+		jit_log.error("ObjectCache: Failed to add nullptr object for file. (path='%s')", path);
+		return false;
+	}
+
+	if (auto object_file = llvm::object::ObjectFile::createObjectFile(*object))
+	{
+		m_engine->addObjectFile(llvm::object::OwningBinary<llvm::object::ObjectFile>(std::move(*object_file), std::move(object)));
 		jit_log.trace("ObjectCache: Successfully added %s", path);
 		return true;
 	}
 	else
 	{
-		jit_log.error("ObjectCache: Adding failed: %s", path);
+		jit_log.error("ObjectCache: Adding failed: %s (%s)", path, llvm::toString(object_file.takeError()));
 		return false;
 	}
 }
 
-bool jit_compiler::check(const std::string& path)
+std::unique_ptr<llvm::MemoryBuffer> jit_compiler::load_object(const std::string& path)
 {
 	if (auto cache = ObjectCache::load(path))
 	{
 		if (auto object_file = llvm::object::ObjectFile::createObjectFile(*cache))
 		{
-			return true;
+			return cache;
+		}
+		else
+		{
+			llvm::consumeError(object_file.takeError());
 		}
 
-		if (fs::remove_file(path))
+		// Remove cached and uncached file
+		const bool removed_gz = fs::remove_file(path + ".gz");
+		const bool removed = fs::remove_file(path);
+
+		if (removed_gz || removed)
 		{
 			jit_log.error("ObjectCache: Removed damaged file: %s", path);
 		}
 	}
 
-	return false;
+	return nullptr;
 }
 
 void jit_compiler::update_global_mapping(const std::string& name, u64 addr)

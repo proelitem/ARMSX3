@@ -104,6 +104,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
@@ -154,11 +156,15 @@ fun HomeScreen(
     var overflowMenu by remember { mutableStateOf(false) }
     var showExitConfirm by remember { mutableStateOf(false) }
     var menuGame by remember { mutableStateOf<GameInfo?>(null) }
+    // The menu was opened with the controller (Triangle), so its first row takes focus.
+    var menuFromPad by remember { mutableStateOf(false) }
     // Set by the context menu's "Install licence" entry; drives the .rap file browser.
     var licenceGame by remember { mutableStateOf<GameInfo?>(null) }
     // The game whose categories are being edited. Its own sheet rather than a submenu, because
     // filing a game usually means ticking more than one box.
     var categoriesGame by remember { mutableStateOf<GameInfo?>(null) }
+    // The game whose caches the long-press menu is about to clear, while the user confirms.
+    var clearCacheGame by remember { mutableStateOf<GameInfo?>(null) }
     var categoryPicker by remember { mutableStateOf(false) }
     // The category being renamed, if any. Long-press a row in the picker.
     var renameCategory by remember { mutableStateOf<String?>(null) }
@@ -176,6 +182,14 @@ fun HomeScreen(
         LibraryBackground.ensureLoaded()
         // The saved backgrounds, and what an older version left as the background, kept now.
         withContext(Dispatchers.IO) { LibraryBackground.loadSaved(context) }?.let(LibraryBackground::select)
+        // Themes kept before their XMB icons and sounds were read get them from their .p3t now, and
+        // XMB mode shows them straight away when it is using one.
+        withContext(Dispatchers.IO) {
+            val restored = LibraryBackground.restoreXmbAssets(context)
+            if (restored.any { it.folder.name == com.armsx2.ui.xmb.XmbTheme.selected.value }) {
+                com.armsx2.ui.xmb.XmbTheme.reapply(context)
+            }
+        }
     }
     // The animated background switched itself off because the last run died with it on screen
     // (LibraryBackground.armSaver). Say so -- silently reverting a setting the user chose reads
@@ -198,10 +212,12 @@ fun HomeScreen(
             // is used as picked, as before, provided it is a picture: .p3t files have no image type,
             // so the picker now lists other files too.
             // Either way it is kept (LibraryBackground.saved), so the menu can bring it back later.
+            var theme = false
             val kept = withContext(Dispatchers.IO) {
                 val name = LibraryBackground.displayName(context, picked)
                 when {
                     LibraryBackground.isTheme(context, picked) -> LibraryBackground.importTheme(context, picked).let { outcome ->
+                        theme = true
                         outcome.messageKey to outcome.file?.let {
                             LibraryBackground.keep(context, outcome, outcome.name ?: name ?: "PS3 theme")
                         }
@@ -213,6 +229,11 @@ fun HomeScreen(
                 }
             }
             kept.second?.let(LibraryBackground::select)
+            // The same theme imported again replaces the copy that was there.
+            if (theme) kept.second?.let { entry ->
+                val gone = LibraryBackground.replaceOlder(entry)
+                withContext(Dispatchers.IO) { gone.forEach { runCatching { it.deleteRecursively() } } }
+            }
             kept.first?.let { Toast.makeText(context, I18n.get(it), Toast.LENGTH_LONG).show() }
         }
     }
@@ -235,7 +256,10 @@ fun HomeScreen(
         viewModel.checkForChanges()
     }
     DisposableEffect(viewModel, onOpenMenu) {
-        HomeInputController.bind(viewModel, onOpenMenu)
+        HomeInputController.bind(viewModel, onOpenMenu) { game ->
+            menuFromPad = true
+            menuGame = game
+        }
         onDispose { HomeInputController.unbind(viewModel) }
     }
 
@@ -243,6 +267,7 @@ fun HomeScreen(
 
     CompositionLocalProvider(LocalCustomCoverMap provides customCoverMap) {
     ArmsBackdrop(
+        ignoreIme = com.armsx2.ui.xmb.XmbMode.active.value,
         // Full-bleed wallpaper: the library image + readability scrim, drawn edge-to-edge
         // (behind the gesture bar) so it never leaves an exposed strip at the bottom —
         // that strip was the "blue bar" in landscape.
@@ -258,7 +283,8 @@ fun HomeScreen(
             // brightness, gets a dark scrim; the XMB is our own controlled backdrop (dark at the
             // top where the content sits) and a heavy scrim just muddied its blue into navy, so
             // it gets only a whisper of dimming.
-            val dimming = LibraryChromePreferences.backgroundDimming.value / 100f
+            // None in XMB mode: the console's XMB sits on its wave with no scrim.
+            val dimming = if (com.armsx2.ui.xmb.XmbMode.active.value) 0f else LibraryChromePreferences.backgroundDimming.value / 100f
             val scrimTop = (if (libraryBg == null) 0.06f else 0.55f) * dimming
             val scrimBottom = (if (libraryBg == null) 0.20f else 0.80f) * dimming
             Box(
@@ -274,6 +300,19 @@ fun HomeScreen(
         },
     ) {
         BoxWithConstraints(modifier.fillMaxSize()) {
+            // XMB mode: the XMB in place of the library. This screen's menus and dialogs stay, so a
+            // game's Triangle menu there is the same one the library opens.
+            if (com.armsx2.ui.xmb.XmbMode.active.value) {
+                com.armsx2.ui.xmb.XmbHome(
+                    state = state,
+                    viewModel = viewModel,
+                    onGameMenu = { game ->
+                        menuFromPad = com.armsx2.ui.common.PadInput.active.value
+                        menuGame = game
+                    },
+                )
+                return@BoxWithConstraints
+            }
             val compact = maxWidth < 600.dp
             // Adaptive cells alone give a tablet MORE columns rather than BIGGER art, so scale the
             // cell width. Bigger cells mean bigger covers and fewer, better-spaced columns. Opt-in:
@@ -324,7 +363,7 @@ fun HomeScreen(
                 emptyList()
             }
             LaunchedEffect(shownRecents) {
-                HomeInputController.setRecents(shownRecents.size) { i ->
+                HomeInputController.setRecents(shownRecents.size, game = { shownRecents.getOrNull(it) }) { i ->
                     shownRecents.getOrNull(i)?.let(viewModel::launch)
                 }
             }
@@ -949,7 +988,17 @@ fun HomeScreen(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 8.dp),
                 )
-                GameMenuAction("▶", str("action.play")) {
+                // Opened with the controller: focus the first row, so the D-pad starts here
+                // instead of spending its first press finding the menu.
+                val playFocus = remember { FocusRequester() }
+                LaunchedEffect(game.uri) {
+                    if (menuFromPad) {
+                        menuFromPad = false
+                        withFrameNanos { }
+                        runCatching { playFocus.requestFocus() }
+                    }
+                }
+                GameMenuAction("▶", str("action.play"), Modifier.focusRequester(playFocus)) {
                     menuGame = null
                     viewModel.launch(game)
                 }
@@ -983,41 +1032,24 @@ fun HomeScreen(
                         menuGame = null
                     }
                 }
-                // Per-game cache clears. The settings screen only offers "clear everything",
-                // which is the wrong tool when one title is misbehaving and another has an hour of
-                // PPU compilation banked. Shaders are offered separately because shaders_cache/
-                // sits INSIDE the ppu-* directory: clearing PPU already takes the shaders, but not
-                // the reverse, and a driver change usually only invalidates the shaders.
-                val cacheStopFirst = str("perf.clearCache.stopFirst")
-                val cacheNoSerial = str("games.clearCache.noSerial")
-                val cacheEmpty = str("games.clearCache.empty")
-                val cacheDone = str("perf.clearCache.done")
-
-                // All three share this: refuse while anything is running, because the live VM
-                // holds these files open and is still writing to them.
-                val clearGameCache = { clear: (java.io.File) -> Pair<Int, Long> ->
-                    val dir = com.armsx2.cache.titleCacheDir(context, game.serial)
-                    val message = when {
-                        MainActivityRuntime.eState.value != EmuState.STOPPED -> cacheStopFirst
-                        dir == null -> cacheNoSerial
-                        !dir.isDirectory -> cacheEmpty
-                        else -> {
-                            val (count, bytes) = clear(dir)
-                            if (count > 0) cacheDone.format(count, com.armsx2.cache.formatBytes(bytes))
-                            else cacheEmpty
-                        }
-                    }
-                    Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
-                }
-
+                // Per-game cache clear, the quick way to reset one misbehaving title without
+                // touching another that has an hour of PPU compilation banked.
+                //
                 // One action, because for a single title the three caches are one thing on disk:
                 // shaders_cache/ and the SPU caches live INSIDE ppu-<hash>-EBOOT.BIN, so clearing
                 // this game's PPU necessarily takes its SPU and shaders with it. Splitting them
                 // here would offer two buttons that cannot do what their names imply. The settings
-                // screen keeps its separate PPU/SPU rows, where the scope is every game at once.
+                // screen keeps its separate PPU/SPU rows, where SPU alone can still be cleared.
+                val cacheStopFirst = str("perf.clearCache.stopFirst")
                 GameMenuAction("\uD83E\uDDF9", str("games.clearCache")) {
                     menuGame = null
-                    clearGameCache { com.armsx2.cache.clearRecompilerCache(it, spuOnly = false) }
+                    // Refuse while anything is running, before asking: the live VM holds these
+                    // files open and is still writing to them.
+                    if (MainActivityRuntime.eState.value != EmuState.STOPPED) {
+                        Toast.makeText(context, cacheStopFirst, Toast.LENGTH_SHORT).show()
+                    } else {
+                        clearCacheGame = game
+                    }
                 }
                 val addToHomeFailed = str("games.addToHome.unsupported")
                 GameMenuAction("📌", str("games.addToHome")) {
@@ -1051,6 +1083,41 @@ fun HomeScreen(
                 }
             }
         }
+    }
+
+    // The long-press menu's cache clear asks first, like the settings rows: the game's next boot
+    // recompiles everything, which can take a long while.
+    clearCacheGame?.let { game ->
+        val cacheStopFirst = str("perf.clearCache.stopFirst")
+        val cacheNoSerial = str("games.clearCache.noSerial")
+        val cacheEmpty = str("games.clearCache.empty")
+        val cacheDone = str("perf.clearCache.done")
+        AlertDialog(
+            onDismissRequest = { clearCacheGame = null },
+            title = { Text(game.displayTitle(EnglishTitles.enabled.value)) },
+            text = { Text(str("perf.clearPpuCache.confirmGame")) },
+            confirmButton = {
+                TextButton(onClick = {
+                    clearCacheGame = null
+                    val dir = com.armsx2.cache.titleCacheDir(context, game.serial)
+                    val message = when {
+                        // Again here, in case a game started while the dialog was open.
+                        MainActivityRuntime.eState.value != EmuState.STOPPED -> cacheStopFirst
+                        dir == null -> cacheNoSerial
+                        !dir.isDirectory -> cacheEmpty
+                        else -> {
+                            val (count, bytes) = com.armsx2.cache.clearRecompilerCache(dir, spuOnly = false)
+                            if (count > 0) cacheDone.format(count, com.armsx2.cache.formatBytes(bytes))
+                            else cacheEmpty
+                        }
+                    }
+                    Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+                }) { Text(str("action.delete")) }
+            },
+            dismissButton = {
+                TextButton(onClick = { clearCacheGame = null }) { Text(str("action.cancel")) }
+            },
+        )
     }
 
     // The game IS needed, when we have it. A RAP's filename is only conventionally the content
@@ -1327,13 +1394,17 @@ fun HomeScreen(
 }
 
 @Composable
-private fun GameMenuAction(glyph: String, label: String, onClick: () -> Unit) {
+private fun GameMenuAction(glyph: String, label: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    // A controller moves focus through these rows (Triangle opens the menu); the focused one
+    // takes the accent outline, since the default focus tint is too faint to follow.
+    var focused by remember { mutableStateOf(false) }
     Surface(
         onClick = onClick,
-        modifier = Modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth().onFocusChanged { focused = it.isFocused },
         shape = RoundedCornerShape(18.dp),
         color = MaterialTheme.colorScheme.surfaceVariant,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.45f)),
+        border = if (focused) BorderStroke(2.dp, MaterialTheme.colorScheme.primary)
+        else BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.45f)),
     ) {
         Row(
             Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
@@ -1354,6 +1425,26 @@ private fun GameMenuAction(glyph: String, label: String, onClick: () -> Unit) {
 @Composable
 internal fun LibraryBackdrop() {
     val context = LocalContext.current
+    // XMB mode has a background of its own: the XMB theme's, or the console's wave in its colour.
+    if (com.armsx2.ui.xmb.XmbMode.active.value) {
+        // The boot animation is the console's own, on its wave, whatever the theme.
+        val theme = com.armsx2.ui.xmb.XmbTheme.entry()?.takeUnless { com.armsx2.ui.xmb.XmbMode.booting.value }
+        if (theme == null) {
+            // The boot animation is the console's, on its wave, whatever the background. One call
+            // for the wave, booting or not: two had the boot's wave view thrown away as the boot
+            // ended and a new one started, which showed the still behind it (a blue flash) and
+            // began the wave again.
+            val booting = com.armsx2.ui.xmb.XmbMode.booting.value
+            when {
+                !booting && LibraryBackground.flurry.value -> SaverBackdrop()
+                !booting && LibraryBackground.animated2D.value -> LibraryWaveBackground(Modifier.fillMaxSize())
+                else -> XmbWave()
+            }
+        } else {
+            SavedBackdrop(Uri.fromFile(theme.picture).toString(), theme.slideshow, theme.scene)
+        }
+        return
+    }
     val libraryBg = LibraryBackground.uri.value
     if (libraryBg == null) {
         // Default: the live PS3-XMB wave (XmbGlView — a GLES3 port of linkev's
@@ -1365,75 +1456,145 @@ internal fun LibraryBackdrop() {
         // bundled still is the cheap floor shown during GL startup (and, once the wave is up,
         // sits hidden behind it). Custom backgrounds below override all of this.
         if (LibraryBackground.flurry.value) {
-            // Flurry, in the same shell as the XMB wave: if GL cannot come up we get the
-            // 2D backdrop rather than a hole, exactly as XmbGlView does below.
-            // Keyed on the selection: an AndroidView factory runs once, so without this
-            // switching saver or preset would leave the old one running.
-            val kind = LibraryBackground.saverKind.value
-            val preset = if (kind == 0) LibraryBackground.flurryPreset.value
-                         else LibraryBackground.rssPreset.value
-            androidx.compose.runtime.key(kind, preset) {
-                var saverGl by remember { mutableStateOf<Boolean?>(null) }
-                if (saverGl == false) {
-                    LibraryWaveBackground(Modifier.fillMaxSize())
-                } else {
-                    AndroidView(
-                        factory = {
-                            SaverGlView(it, LibraryBackground.currentSpec()).apply {
-                                onGlStatus = { ok -> saverGl = ok }
-                            }
-                        },
-                        modifier = Modifier.fillMaxSize(),
-                        onRelease = { it.stop() },
-                    )
-                }
-            }
+            SaverBackdrop()
         } else if (LibraryBackground.animated2D.value) {
             // User opted into the lightweight 2D animated wave everywhere (#Luminz) — the same
             // backdrop GL-fail devices get; skip the GLES3 XmbGlView entirely.
             LibraryWaveBackground(Modifier.fillMaxSize())
         } else {
-            var xmbGlState by remember { mutableStateOf<Boolean?>(null) } // null=starting, true=up, false=failed
-            if (xmbGlState == false) {
-                LibraryWaveBackground(Modifier.fillMaxSize())
-            } else {
-                Image(
-                    painter = painterResource(R.drawable.library_bg_xmb),
-                    contentDescription = null,
-                    modifier = Modifier.fillMaxSize(),
-                    contentScale = ContentScale.Crop,
-                )
-            }
+            XmbWave()
+        }
+    } else {
+        SavedBackdrop(libraryBg, LibraryBackground.slideshow.value, LibraryBackground.scene.value)
+    }
+}
+
+/**
+ * The chosen screensaver (Flurry and the rest), in the same shell as the XMB wave: if GL cannot
+ * come up we get the 2D backdrop rather than a hole, exactly as XmbGlView does. Keyed on the
+ * selection: an AndroidView factory runs once, so without this switching saver or preset would
+ * leave the old one running.
+ */
+@Composable
+private fun SaverBackdrop() {
+    val kind = LibraryBackground.saverKind.value
+    val preset = if (kind == 0) LibraryBackground.flurryPreset.value else LibraryBackground.rssPreset.value
+    androidx.compose.runtime.key(kind, preset) {
+        var saverGl by remember { mutableStateOf<Boolean?>(null) }
+        if (saverGl == false) {
+            LibraryWaveBackground(Modifier.fillMaxSize())
+        } else {
             AndroidView(
-                factory = { XmbGlView(it).apply { onGlStatus = { ok -> xmbGlState = ok } } },
+                factory = {
+                    SaverGlView(it, LibraryBackground.currentSpec()).apply {
+                        onGlStatus = { ok -> saverGl = ok }
+                    }
+                },
                 modifier = Modifier.fillMaxSize(),
+                onRelease = { it.stop() },
+            )
+        }
+    }
+}
+
+/** The live XMB wave, over the colours of its first frame while GL starts, or the 2D wave when GL cannot. */
+@Composable
+private fun XmbWave() {
+    var xmbGlState by remember { mutableStateOf<Boolean?>(null) } // null=starting, true=up, false=failed
+    val floor = waveFloor()
+    if (xmbGlState == false) {
+        LibraryWaveBackground(Modifier.fillMaxSize())
+    } else if (floor != null) {
+        // The bundled still is the built-in blue wave, and under a wave in other colours it flashed
+        // up each time a wave view started again: XMB mode back from a game, the screensaver coming
+        // and going. A CSS angle, 0 up and clockwise, over the screen's projection onto it, as
+        // XmbOriginalColors.shaderDirection gives the wave.
+        Canvas(Modifier.fillMaxSize()) {
+            val a = Math.toRadians(floor.angleDeg.toDouble())
+            val dx = kotlin.math.sin(a).toFloat()
+            val dy = -kotlin.math.cos(a).toFloat()
+            val half = (kotlin.math.abs(size.width * dx) + kotlin.math.abs(size.height * dy)) / 2f
+            drawRect(
+                Brush.linearGradient(
+                    listOf(floor.top, floor.bottom),
+                    start = androidx.compose.ui.geometry.Offset(center.x - dx * half, center.y - dy * half),
+                    end = androidx.compose.ui.geometry.Offset(center.x + dx * half, center.y + dy * half),
+                ),
             )
         }
     } else {
-        // User-picked still image / GIF (Coil handles both), or a dynamic PS3 theme's slides.
-        val slides = LibraryBackground.slideshow.value
-        if (slides != null) {
-            ThemeSlideshow(slides, Modifier.fillMaxSize())
-        } else {
-            AsyncImage(
-                model = ImageRequest.Builder(context).data(libraryBg).crossfade(true).build(),
-                contentDescription = null,
-                modifier = Modifier.fillMaxSize(),
-                contentScale = ContentScale.Crop,
-            )
-            // A dynamic theme played live, over its still: the still shows until the scene
-            // draws, and stays if it cannot. Keyed so a new theme gets a new view.
-            LibraryBackground.scene.value?.let { live ->
-                androidx.compose.runtime.key(live) {
-                    var sceneGl by remember { mutableStateOf<Boolean?>(null) }
-                    if (sceneGl != false) {
-                        AndroidView(
-                            factory = { ThemeSceneView(it, live).apply { onGlStatus = { ok -> sceneGl = ok } } },
-                            modifier = Modifier.fillMaxSize(),
-                            onRelease = { it.stop() },
-                        )
-                    }
-                }
+        Image(
+            painter = painterResource(R.drawable.library_bg_xmb),
+            contentDescription = null,
+            modifier = Modifier.fillMaxSize(),
+            contentScale = ContentScale.Crop,
+        )
+    }
+    AndroidView(
+        factory = { XmbGlView(it).apply { onGlStatus = { ok -> xmbGlState = ok } } },
+        modifier = Modifier.fillMaxSize(),
+    )
+}
+
+private class WaveFloor(val top: Color, val bottom: Color, val angleDeg: Float)
+
+/**
+ * What XmbGlView's background draws in its first frame, chosen as it chooses: the month's gradient
+ * at its angle (XMB mode or the Monthly setting; from black while XMB mode's boot brings the colour
+ * up), the RGB cycle at its first hue (each view's clock starts at 0), or the picked colour straight
+ * down. Null for the built-in colours, which the bundled still shows.
+ */
+private fun waveFloor(): WaveFloor? {
+    val colors = com.armsx2.ui.theme.LibraryBackgroundColorPreferences
+    fun rgb(c: FloatArray, scale: Float = 1f) =
+        Color((c[0] * scale).coerceIn(0f, 1f), (c[1] * scale).coerceIn(0f, 1f), (c[2] * scale).coerceIn(0f, 1f))
+    return when {
+        colors.monthly.value || com.armsx2.ui.xmb.XmbMode.active.value -> {
+            val month = com.armsx2.ui.xmb.XmbOriginalColors.now()
+            val level = com.armsx2.ui.xmb.XmbOriginalColors.bootColor
+            WaveFloor(rgb(month.start, level), rgb(month.end, level), month.angleDeg)
+        }
+        colors.rgbCycle.value -> {
+            val bottom = Color.hsv(0f, 0.92f, 0.98f)
+            WaveFloor(Color(bottom.red * 0.2f, bottom.green * 0.2f, bottom.blue * 0.2f), bottom, 180f)
+        }
+        colors.color.value != 0 -> {
+            val top = colors.glTop ?: return null
+            val bottom = colors.glBottom ?: return null
+            WaveFloor(rgb(top), rgb(bottom), 180f)
+        }
+        else -> null
+    }
+}
+
+/**
+ * A saved background: a still picture or GIF (Coil handles both), a dynamic PS3 theme's [slides],
+ * or its scene played [live] over the still.
+ */
+@Composable
+private fun SavedBackdrop(picture: String, slides: LibraryBackground.Slideshow?, live: java.io.File?) {
+    val context = LocalContext.current
+    if (slides != null) {
+        ThemeSlideshow(slides, Modifier.fillMaxSize())
+        return
+    }
+    AsyncImage(
+        model = ImageRequest.Builder(context).data(picture).crossfade(true).build(),
+        contentDescription = null,
+        modifier = Modifier.fillMaxSize(),
+        contentScale = ContentScale.Crop,
+    )
+    // A dynamic theme played live, over its still: the still shows until the scene draws, and
+    // stays if it cannot. Keyed so a new theme gets a new view.
+    live?.let { scene ->
+        androidx.compose.runtime.key(scene) {
+            var sceneGl by remember { mutableStateOf<Boolean?>(null) }
+            if (sceneGl != false) {
+                AndroidView(
+                    factory = { ThemeSceneView(it, scene).apply { onGlStatus = { ok -> sceneGl = ok } } },
+                    modifier = Modifier.fillMaxSize(),
+                    onRelease = { it.stop() },
+                )
             }
         }
     }
@@ -2273,6 +2434,8 @@ enum class HomeZone { Toolbar, Search, Recents, Grid }
 object HomeInputController {
     private var owner: HomeViewModel? = null
     private var openMenu: (() -> Unit)? = null
+    // Opens a game's long-press menu (Triangle).
+    private var gameMenu: ((GameInfo) -> Unit)? = null
     private var columns = 3
     val scrollVelocity = mutableFloatStateOf(0f)
 
@@ -2290,6 +2453,7 @@ object HomeInputController {
     private var toolbarActions: List<() -> Unit> = emptyList()
     private var recentCount = 0
     private var recentLauncher: ((Int) -> Unit)? = null
+    private var recentGame: ((Int) -> GameInfo?)? = null
     private var searchAvailable = false
     private var searchConfirm: (() -> Unit)? = null
     private var toolbarAtBottom = false
@@ -2301,9 +2465,10 @@ object HomeInputController {
      *  time the library (re)opens it starts at the top again. */
     var userNavigated = false
 
-    fun bind(viewModel: HomeViewModel, onOpenMenu: () -> Unit) {
+    fun bind(viewModel: HomeViewModel, onOpenMenu: () -> Unit, onGameMenu: (GameInfo) -> Unit) {
         owner = viewModel
         openMenu = onOpenMenu
+        gameMenu = onGameMenu
         userNavigated = false
     }
 
@@ -2311,13 +2476,21 @@ object HomeInputController {
         if (owner === viewModel) {
             owner = null
             openMenu = null
+            gameMenu = null
             scrollVelocity.floatValue = 0f
             zone.value = HomeZone.Grid
         }
     }
 
     fun setColumnCount(value: Int) { columns = value.coerceAtLeast(1) }
-    fun active(): Boolean = owner != null
+
+    /** XMB mode: the XMB takes the pad, except while one of its panels shows an app screen, whose
+     *  rows then move with the same registry as everywhere else. */
+    private fun xmb(): Boolean = com.armsx2.ui.xmb.XmbMode.active.value && com.armsx2.ui.xmb.XmbInput.active()
+
+    fun active(): Boolean = owner != null && com.armsx2.ui.xmb.XmbInput.controller?.panel == null &&
+        // The avatar picker, opened from the XMB's RPCN column, takes the pad as settings does
+        !com.armsx2.ui.settings.RpcnAvatarPicker.open.value
 
     /** HomeScreen registers the toolbar button actions here, in visual left→right
      *  order (leading menu button first). */
@@ -2325,8 +2498,9 @@ object HomeInputController {
 
     /** HomeScreen registers the currently-shown Recently-Played games (0 when the
      *  shelf is hidden, e.g. while searching). */
-    fun setRecents(count: Int, launcher: (Int) -> Unit) {
+    fun setRecents(count: Int, game: (Int) -> GameInfo?, launcher: (Int) -> Unit) {
         recentCount = count
+        recentGame = game
         recentLauncher = launcher
         if (recentIndex.intValue >= count) recentIndex.intValue = (count - 1).coerceAtLeast(0)
         if (count == 0 && zone.value == HomeZone.Recents) zone.value = HomeZone.Grid
@@ -2355,6 +2529,7 @@ object HomeInputController {
     }
 
     fun move(dx: Int, dy: Int): Boolean {
+        if (xmb()) return com.armsx2.ui.xmb.XmbInput.move(dx, dy)
         val viewModel = owner ?: return false
         userNavigated = true
         // The press that switched from touch to the pad shows where the selection is: nothing was
@@ -2424,6 +2599,7 @@ object HomeInputController {
     }
 
     fun confirm(): Boolean {
+        if (xmb()) return com.armsx2.ui.xmb.XmbInput.confirm()
         val viewModel = owner ?: return false
         // As in move(): a first press only shows the selection, so it cannot launch a game that
         // was never highlighted.
@@ -2442,18 +2618,36 @@ object HomeInputController {
     }
 
     fun openSelectedSettings(): Boolean {
+        if (xmb()) return com.armsx2.ui.xmb.XmbInput.square()
         val game = owner?.selectedGame() ?: return false
         com.armsx2.navigation.UiNavigator.navigate(com.armsx2.navigation.AppRoute.Settings(game = game))
         return true
     }
 
+    /** Triangle: the highlighted game's long-press menu (play, load state, settings, categories,
+     *  clearing its caches...), which a controller had no way to open. The game is the one
+     *  highlighted in the grid, or in the Recently Played row when that has the selector. */
+    fun openSelectedMenu(): Boolean {
+        if (xmb()) return com.armsx2.ui.xmb.XmbInput.options()
+        val viewModel = owner ?: return false
+        val game = when (zone.value) {
+            HomeZone.Grid -> viewModel.selectedGame()
+            HomeZone.Recents -> recentGame?.invoke(recentIndex.intValue)
+            else -> null
+        } ?: return false
+        gameMenu?.invoke(game) ?: return false
+        return true
+    }
+
     fun scroll(velocity: Float): Boolean {
+        if (xmb()) return true
         if (owner == null) return false
         scrollVelocity.floatValue = if (abs(velocity) > 0.08f) velocity.coerceIn(-1f, 1f) else 0f
         return true
     }
 
     fun back(): Boolean {
+        if (xmb()) return com.armsx2.ui.xmb.XmbInput.back()
         com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.BACK)
         // B in the Recents / Toolbar zone drops back to the grid; on the grid it
         // opens the nav drawer.
@@ -2469,6 +2663,8 @@ object HomeInputController {
      *  controller direct access to all three view modes without needing to reach
      *  the touch-only toolbar toggle. */
     fun cycleLayout(): Boolean {
+        // The XMB has no layouts to cycle; R1 pages down, as on the console.
+        if (xmb()) return com.armsx2.ui.xmb.XmbInput.page(1)
         val viewModel = owner ?: return false
         viewModel.toggleLayout()
         return true
@@ -2476,6 +2672,7 @@ object HomeInputController {
 
     /** Cycle the library sort order (bound to L1). */
     fun cycleSort(): Boolean {
+        if (xmb()) return com.armsx2.ui.xmb.XmbInput.page(-1)
         val viewModel = owner ?: return false
         val entries = HomeSort.entries
         val next = entries[(viewModel.state.value.sort.ordinal + 1) % entries.size]

@@ -139,7 +139,7 @@ sed -i 's/darwin-x86_64/linux-x86_64/' android/build-variants.sh
 android/build-variants.sh a13
 ```
 
-L'APK est alors copié dans `~/Downloads/ARMSX3-1.5-a13-armv8.2-sdk33.apk`. adb doit
+L'APK est alors copié dans `~/Downloads/ARMSX3-1.6.2-a13-armv8.2-sdk33.apk`. adb doit
 voir le casque depuis WSL (usbipd) ou l'APK est installé depuis Windows.
 
 ## 7. Prompt prêt à coller pour l'agent local

@@ -22,9 +22,9 @@ import com.armsx2.CustomCovers
 import com.armsx2.DiscIcons
 import com.armsx2.Ps3Sfo
 import com.armsx3.NativeApp
-import net.rpcsx.GameFlag
-import net.rpcsx.RPCSX
-import net.rpcsx.GameRepository as NativeGames
+import com.armsx3.core.GameFlag
+import com.armsx3.core.ARMSX3
+import com.armsx3.core.GameRepository as NativeGames
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -84,7 +84,7 @@ class GameLibraryRepository(private val context: Context) {
      * The emulator's OWN game storage, always scanned on top of the user's ROM folders.
      *
      * A PKG install and anything dropped into RPCS3's games directory land here, never in
-     * a ROM folder, so neither was reachable: this library replaced net.rpcsx's
+     * a ROM folder, so neither was reachable: this library replaced com.armsx3.core's
      * GameRepository, which did read both of these, and the paths came with it. Reported as
      * "doesn't detect disc games from config folder like other ps3 emus".
      *
@@ -133,7 +133,7 @@ class GameLibraryRepository(private val context: Context) {
      * Absolute paths of installed titles the core cannot decrypt without a licence.
      *
      * Asked of the CORE rather than worked out here. The flag comes from actually attempting
-     * decrypt_self on the game's EBOOT (fetchGameInfo, rpcsx-android.cpp), which is the only
+     * decrypt_self on the game's EBOOT (fetchGameInfo, armsx3-core.cpp), which is the only
      * honest answer to "does this need a .rap". Checking PARAM.SFO's CONTENT_ID against
      * exdata instead -- the obvious pure-Kotlin shortcut -- would call every PSN title locked,
      * including the many whose EBOOT needs no licence at all.
@@ -150,12 +150,12 @@ class GameLibraryRepository(private val context: Context) {
     private class CoreFlags(val locked: Set<String>, val trial: Set<String>)
 
     private fun coreGameFlags(): CoreFlags = runCatching {
-        if (!RPCSX.initialized) return CoreFlags(emptySet(), emptySet())
+        if (!ARMSX3.initialized) return CoreFlags(emptySet(), emptySet())
         // The native repository is a scratch buffer here: nothing else in this app reads it,
         // and collectGameInfo appends into it.
         NativeGames.clear()
         internalGameDirectories().forEach { dir ->
-            RPCSX.instance.collectGameInfo(dir.absolutePath, -1)
+            ARMSX3.instance.collectGameInfo(dir.absolutePath, -1)
         }
         val games = NativeGames.list()
         fun pathsWith(flag: GameFlag) = games
@@ -166,8 +166,8 @@ class GameLibraryRepository(private val context: Context) {
     }.getOrDefault(CoreFlags(emptySet(), emptySet()))
 
     private fun internalGameDirectories(): List<File> = listOf(
-        File(RPCSX.rootDirectory, "config/dev_hdd0/game"),
-        File(RPCSX.rootDirectory, "config/games"),
+        File(ARMSX3.rootDirectory, "config/dev_hdd0/game"),
+        File(ARMSX3.rootDirectory, "config/games"),
     ).filter { runCatching { it.isDirectory }.getOrDefault(false) }
 
     /**
@@ -334,6 +334,13 @@ class GameLibraryRepository(private val context: Context) {
             val isFolder = game.extension.equals("folder", ignoreCase = true)
             if (isFolder && !DiscIcons.has(serial)) {
                 android.util.Log.i(ScanTag, "re-probing folder '$serial': no usable disc icon on disk")
+                return@forEach
+            }
+            // A trial's folder is read again on every scan. Installing its unlock key moves its title
+            // and icon to the full game's (C00) without changing anything the cache keys on, so
+            // Castlevania: Harmony of Despair kept its "Demo" name after the unlock.
+            if (isFolder && File(path, "C00").isDirectory) {
+                android.util.Log.i(ScanTag, "re-probing folder '$serial': trial (C00)")
                 return@forEach
             }
             if (reprobeImages && game.extension.lowercase() in probeExtensions) {
@@ -1025,7 +1032,7 @@ class GameLibraryRepository(private val context: Context) {
     private fun probePkg(open: () -> ParcelFileDescriptor?): PkgInfo? {
         val raw = runCatching {
             val descriptor = open() ?: return null
-            RPCSX.instance.probePkgInfo(descriptor.detachFd())
+            ARMSX3.instance.probePkgInfo(descriptor.detachFd())
         }.getOrNull() ?: return null
 
         val info = runCatching {
@@ -1037,7 +1044,7 @@ class GameLibraryRepository(private val context: Context) {
                 o.optString("title").trim(),
                 o.optString("category").trim().uppercase(),
                 o.optString("contentId").trim(),
-                // 3 is DRM-free; see _rpcsx_probePkgInfo.
+                // 3 is DRM-free; see _armsx3_probePkgInfo.
                 o.optInt("drmType", 0) == 3,
             )
         }.getOrNull() ?: return null
@@ -1083,7 +1090,7 @@ class GameLibraryRepository(private val context: Context) {
             .filter { it.isNotEmpty() && !it.startsWith("#") }
             .map { line ->
                 // A bare title id names an installed PSN game, as read_disc_playlist resolves it.
-                File(RPCSX.getHdd0Dir(), "game/$line")
+                File(ARMSX3.getHdd0Dir(), "game/$line")
                     .takeIf { titleIdLine.matches(line) && it.isDirectory }
                     ?.path
                     ?: if (line.startsWith("/")) line else "$folder/" + line.removePrefix("./")
@@ -1142,7 +1149,7 @@ class GameLibraryRepository(private val context: Context) {
      * already covers is left alone. The discs keep their own tiles, as with any playlist.
      */
     private fun addAutoPlaylists(collected: MutableMap<String, GameInfo>) {
-        val dir = File(RPCSX.rootDirectory, "playlists")
+        val dir = File(ARMSX3.rootDirectory, "playlists")
         if (!com.armsx2.AutoPlaylists.enabled.value) {
             dir.listFiles()?.filter { it.extension.equals("m3u", ignoreCase = true) }?.forEach { it.delete() }
             return
@@ -1176,7 +1183,7 @@ class GameLibraryRepository(private val context: Context) {
             },
         )
 
-        val installed = File(RPCSX.getHdd0Dir(), "game").path
+        val installed = File(ARMSX3.getHdd0Dir(), "game").path
         addSets(
             games.filter { it.isPsn && it.extension.equals("folder", ignoreCase = true) }.mapNotNull { game ->
                 val serial = game.serial ?: return@mapNotNull null
@@ -1245,7 +1252,7 @@ class GameLibraryRepository(private val context: Context) {
         if (existing != null) return existing
 
         val raw = runCatching {
-            RPCSX.instance.probeDiscInfo(path, DiscIcons.fileFor(PendingIcon).absolutePath)
+            ARMSX3.instance.probeDiscInfo(path, DiscIcons.fileFor(PendingIcon).absolutePath)
         }.getOrNull()
         android.util.Log.i(ScanTag, "  probeDiscInfo('$label') -> $raw")
         if (raw == null) return reprobeFallback.remove(path)?.also { discInfoCache[path] = it }
@@ -1461,7 +1468,11 @@ class GameLibraryRepository(private val context: Context) {
         // to be rescanned for them to go.
         // 12: trials are flagged (GameInfo.trial). A cache from before never asked, so every
         // trial kept looking like the full game until something else forced a rescan.
-        const val ScanSchemaVersion = 12
+        // 13: an unlocked trial takes its title and icon from C00, the way RPCS3 boots it; a cache
+        // from before kept the trial's name ("Castlevania: Harmony of Despair Demo").
+        // 14: a trial's folder is read again on every scan. 13 alone was not enough: a library
+        // already on 13 kept its seeded "... Demo" title and never rescanned.
+        const val ScanSchemaVersion = 14
         /** The first scanner that looked for other games on a disc image. A cache from before it
          *  has never been asked, so its images are re-probed once. */
         const val DiscGamesSchemaVersion = 9

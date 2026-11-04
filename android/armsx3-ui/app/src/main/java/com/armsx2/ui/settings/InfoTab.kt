@@ -138,7 +138,7 @@ fun InfoTab(game: GameInfo?) {
                 value = withContext(Dispatchers.IO) {
                     val own = if (game.isPsn && serial != null) {
                         com.armsx2.Ps3Sfo.installDir(serial)?.let { dir ->
-                            runCatching { net.rpcsx.RPCSX.instance.gameContentId(dir.absolutePath) }.getOrNull()
+                            runCatching { com.armsx3.core.ARMSX3.instance.gameContentId(dir.absolutePath) }.getOrNull()
                         }.orEmpty()
                     } else {
                         ""
@@ -266,6 +266,12 @@ fun InfoTab(game: GameInfo?) {
 
 @Composable
 private fun InfoRow(label: String, value: String, clipboard: ClipboardManager) {
+    com.armsx2.ui.xmb.LocalXmbCollector.current?.let { c ->
+        com.armsx2.ui.xmb.XmbCollected(c, com.armsx2.ui.xmb.XmbNode.Action("info.row.$label", label, c.icon, value) {
+            if (value != "\u2014") clipboard.setText(AnnotatedString(value))
+        })
+        return
+    }
     Row(Modifier.fillMaxWidth().padding(vertical = 7.dp), verticalAlignment = Alignment.CenterVertically) {
         Text(
             label,

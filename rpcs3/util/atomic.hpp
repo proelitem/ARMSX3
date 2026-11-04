@@ -325,15 +325,17 @@ struct atomic_storage
 
 	static inline T load(const T& dest)
 	{
+		// Put fence BEFORE the instruction, the compiler tends to put it afterwards
+		atomic_fence_acquire();
 #ifdef __clang__
 		type result;
-		__atomic_load(reinterpret_cast<const type*>(&dest), MAYBE_CAST(&result), __ATOMIC_SEQ_CST);
-		return std::bit_cast<T>(result);
+		__atomic_load(reinterpret_cast<const type*>(&dest), MAYBE_CAST(&result), __ATOMIC_RELAXED);
 #else
 		alignas(sizeof(T)) T result;
-		__atomic_load(&dest, &result, __ATOMIC_SEQ_CST);
-		return result;
+		__atomic_load(&dest, &result, __ATOMIC_RELAXED);
 #endif
+		atomic_fence_acquire();
+		return std::bit_cast<T>(result);
 	}
 
 	static inline T observe(const T& dest)
@@ -966,12 +968,14 @@ struct atomic_storage<T, 16> : atomic_storage<T, 0>
 #elif defined(ARCH_X64)
 	static inline T load(const T& dest)
 	{
+		atomic_fence_acquire();
 		alignas(16) T r;
 #ifdef __AVX__
 		__asm__ volatile("vmovdqa %1, %0;" : "=x" (r) : "m" (dest) : "memory");
 #else
 		__asm__ volatile("movdqa %1, %0;" : "=x" (r) : "m" (dest) : "memory");
 #endif
+		atomic_fence_acquire();
 		return r;
 	}
 
@@ -1045,11 +1049,13 @@ struct atomic_storage<T, 16> : atomic_storage<T, 0>
 	static inline void release(T& dest, T value)
 	{
 		u128 val = std::bit_cast<u128>(value);
+		atomic_fence_release();
 #ifdef __AVX__
 		__asm__ volatile("vmovdqa %0, %1;" :: "x" (val), "m" (dest) : "memory");
 #else
 		__asm__ volatile("movdqa %0, %1;" :: "x" (val), "m" (dest) : "memory");
 #endif
+		atomic_fence_release();
 	}
 #elif defined(ARCH_ARM64)
 	// ARMSX3: every one of these used to be an LDAXP/STLXP loop on Android, loads included. A load
@@ -1067,6 +1073,8 @@ struct atomic_storage<T, 16> : atomic_storage<T, 0>
 
 	static inline T load(const T& dest)
 	{
+		atomic_fence_acquire();
+
 		if (utils::g_atomic_lse2) [[likely]]
 		{
 			u64 data[2];
@@ -1077,12 +1085,17 @@ struct atomic_storage<T, 16> : atomic_storage<T, 0>
 				: "memory");
 			T result;
 			std::memcpy(&result, data, 16);
+			atomic_fence_acquire();
 			return result;
 		}
 
 		// One CASPAL that compares and swaps a register pair with itself: whatever the comparison
 		// finds, it writes back only the value already there, and returns the current value.
-		return std::bit_cast<T>(__atomic_load_n(reinterpret_cast<const u128*>(&dest), __ATOMIC_SEQ_CST));
+		const u128 data = __atomic_load_n(reinterpret_cast<const u128*>(&dest), __ATOMIC_SEQ_CST);
+		T result;
+		std::memcpy(&result, &data, 16);
+		atomic_fence_acquire();
+		return result;
 	}
 
 	static inline T observe(const T& dest)
@@ -1094,21 +1107,36 @@ struct atomic_storage<T, 16> : atomic_storage<T, 0>
 	static inline bool compare_exchange(T& dest, T& comp, T exch)
 	{
 		// One CASPAL where there used to be an LDAXP/STLXP loop.
-		u128 cmp = std::bit_cast<u128>(comp);
+		//
+		// The values go through memcpy, never std::bit_cast. bit_cast leaves a struct's padding bits
+		// unspecified, and clang took that literally: in rsxaudio's callback_config (two padding bytes)
+		// it zeroed them in the comparand while the value it stored kept stack garbage there. From the
+		// first such store on, every CAS failed on the padding alone, atomic_op handed back the same
+		// value and tried again, and the thread spun for good: the XMB's AV thread, in AUDIO_INIT or
+		// AV_AUDIO_MUTE, which left it black on some boots. memcpy carries the bytes exactly, so a
+		// failed comparand comes back as exactly what memory holds and the next attempt matches.
+		u128 cmp, desired;
+		std::memcpy(&cmp, &comp, 16);
+		std::memcpy(&desired, &exch, 16);
 
-		if (__atomic_compare_exchange_n(reinterpret_cast<u128*>(&dest), &cmp, std::bit_cast<u128>(exch), false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+		if (__atomic_compare_exchange_n(reinterpret_cast<u128*>(&dest), &cmp, desired, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
 		{
 			return true;
 		}
 
-		comp = std::bit_cast<T>(cmp);
+		std::memcpy(&comp, &cmp, 16);
 		return false;
 	}
 
 	static inline T exchange(T& dest, T value)
 	{
 		// A CASPAL loop, which only goes round again when another core changed the value in between.
-		return std::bit_cast<T>(__atomic_exchange_n(reinterpret_cast<u128*>(&dest), std::bit_cast<u128>(value), __ATOMIC_SEQ_CST));
+		u128 desired;
+		std::memcpy(&desired, &value, 16);
+		const u128 old = __atomic_exchange_n(reinterpret_cast<u128*>(&dest), desired, __ATOMIC_SEQ_CST);
+		T result;
+		std::memcpy(&result, &old, 16);
+		return result;
 	}
 
 	static inline void store(T& dest, T value)
@@ -1230,7 +1258,9 @@ public:
 		requires (!std::is_invocable_v<F, const T> && !std::is_invocable_v<F, volatile T>)
 	std::conditional_t<std::is_void_v<RT>, type, std::pair<type, RT>> fetch_op(F func)
 	{
-		type _new, old = atomic_storage<type>::load(m_data);
+		atomic_fence_acq_rel();
+
+		type _new, old = atomic_storage<type>::observe(m_data);
 
 		while (true)
 		{
@@ -1262,7 +1292,9 @@ public:
 		requires (!std::is_invocable_v<F, const T> && !std::is_invocable_v<F, volatile T>)
 	RT atomic_op(F func)
 	{
-		type _new, old = atomic_storage<type>::load(m_data);
+		atomic_fence_acq_rel();
+
+		type _new, old = atomic_storage<type>::observe(m_data);
 
 		while (true)
 		{
@@ -1586,7 +1618,9 @@ public:
 	// Conditionally decrement
 	bool try_dec(std::common_type_t<T> greater_than)
 	{
-		type _new, old = atomic_storage<type>::load(m_data);
+		atomic_fence_acq_rel();
+
+		type _new, old = atomic_storage<type>::observe(m_data);
 
 		while (true)
 		{
@@ -1609,7 +1643,9 @@ public:
 	// Conditionally increment
 	bool try_inc(std::common_type_t<T> less_than)
 	{
-		type _new, old = atomic_storage<type>::load(m_data);
+		atomic_fence_acq_rel();
+
+		type _new, old = atomic_storage<type>::observe(m_data);
 
 		while (true)
 		{

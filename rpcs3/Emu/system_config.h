@@ -79,8 +79,6 @@ struct cfg_root : cfg::node
 		cfg::_bool hook_functions{ this, "Hook static functions" };
 		cfg::set_entry libraries_control{ this, "Libraries Control" }; // Override HLE/LLE behaviour of selected libs
 		cfg::_bool hle_lwmutex{ this, "HLE lwmutex" }; // Force alternative lwmutex/lwcond implementation
-		cfg::uint64 spu_llvm_lower_bound{ this, "SPU LLVM Lower Bound" };
-		cfg::uint64 spu_llvm_upper_bound{ this, "SPU LLVM Upper Bound", 0xffffffffffffffff };
 
 		cfg::_int<10, 3000> clocks_scale{ this, "Clocks scale", 100 }; // Changing this from 100 (percentage) may affect game speed in unexpected ways
 		cfg::uint<0, 3000> spu_wakeup_delay{ this, "SPU Wake-Up Delay", 0, true };
@@ -241,6 +239,11 @@ struct cfg_root : cfg::node
 		// Output Scaling Mode is "Shader chain (librashader)". Empty = no chain,
 		// which falls back to a plain blit rather than failing to present.
 		cfg::string shader_preset_path{ this, "Shader Preset Path", "", true };
+		// ARMSX3: the share of full size the shader chain runs at, in percent. Below 100 the game's
+		// picture is shrunk by it going in and the chain draws into an image that much smaller than
+		// the screen, which is then scaled up. Every pass costs what its pixels cost, so at 67 a
+		// heavy preset draws about 0.44 of what it did.
+		cfg::uint<25, 100> shader_preset_scale{ this, "Shader Preset Resolution", 67, true };
 #endif
 		cfg::_bool record_with_overlays{ this, "Record With Overlays", true, true };
 		cfg::_bool disable_hardware_blending{ this, "Disable Hardware Blending", false, true };
@@ -309,6 +312,13 @@ struct cfg_root : cfg::node
 			cfg::_bool use_window_space{this, "Use Window Space", false, true};
 
 		} perf_overlay{ this };
+
+		struct native_ui : cfg::node
+		{
+			native_ui(cfg::node* _this) : cfg::node(_this, "Native UI") {}
+
+			cfg::string default_font{ this, "Default Font", "Arial", false };
+		} ui{ this };
 
 		struct node_shader_preloading_dialog : cfg::node
 		{

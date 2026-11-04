@@ -2,22 +2,36 @@ package com.armsx2
 
 import android.app.Presentation
 import android.content.Context
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.ColorFilter
+import android.graphics.LinearGradient
+import android.graphics.Paint
+import android.graphics.PixelFormat
+import android.graphics.Shader
+import android.graphics.drawable.Drawable
+import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.StateListDrawable
 import android.hardware.display.DisplayManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.text.TextUtils
 import android.view.Display
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.compose.runtime.mutableStateOf
 import com.armsx2.i18n.I18n
 import com.armsx2.runtime.MainActivityRuntime
 import com.armsx3.NativeApp
+import java.io.File
 
 /**
  * Utility panel on a SECOND display — Ayn Thor, the Retroid dual-screen add-on, or anything else
@@ -158,20 +172,113 @@ object SecondScreen {
         }
     }
 
-    /** The panel itself. */
+    /**
+     * The XMB's colour for now, for the panel in XMB mode: the month's gradient at its angle, dimmed
+     * at night, as the XMB's background draws it (XmbOriginalColors). Read again at every draw, so
+     * the panel's tick keeps it with the XMB's, Theme Settings' Cycle included.
+     */
+    private class XmbBackdrop : Drawable() {
+        private val paint = Paint()
+
+        override fun draw(canvas: Canvas) {
+            val g = com.armsx2.ui.xmb.XmbOriginalColors.now()
+            val w = bounds.width().toFloat()
+            val h = bounds.height().toFloat()
+            // A CSS angle, as the XMB's: 0 points up, turning clockwise, spanning the projection of
+            // the whole panel onto that direction.
+            val a = Math.toRadians(g.angleDeg.toDouble())
+            val dx = Math.sin(a).toFloat()
+            val dy = -Math.cos(a).toFloat()
+            val half = (Math.abs(w * dx) + Math.abs(h * dy)) / 2f
+            fun color(c: FloatArray) = Color.rgb(
+                (c[0].coerceIn(0f, 1f) * 255).toInt(),
+                (c[1].coerceIn(0f, 1f) * 255).toInt(),
+                (c[2].coerceIn(0f, 1f) * 255).toInt(),
+            )
+            paint.shader = LinearGradient(
+                bounds.exactCenterX() - dx * half, bounds.exactCenterY() - dy * half,
+                bounds.exactCenterX() + dx * half, bounds.exactCenterY() + dy * half,
+                color(g.start), color(g.end), Shader.TileMode.CLAMP,
+            )
+            canvas.drawRect(bounds, paint)
+        }
+
+        override fun setAlpha(alpha: Int) = Unit
+        override fun setColorFilter(colorFilter: ColorFilter?) = Unit
+        @Deprecated("Drawable.getOpacity", ReplaceWith(""))
+        override fun getOpacity(): Int = PixelFormat.OPAQUE
+    }
+
+    /**
+     * The panel itself. ARMSX3's mark at the top left, the time and battery at the top right, and in
+     * the middle the game being played as the library shows it (its icon and title) with how it runs,
+     * over Pause and Screenshot and any macros. With no game, the middle says so. Save and load are
+     * left to the in-game menu, where their state is shown.
+     *
+     * In XMB mode it takes the XMB's look: its colour, its font, glass buttons and the clock's bar.
+     * Otherwise it is plain: black, the app's font and the app's own buttons.
+     */
     private class Panel(context: Context, display: Display) : Presentation(context, display) {
 
-        private lateinit var stats: TextView
-        private lateinit var idleLabel: TextView
-        /** Rows that only make sense with a game running; hidden in the library. */
-        private val gameRows = mutableListOf<View>()
+        private val xmb = com.armsx2.ui.xmb.XmbMode.active.value
+        private val face: android.graphics.Typeface? = if (xmb) com.armsx2.ui.xmb.XmbFirmware.typeface() else null
+        private val dp = context.resources.displayMetrics.density
+
+        private lateinit var root: FrameLayout
+        private lateinit var game: View
+        private lateinit var idle: TextView
+        private lateinit var icon: ImageView
+        private lateinit var title: TextView
+        private lateinit var running: TextView
+        private lateinit var status: TextView
+        private lateinit var pause: Button
+        /** The game whose icon is up, so it is read once per game rather than every tick. */
+        private var iconFor: String? = null
         private var ticking = false
+
         private val tick = object : Runnable {
             override fun run() {
                 if (!ticking) return
+                if (com.armsx2.ui.xmb.XmbMode.active.value != xmb) {
+                    // XMB mode switched while it was up: built again in the other look.
+                    ticking = false
+                    handler.post { MainActivityRuntime.instance?.let { activity -> detach(); attach(activity) } }
+                    return
+                }
                 updateStats()
+                if (xmb) root.background?.invalidateSelf()
                 handler.postDelayed(this, TICK_MS)
             }
+        }
+
+        private fun px(v: Float) = (v * dp).toInt()
+
+        /** White words at [sizeSp] and [alpha]; in XMB mode in its font, with its shadow. */
+        private fun TextView.words(sizeSp: Float, alpha: Float = 1f) {
+            textSize = sizeSp
+            setTextColor(Color.argb((alpha * 255).toInt(), 255, 255, 255))
+            if (xmb) {
+                face?.let { typeface = it }
+                setShadowLayer(6f, 0f, 2f, Color.argb(153, 0, 0, 0))
+            }
+        }
+
+        /** In XMB mode the XMB's glass button: a faint fill and a light edge, brighter while held. */
+        private fun Button.styled() {
+            isAllCaps = false
+            if (!xmb) return
+            fun glass(fill: Int) = GradientDrawable().apply {
+                cornerRadius = 6 * dp
+                setColor(fill)
+                setStroke(maxOf(1, dp.toInt()), Color.argb(87, 255, 255, 255))
+            }
+            background = StateListDrawable().apply {
+                addState(intArrayOf(android.R.attr.state_pressed), glass(Color.argb(56, 255, 255, 255)))
+                addState(intArrayOf(), glass(Color.argb(20, 255, 255, 255)))
+            }
+            stateListAnimator = null
+            minHeight = px(52f)
+            words(17f)
         }
 
         override fun onCreate(savedInstanceState: Bundle?) {
@@ -183,56 +290,93 @@ object SecondScreen {
             // unplugging the display are the ways out.
             setCancelable(false)
             setCanceledOnTouchOutside(false)
-            val pad = (resources.displayMetrics.density * 12).toInt()
-            val rootView = LinearLayout(context).apply {
+
+            val metrics = context.resources.displayMetrics
+            val widthDp = metrics.widthPixels / dp
+            val heightDp = metrics.heightPixels / dp
+            // The buttons' width, and the icon, fitted to the display: a strip-shaped second screen
+            // has no room for the icon over the rest.
+            val rowWidth = px(minOf(460f, widthDp - 48f))
+            val iconWidth = minOf(300f, widthDp * 0.5f)
+
+            root = FrameLayout(context).apply {
+                if (xmb) background = XmbBackdrop() else setBackgroundColor(Color.BLACK)
+            }
+
+            // ARMSX3's mark, top left.
+            root.addView(
+                ImageView(context).apply { setImageBitmap(com.armsx2.ui.xmb.XmbWordmark.markIcon(px(48f))) },
+                FrameLayout.LayoutParams(px(48f), px(48f), Gravity.TOP or Gravity.START).apply {
+                    setMargins(px(22f), px(18f), 0, 0)
+                },
+            )
+
+            // The time and battery, top right; in XMB mode in the clock's bar, open to the edge of
+            // the screen as the XMB's is.
+            status = TextView(context).apply {
+                words(17f)
+                if (xmb) {
+                    setPadding(px(18f), px(6f), px(24f), px(6f))
+                    background = GradientDrawable().apply {
+                        val r = 4 * dp
+                        cornerRadii = floatArrayOf(r, r, 0f, 0f, 0f, 0f, r, r)
+                        setColor(Color.argb(20, 255, 255, 255))
+                        setStroke(maxOf(1, dp.toInt()), Color.argb(87, 255, 255, 255))
+                    }
+                } else {
+                    setPadding(0, 0, px(24f), 0)
+                }
+            }
+            root.addView(
+                status,
+                FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.END,
+                ).apply { topMargin = px(28f) },
+            )
+
+            // The game in the middle, as the library shows it.
+            val column = LinearLayout(context).apply {
                 orientation = LinearLayout.VERTICAL
-                setBackgroundColor(Color.BLACK)
-                setPadding(pad, pad, pad, pad)
-            }
-
-            stats = TextView(context).apply {
-                setTextColor(Color.WHITE)
-                textSize = 16f
                 gravity = Gravity.CENTER_HORIZONTAL
             }
-            rootView.addView(stats, lp())
-
-            // Shown in the library, where the game actions below would all be dead buttons.
-            idleLabel = TextView(context).apply {
-                text = I18n.get("secondScreen.noGame")
-                setTextColor(Color.parseColor("#9AA0A6"))
-                textSize = 14f
-                gravity = Gravity.CENTER_HORIZONTAL
-                setPadding(0, pad, 0, 0)
+            icon = ImageView(context).apply {
+                scaleType = ImageView.ScaleType.FIT_CENTER
+                visibility = View.GONE
             }
-            rootView.addView(idleLabel, lp())
+            if (heightDp >= 400f) {
+                column.addView(icon, LinearLayout.LayoutParams(px(iconWidth), px(iconWidth * 176f / 320f)))
+            }
+            title = TextView(context).apply {
+                words(24f)
+                gravity = Gravity.CENTER_HORIZONTAL
+                maxLines = 2
+                ellipsize = TextUtils.TruncateAt.END
+                setPadding(0, px(12f), 0, 0)
+            }
+            column.addView(title, lp())
+            running = TextView(context).apply {
+                words(16f, 0.8f)
+                gravity = Gravity.CENTER_HORIZONTAL
+                setPadding(0, px(4f), 0, px(16f))
+            }
+            column.addView(running, lp())
 
-            // Two rows of actions, so a wide strip display stays readable.
-            val row1 = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
-            val row2 = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
-            row1.addView(action(I18n.get("touch.stateAction.save")) {
-                MainActivityRuntime.instance?.saveState()
-            }, rowLp())
-            row1.addView(action(I18n.get("touch.stateAction.load")) {
-                MainActivityRuntime.instance?.loadState()
-            }, rowLp())
-            row2.addView(action(I18n.get("secondScreen.pause")) {
+            val actions = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
+            pause = action(I18n.get("secondScreen.pause")) {
                 // Toggle on the core's own state, not eState. Nothing ever sets eState to PAUSED
                 // (the core does not report pauses back), so this button used to pause again on
                 // every press and could never resume. Only an exact Paused resumes: the core's
                 // Resume() ignores Frozen. Setting eState to PAUSED instead would wake the
                 // stuck-paused backstop in MainActivityRuntime, which resumes any pause that has
                 // no menu over it — including this one.
-                val paused = net.rpcsx.RPCSX.getState() == net.rpcsx.EmulatorState.Paused
+                val paused = com.armsx3.core.ARMSX3.getState() == com.armsx3.core.EmulatorState.Paused
                 if (paused) MainActivityRuntime.resume() else MainActivityRuntime.pause()
-            }, rowLp())
-            row2.addView(action(I18n.get("touch.stateAction.screenshot")) {
+            }
+            actions.addView(pause, rowLp())
+            actions.addView(action(I18n.get("secondScreen.screenshot")) {
                 MainActivityRuntime.instance?.applicationContext?.let { Screenshots.capture(it) }
             }, rowLp())
-            rootView.addView(row1, lp())
-            rootView.addView(row2, lp())
-            gameRows += row1
-            gameRows += row2
+            column.addView(actions, LinearLayout.LayoutParams(rowWidth, ViewGroup.LayoutParams.WRAP_CONTENT))
 
             // On-screen macros (M1-M4), so the second screen can fire the same combos the touch
             // layout does — the natural home for them when the pad is on the main screen. Only the
@@ -252,11 +396,28 @@ object SecondScreen {
                 macroRow.addView(macroAction(id), rowLp())
             }
             if (macroCount > 0) {
-                rootView.addView(macroRow, lp())
-                gameRows += macroRow
+                column.addView(macroRow, LinearLayout.LayoutParams(rowWidth, ViewGroup.LayoutParams.WRAP_CONTENT))
             }
 
-            setContentView(rootView)
+            game = column
+            root.addView(
+                column,
+                FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER)
+                    .apply { setMargins(px(24f), px(64f), px(24f), px(16f)) },
+            )
+
+            // Shown in the library, where the buttons above would all be dead.
+            idle = TextView(context).apply {
+                text = I18n.get("secondScreen.idle")
+                words(18f, 0.75f)
+                gravity = Gravity.CENTER
+            }
+            root.addView(
+                idle,
+                FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER),
+            )
+
+            setContentView(root)
             updateStats()
         }
 
@@ -265,7 +426,7 @@ object SecondScreen {
         private fun macroAction(id: com.armsx2.ui.touch.TouchButtonId): View =
             Button(context).apply {
                 text = id.label
-                isAllCaps = false
+                styled()
                 setOnTouchListener { v, ev ->
                     when (ev.actionMasked) {
                         android.view.MotionEvent.ACTION_DOWN -> {
@@ -297,60 +458,83 @@ object SecondScreen {
 
         private fun rowLp() = LinearLayout.LayoutParams(
             0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f,
-        )
+        ).apply {
+            // Glass buttons need air between them; the stock ones bring their own inset.
+            if (xmb) px(6f).let { setMargins(it, it, it, it) }
+        }
 
-        private fun action(label: String, onClick: () -> Unit): View =
+        private fun action(label: String, onClick: () -> Unit): Button =
             Button(context).apply {
                 text = label
-                isAllCaps = false
+                styled()
                 setOnClickListener { runCatching { onClick() } }
             }
 
+        /** The game's ICON0, as the library and the XMB's game list show it, read off the main thread. */
+        private fun loadIcon(current: GameInfo?) {
+            val key = iconFor
+            icon.setImageDrawable(null)
+            icon.visibility = View.GONE
+            if (current == null) return
+            Thread {
+                val bitmap = iconFile(current)?.let { runCatching { BitmapFactory.decodeFile(it.absolutePath) }.getOrNull() }
+                handler.post {
+                    if (iconFor != key || bitmap == null) return@post
+                    icon.setImageBitmap(bitmap)
+                    icon.visibility = View.VISIBLE
+                }
+            }.apply { isDaemon = true }.start()
+        }
+
+        /** Read off the disc when the library scanned it, else in the game's own folder or install. */
+        private fun iconFile(current: GameInfo): File? =
+            current.discIconFile
+                ?: current.discGameDir?.let { File(it, "ICON0.PNG") }?.takeIf { it.isFile }
+                ?: current.serial?.takeIf { it.isNotBlank() }
+                    ?.let { File(com.armsx3.core.ARMSX3.rootDirectory, "config/dev_hdd0/game/$it/ICON0.PNG") }
+                    ?.takeIf { it.isFile }
+
         private fun updateStats() {
-            // In the library there is no VM, so save/load/pause/FF/screenshot and the macros are
-            // all dead buttons — hide them and say so rather than showing controls that do nothing.
+            // In the library there is no VM, so pause, screenshot and the macros are all dead
+            // buttons — hide them and say so rather than showing controls that do nothing.
             val inGame = MainActivityRuntime.eState.value == EmuState.RUNNING ||
                 MainActivityRuntime.eState.value == EmuState.PAUSED
-            gameRows.forEach { it.visibility = if (inGame) View.VISIBLE else View.GONE }
-            idleLabel.visibility = if (inGame) View.GONE else View.VISIBLE
+            game.visibility = if (inGame) View.VISIBLE else View.GONE
+            idle.visibility = if (inGame) View.GONE else View.VISIBLE
+
+            val current = MainActivityRuntime.currentGame.value
+            title.text = current?.displayTitle(EnglishTitles.enabled.value).orEmpty()
+            val key = current?.uri?.toString()
+            if (key != iconFor) {
+                iconFor = key
+                loadIcon(current)
+            }
+
+            // Named for what a press does now, read from the core as the press reads it.
+            val paused = inGame && runCatching { com.armsx3.core.ARMSX3.getState() == com.armsx3.core.EmulatorState.Paused }.getOrDefault(false)
+            pause.text = I18n.get(if (paused) "action.resume" else "secondScreen.pause")
 
             val fps = runCatching { NativeApp.getFPS() }.getOrDefault(0f)
-            val title = MainActivityRuntime.currentGame.value?.title.orEmpty()
+            running.text = buildString {
+                append("FPS ").append(String.format(java.util.Locale.US, "%.1f", fps))
+                // Carrying the OSD for the game screen: add the speed vs the game's own target,
+                // so the panel replaces what was hidden up top rather than showing less.
+                if (moveOsd.value) {
+                    val nominal = runCatching { NativeApp.getNominalFrameRate() }.getOrDefault(0f)
+                    if (nominal > 1f) append("   ").append((fps / nominal * 100f).toInt()).append('%')
+                    if (runCatching { MainActivityRuntime.isFastForwardActive() }.getOrDefault(false)) append("   ▶▶")
+                }
+            }
+
             // Read charge straight from BatteryManager rather than plumbing state over from the
             // main-display status cluster — this panel ticks on its own and the call is cheap.
-            val battery = runCatching {
-                (context.getSystemService(Context.BATTERY_SERVICE) as? android.os.BatteryManager)
-                    ?.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1
-            }.getOrDefault(-1)
-            // Charging state, so the icon can show a bolt rather than a misleading empty cell.
-            val charging = runCatching {
-                val bm = context.getSystemService(Context.BATTERY_SERVICE) as? android.os.BatteryManager
-                bm?.isCharging == true
-            }.getOrDefault(false)
-            val clock = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
-                .format(java.util.Date(System.currentTimeMillis()))
-            stats.text = buildString {
-                if (title.isNotBlank()) append(title).append('\n')
-                // FPS is meaningless with no VM — the reading would just sit at the last value.
-                if (inGame) {
-                    append("FPS ").append(String.format(java.util.Locale.US, "%.1f", fps))
-                    // Carrying the OSD for the game screen: add the speed vs the game's own target,
-                    // so the panel replaces what was hidden up top rather than showing less.
-                    if (moveOsd.value) {
-                        val nominal = runCatching { NativeApp.getNominalFrameRate() }.getOrDefault(0f)
-                        if (nominal > 1f) {
-                            append("   ").append((fps / nominal * 100f).toInt()).append('%')
-                        }
-                        if (runCatching { MainActivityRuntime.isFastForwardActive() }
-                                .getOrDefault(false)
-                        ) append("   ▶▶")
-                    }
-                }
-                if (battery >= 0) {
-                    if (inGame) append("   ")
-                    append(batteryIcon(battery, charging)).append(' ').append(battery).append('%')
-                }
-                append("   ").append(clock)
+            val bm = context.getSystemService(Context.BATTERY_SERVICE) as? android.os.BatteryManager
+            val battery = runCatching { bm?.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1 }.getOrDefault(-1)
+            val charging = runCatching { bm?.isCharging == true }.getOrDefault(false)
+            val clock = android.text.format.DateFormat.getTimeFormat(context).format(java.util.Date())
+            status.text = buildString {
+                append(clock)
+                if (battery >= 0) append("   ").append(batteryIcon(battery, charging)).append(' ').append(battery).append('%')
             }
         }
 

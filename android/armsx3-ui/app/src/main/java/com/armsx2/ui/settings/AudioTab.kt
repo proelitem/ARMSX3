@@ -45,7 +45,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import net.rpcsx.Permission
+import com.armsx3.core.Permission
 
 /**
  * SPU2 audio output settings. Volume + mute apply live to the open audio
@@ -328,6 +328,20 @@ private fun MicTestRow(device: String) {
         }
     }
 
+    // In the XMB: an item that starts and stops the test, with the level as a bar under it.
+    com.armsx2.ui.xmb.LocalXmbCollector.current?.let { c ->
+        com.armsx2.ui.xmb.XmbCollected(
+            c,
+            com.armsx2.ui.xmb.XmbNode.Action(
+                "xmb.mic.test",
+                str(if (testing) "audio.mic.test.stop" else "audio.mic.test"),
+                c.icon,
+                str(if (failed) "audio.mic.test.failed" else "audio.mic.test.description"),
+                meter = if (testing) ({ level }) else null,
+            ) { toggle() },
+        )
+        return
+    }
     SettingsDivider()
     MicActionRow(
         "audio.mic.test",

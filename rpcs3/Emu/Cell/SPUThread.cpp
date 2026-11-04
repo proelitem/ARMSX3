@@ -603,7 +603,7 @@ namespace vm
 	std::array<atomic_t<reservation_waiter_t, 128>, 1024> g_resrv_waiters_count{};
 }
 
-void do_cell_atomic_128_store(u32 addr, const void* to_write);
+void do_cell_atomic_128_store(u32 addr, const void* to_write, bool lock_rsx = true);
 
 extern thread_local u64 g_tls_fault_spu;
 
@@ -1672,17 +1672,18 @@ void spu_thread::cpu_return()
 					exit_status.set_value(last_exit_status);
 				}
 
-				last_stop = group->stop_count;
-
-				if (last_stop == umax)
+				last_stop = group->stop_count.fetch_op([&](u32& count)
 				{
-					// Restart with some high count to preserve some meaning
-					group->stop_count = 1000;
-				}
-				else
-				{
-					group->stop_count++;
-				}
+					if (count == umax)
+					{
+						// Restart with some high count to preserve some meaning
+						count = 1000;
+					}
+					else
+					{
+						count++;
+					}
+				});
 
 				if (const auto ppu = std::exchange(group->waiter, nullptr))
 				{
@@ -3260,7 +3261,7 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 
 		for (u32 size = args.size, size0; is_get; size -= size0, dst += size0, src += size0, eal += size0)
 		{
-			size0 = std::min<u32>(128 - (eal & 127), std::min<u32>(size, 128));
+			size0 = std::min<u32>(128 - (eal & 127), size);
 
 			for (u64 i = 0;; [&]()
 			{
@@ -3388,12 +3389,12 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 		{
 			for (u32 size0, size = args.size;; size -= size0, dst += size0, src += size0, eal += size0)
 			{
-				size0 = std::min<u32>(128 - (eal & 127), std::min<u32>(size, 128));
+				size0 = std::min<u32>(128 - (eal & 127), size);
 
 				if (size0 == 128u && g_cfg.core.accurate_cache_line_stores)
 				{
 					// As atomic as PUTLLUC
-					do_cell_atomic_128_store(eal, src);
+					do_cell_atomic_128_store(eal, src, false);
 
 					if (size == size0)
 					{
@@ -4891,12 +4892,12 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 	}
 }
 
-void do_cell_atomic_128_store(u32 addr, const void* to_write)
+void do_cell_atomic_128_store(u32 addr, const void* to_write, bool lock_rsx)
 {
 	perf_meter<"STORE128"_u64> perf0;
 
 	const auto cpu = get_current_cpu_thread();
-	rsx::reservation_lock rsx_lock(addr, 128);
+	rsx::reservation_lock rsx_lock(addr, 128, lock_rsx && g_cfg.core.rsx_accurate_res_access);
 
 	u64 shared_mem = vm::g_shmem[addr >> 16];
 
@@ -7448,7 +7449,7 @@ s64 spu_thread::get_ch_value(u32 ch)
 						// sub_saturate(8, 10) is 0, so this throttle fires on EVERY background SPU
 						// compile and sleeps productive reservation waiters through scene warm-up.
 						// Keep the desktop behaviour above 10 threads, give low-core devices a sane
-						// non-zero floor. Ported from ouroboros420/rpcsx (d8a19e2c8).
+						// non-zero floor. Ported from an earlier Android fork (d8a19e2c8).
 						const u32 hw_threads = utils::get_thread_count();
 						const u32 true_free = hw_threads > 10 ? (hw_threads - 10) : (hw_threads / 2);
 

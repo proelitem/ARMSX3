@@ -4,7 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.util.Log
 import com.armsx2.HeadsetProfile
-import net.rpcsx.RPCSX
+import com.armsx3.core.ARMSX3
 
 /**
  * The virtual-screen mode on a headset: the PS3's picture on a quad in front of the player,
@@ -42,7 +42,7 @@ object XrPresentation {
     /** Installs the renderer hooks for [activity]. False means the game runs on the panel. */
     fun start(activity: Activity): Boolean {
         val ok = runCatching {
-            RPCSX.instance.xrStart(activity, SCREEN_DISTANCE_M, SCREEN_WIDTH_M, QUAD_WIDTH, QUAD_HEIGHT)
+            ARMSX3.instance.xrStart(activity, SCREEN_DISTANCE_M, SCREEN_WIDTH_M, QUAD_WIDTH, QUAD_HEIGHT)
         }.getOrElse {
             // An older JNI library without the binding: UnsatisfiedLinkError.
             Log.w(TAG, "xrStart unavailable", it)
@@ -55,8 +55,8 @@ object XrPresentation {
     /** May block for a moment (the core waits for its swapchain to be gone), so not on the
      *  main thread. */
     fun stop() {
-        runCatching { RPCSX.instance.xrStop() }.onFailure { Log.w(TAG, "xrStop unavailable", it) }
+        runCatching { ARMSX3.instance.xrStop() }.onFailure { Log.w(TAG, "xrStop unavailable", it) }
     }
 
-    fun active(): Boolean = runCatching { RPCSX.instance.xrActive() }.getOrDefault(false)
+    fun active(): Boolean = runCatching { ARMSX3.instance.xrActive() }.getOrDefault(false)
 }

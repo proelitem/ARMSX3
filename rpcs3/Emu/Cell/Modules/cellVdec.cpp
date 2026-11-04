@@ -242,7 +242,6 @@ struct vdec_context final
 	u32 frc_set{}; // Frame Rate Override
 	u64 next_pts{};
 	u64 next_dts{};
-	u64 last_au_usrd{}; // Userdata of the last decoded AU, used for the drained pictures
 	atomic_t<u32> ppu_tid{};
 
 	std::deque<vdec_frame> out_queue;
@@ -309,6 +308,11 @@ struct vdec_context final
 		{
 			fmt::throw_exception("avcodec_alloc_context3() failed (type=0x%x)", type);
 		}
+
+#ifdef AV_CODEC_FLAG_COPY_OPAQUE
+		// Carry the AU userdata from each packet to the picture decoded from it, across the frame reordering
+		ctx->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
+#endif
 
 		AVDictionary* opts = nullptr;
 
@@ -448,12 +452,22 @@ struct vdec_context final
 				const u32 au_size = cmd->au.size;
 				const u64 au_pts = u64{cmd->au.pts.upper} << 32 | cmd->au.pts.lower;
 				const u64 au_dts = u64{cmd->au.dts.upper} << 32 | cmd->au.dts.lower;
-				au_usrd = drain ? last_au_usrd : cmd->au.userData.value();
+				au_usrd = cmd->au.userData;
 
 				packet.data = cmd->au_data.data();
 				packet.size = au_size;
 				packet.pts = au_pts != umax ? au_pts : s64{smin};
 				packet.dts = au_dts != umax ? au_dts : s64{smin};
+				packet.opaque = reinterpret_cast<void*>(au_usrd);
+
+#ifndef AV_CODEC_FLAG_COPY_OPAQUE
+				// ARMSX3: the Android build uses FFmpeg 5.1, which predates AV_CODEC_FLAG_COPY_OPAQUE. reordered_opaque does the
+				// same job there: the decoder stamps each picture with the value set when the AU holding it was sent.
+				if (!drain)
+				{
+					ctx->reordered_opaque = static_cast<s64>(au_usrd);
+				}
+#endif
 
 				if (next_pts == 0 && au_pts != umax)
 				{
@@ -494,8 +508,6 @@ struct vdec_context final
 					{
 						sequence_header_found = true;
 					}
-
-					last_au_usrd = au_usrd;
 
 					while (!abort_decode && seq_id == cmd->seq_id)
 					{
@@ -555,7 +567,11 @@ struct vdec_context final
 
 						frame.pts = next_pts;
 						frame.dts = next_dts;
-						frame.userdata = au_usrd;
+#ifdef AV_CODEC_FLAG_COPY_OPAQUE
+						frame.userdata = reinterpret_cast<u64>(frame->opaque);
+#else
+						frame.userdata = static_cast<u64>(frame->reordered_opaque);
+#endif
 						frame.attr = attr;
 
 						u64 amend = 0;

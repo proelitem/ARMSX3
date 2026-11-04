@@ -1,5 +1,9 @@
 package com.armsx2.ui.home
 
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.border
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -8,10 +12,15 @@ import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.isImeVisible
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.MaterialTheme
@@ -32,6 +41,12 @@ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -58,6 +73,17 @@ object LibraryKeyboard {
     /** Live buffer, seeded from the current query on open; every edit pushes to onChange. */
     val text = mutableStateOf("")
     private var onChange: (String) -> Unit = {}
+
+    /** [text] with its caret and the IME's composing span, for XMB mode's field, which the phone's
+     *  own keyboard can type in too. Kept in step with [text] by every edit. */
+    private val field = mutableStateOf(TextFieldValue(""))
+
+    /** XMB mode's field is up. It holds the caret, so it can take typing as well as the keys. */
+    val fieldShown = mutableStateOf(false)
+
+    /** Someone is typing in XMB mode's field (the phone's keyboard, after a touch on the field, or a
+     *  real keyboard): keys that aren't the pad's are the field's. */
+    val typing = mutableStateOf(false)
     /** Empty-buffer hint; caller-set so the same keyboard serves library + settings search. */
     private val placeholder = mutableStateOf("Search games…")
 
@@ -70,18 +96,36 @@ object LibraryKeyboard {
     const val CLEAR = "clear"
     const val DONE = "done"
     const val SHIFT = "shift"
+    const val PASTE = "paste"
 
     // It also takes remote play's join address, so it carries the symbols an address and a host
     // name need: "." and ":" (a port), plus "/" "-" "_". They sit where a physical keyboard puts
     // them where possible (". /" after "m") and fill the short rows, so the grid keeps its five
     // rows and still fits a landscape handheld.
-    val rows: List<List<String>> = listOf(
+    private val padRows: List<List<String>> = listOf(
         listOf("1", "2", "3", "4", "5", "6", "7", "8", "9", "0"),
         listOf("q", "w", "e", "r", "t", "y", "u", "i", "o", "p"),
         listOf("a", "s", "d", "f", "g", "h", "j", "k", "l", ":"),
         listOf(SHIFT, "z", "x", "c", "v", "b", "n", "m", ".", "/"),
         listOf("-", "_", SPACE, BACKSPACE, CLEAR, DONE),
     )
+
+    /**
+     * XMB mode's keys, laid out as the console's keyboard: the characters in a block, with the
+     * keys that do something down the right, one a row. A row of symbols too, "@" among them, as
+     * an email address (an RPCN account) has to be typed here.
+     */
+    private val xmbRows: List<List<String>> = listOf(
+        listOf("1", "2", "3", "4", "5", "6", "7", "8", "9", "0", BACKSPACE),
+        listOf("q", "w", "e", "r", "t", "y", "u", "i", "o", "p", SPACE),
+        listOf("a", "s", "d", "f", "g", "h", "j", "k", "l", ":", SHIFT),
+        listOf("z", "x", "c", "v", "b", "n", "m", ".", "/", "-", CLEAR),
+        listOf("@", "_", "!", "?", "#", "&", "'", "+", "=", "~", DONE),
+    )
+
+    private fun xmbKeys(): Boolean = com.armsx2.ui.xmb.XmbMode.active.value && !useSystemIme.value
+
+    val rows: List<List<String>> get() = if (xmbKeys()) xmbRows else padRows
 
     /** Use the Android system IME instead of these on-screen keys. Opt-in: the built-in keyboard
      *  stays the default because it is fully gamepad-navigable, whereas the system IME is not (and
@@ -107,6 +151,8 @@ object LibraryKeyboard {
 
     fun open(initial: String, onChange: (String) -> Unit, placeholder: String = "Search games…", masked: Boolean = false) {
         text.value = initial
+        field.value = TextFieldValue(initial, TextRange(initial.length))
+        typing.value = false
         this.onChange = onChange
         this.placeholder.value = placeholder
         this.masked.value = masked
@@ -134,7 +180,7 @@ object LibraryKeyboard {
 
     /** Press the currently-highlighted key. */
     fun press() {
-        val key = rows[row.intValue].getOrNull(col.intValue) ?: return
+        val key = rows.getOrNull(row.intValue)?.getOrNull(col.intValue) ?: return
         pressKey(key)
     }
 
@@ -146,12 +192,21 @@ object LibraryKeyboard {
             SPACE -> text.value + " "
             BACKSPACE -> text.value.dropLast(1)
             CLEAR -> ""
+            PASTE -> text.value + clipboardText()
             DONE -> { close(); return }
             else -> text.value + (if (shifted.value) key.uppercase() else key)
         }
         text.value = next
+        field.value = TextFieldValue(next, TextRange(next.length))
         onChange(next)
     }
+
+    /** The clipboard's text as one line: a code or an address copied from a message. */
+    private fun clipboardText(): String = runCatching {
+        val context = com.armsx2.Pasx2Application.appContext
+        context.getSystemService(android.content.ClipboardManager::class.java)?.primaryClip
+            ?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(context)?.toString()
+    }.getOrNull().orEmpty().replace(Regex("\\s*[\\r\\n]+\\s*"), " ").trim()
 
     /** Convenience hardware shortcut (e.g. X = backspace) from dispatchKeyEvent. */
     fun backspace() = pressKey(BACKSPACE)
@@ -175,6 +230,11 @@ object LibraryKeyboard {
     @Composable
     fun Overlay(scope: BoxScope) {
         if (!visible.value) return
+        // XMB mode types on a keyboard drawn as the console's: the same keys and the same pad.
+        if (com.armsx2.ui.xmb.XmbMode.active.value && !useSystemIme.value) {
+            XmbPanel(scope)
+            return
+        }
         with(scope) {
         // Dim the library behind, and swallow stray taps so they don't hit covers.
         Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = 0.5f)).clickable(enabled = false) {})
@@ -228,6 +288,181 @@ object LibraryKeyboard {
                 }
             }
         }
+        }
+    }
+
+    /**
+     * The key grid drawn as the PS3's on-screen keyboard, for XMB mode: a dark glass panel over the
+     * dimmed XMB, the text in a light field at its head, and the keys as soft panes in the XMB's
+     * font, the selected one lit. Same keys, same pad handling, same touch.
+     */
+    @Composable
+    private fun XmbPanel(scope: BoxScope) {
+        val font = com.armsx2.ui.xmb.rememberXmbFont()
+        val ime = LocalSoftwareKeyboardController.current
+        val view = androidx.compose.ui.platform.LocalView.current
+        val focus = remember { FocusRequester() }
+        // The field holds the caret from the start, without the phone's keyboard: a touch on the
+        // field brings that up.
+        LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
+        DisposableEffect(Unit) {
+            fieldShown.value = true
+            // Android brings its keyboard up by itself for a window with a field in focus on some
+            // screens (the larger ones, in landscape); while this is up, only when asked for.
+            val window = generateSequence(view.context) { (it as? android.content.ContextWrapper)?.baseContext }
+                .filterIsInstance<android.app.Activity>().firstOrNull()?.window
+            val mode = window?.attributes?.softInputMode
+            if (window != null && mode != null) {
+                window.setSoftInputMode(
+                    (mode and android.view.WindowManager.LayoutParams.SOFT_INPUT_MASK_STATE.inv()) or
+                        android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN,
+                )
+            }
+            onDispose {
+                if (window != null && mode != null) window.setSoftInputMode(mode)
+                if (typing.value) ime?.hide()
+                typing.value = false
+                fieldShown.value = false
+            }
+        }
+        // And should it come up anyway with nobody typing (no touch on the field, no keyboard keys),
+        // it goes again.
+        @OptIn(ExperimentalLayoutApi::class)
+        val imeShown = WindowInsets.isImeVisible
+        LaunchedEffect(imeShown) { if (imeShown && !typing.value) ime?.hide() }
+        with(scope) {
+            Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = 0.55f)).clickable(enabled = false) {})
+            Column(
+                Modifier
+                    .align(Alignment.Center)
+                    .fillMaxWidth(0.86f)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(
+                        androidx.compose.ui.graphics.Brush.verticalGradient(
+                            listOf(Color(0xE6303036), Color(0xE6141418)),
+                        ),
+                    )
+                    .border(1.dp, Color.White.copy(alpha = 0.22f), RoundedCornerShape(10.dp))
+                    .padding(horizontal = 18.dp, vertical = 14.dp),
+                verticalArrangement = Arrangement.spacedBy(7.dp),
+            ) {
+                Text(
+                    placeholder.value,
+                    color = Color.White.copy(alpha = 0.75f),
+                    fontFamily = font,
+                    fontSize = 14.sp,
+                    maxLines = 1,
+                )
+                // A real field: tapped, the phone's own keyboard types in it (its clipboard too), and a
+                // long press pastes, so a code copied from an email goes straight in. The keys below
+                // still type here, by pad or by touch, and the caret is the field's own.
+                BasicTextField(
+                    value = field.value,
+                    onValueChange = {
+                        val next = it.text.replace("\n", "")
+                        field.value = if (next == it.text) it else TextFieldValue(next, TextRange(next.length))
+                        if (next != text.value) {
+                            text.value = next
+                            onChange(next)
+                        }
+                    },
+                    singleLine = true,
+                    textStyle = TextStyle(color = Color(0xFF101014), fontFamily = font, fontSize = 19.sp),
+                    cursorBrush = SolidColor(Color(0xFF101014)),
+                    visualTransformation = if (masked.value) androidx.compose.ui.text.input.PasswordVisualTransformation()
+                    else androidx.compose.ui.text.input.VisualTransformation.None,
+                    keyboardOptions = KeyboardOptions(
+                        imeAction = ImeAction.Done,
+                        keyboardType = if (masked.value) androidx.compose.ui.text.input.KeyboardType.Password
+                        else androidx.compose.ui.text.input.KeyboardType.Text,
+                        autoCorrectEnabled = false,
+                        showKeyboardOnFocus = false,
+                    ),
+                    keyboardActions = KeyboardActions(onDone = { close() }),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .focusRequester(focus)
+                        .pointerInput(Unit) {
+                            awaitEachGesture {
+                                awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                                typing.value = true
+                            }
+                        },
+                    decorationBox = { inner ->
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(4.dp))
+                                .background(Color.White.copy(alpha = 0.92f))
+                                .padding(horizontal = 10.dp, vertical = 7.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            inner()
+                        }
+                    },
+                )
+                Spacer(Modifier.height(4.dp))
+                rows.forEachIndexed { r, keys ->
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                        keys.forEachIndexed { c, key ->
+                            val selected = row.intValue == r && col.intValue == c
+                            val on = key == SHIFT && shifted.value
+                            val label = glyphOf(key)
+                            // The keys that do something stand apart down the right, as the console's do.
+                            val action = key == BACKSPACE || key == SPACE || key == SHIFT || key == CLEAR || key == DONE
+                            if (action) Spacer(Modifier.width(6.dp))
+                            Box(
+                                modifier = Modifier
+                                    .weight(if (action) 2.4f else 1f)
+                                    .height(44.dp)
+                                    .clip(RoundedCornerShape(5.dp))
+                                    .background(
+                                        when {
+                                            selected -> androidx.compose.ui.graphics.Brush.verticalGradient(listOf(Color.White.copy(alpha = 0.62f), Color.White.copy(alpha = 0.34f)))
+                                            on -> androidx.compose.ui.graphics.Brush.verticalGradient(listOf(Color.White.copy(alpha = 0.30f), Color.White.copy(alpha = 0.18f)))
+                                            else -> androidx.compose.ui.graphics.Brush.verticalGradient(listOf(Color.White.copy(alpha = 0.14f), Color.White.copy(alpha = 0.06f)))
+                                        },
+                                    )
+                                    .border(1.dp, Color.White.copy(alpha = if (selected) 0.85f else 0.16f), RoundedCornerShape(5.dp))
+                                    .clickable {
+                                        row.intValue = r
+                                        col.intValue = c
+                                        pressKey(key)
+                                    },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Text(
+                                    label,
+                                    color = if (selected) Color(0xFF0C0C10) else Color.White,
+                                    fontFamily = font,
+                                    fontSize = if (label.length > 1) 14.sp else 18.sp,
+                                    maxLines = 1,
+                                )
+                            }
+                        }
+                    }
+                }
+                // The console's guide along the foot: what the face buttons do here.
+                Row(
+                    Modifier.fillMaxWidth().padding(top = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(18.dp, Alignment.End),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    // Each also does its job when tapped, so Paste is a tap away on a phone.
+                    listOf(
+                        Triple("\u25B3" to Color(0xFF3DDC84), glyphOf(SPACE)) { pressKey(SPACE) },
+                        Triple("\u25A1" to Color(0xFFE88BD5), glyphOf(BACKSPACE)) { pressKey(BACKSPACE) },
+                        Triple("\u25CB" to Color(0xFFFF5A5A), com.armsx2.i18n.I18n.get("xmb.back")) { close() },
+                        Triple("SELECT" to Color.White, com.armsx2.i18n.I18n.get("xmb.keyboard.paste")) { pressKey(PASTE) },
+                        Triple("START" to Color.White, glyphOf(DONE)) { pressKey(DONE) },
+                    ).forEach { (button, label, action) ->
+                        Row(Modifier.clickable(onClick = action), verticalAlignment = Alignment.CenterVertically) {
+                            Text(button.first, color = button.second, fontFamily = font, fontSize = 14.sp)
+                            Text(" $label", color = Color.White.copy(alpha = 0.85f), fontFamily = font, fontSize = 13.sp)
+                        }
+                    }
+                }
+            }
         }
     }
 

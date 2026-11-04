@@ -34,8 +34,8 @@ android {
         // agree -- an APK that installs below its core's target is a dlopen failure at boot.
         minSdk = (project.findProperty("armsx3.minSdk") as String?)?.toInt() ?: 33
         targetSdk = 37
-        versionCode = 102
-        versionName = "1.5"
+        versionCode = 109
+        versionName = "1.6.2"
 
         // ARMSX2's UI reads these. STORAGE_ALL_FILES gates the all-files storage path in
         // onboarding; IN_APP_UPDATER gates the in-app GitHub-release updater.
@@ -256,8 +256,8 @@ androidComponents {
 // The claim being guarded is live in THIS module: RendererBackendSection ->
 // AngleDriverSection writes Settings.useAngleOpenGL, and applyAngleEnv turns it
 // into ARMSX2_ANGLE_EGL_LIBRARY. (Both the libraries and this task used to sit in
-// the stale android/armsx3-app module, which builds nothing that ships -- so the
-// guard could not fire for the APK it was meant to protect.)
+// a second, stale Gradle module that built nothing that ships, since deleted -- so
+// the guard could not fire for the APK it was meant to protect.)
 val verifyAngleLibs by tasks.registering {
     val angleLibs = listOf("libEGL_angle.so", "libGLESv2_angle.so")
     val jniLibDir = file("src/main/jniLibs/arm64-v8a")
@@ -317,7 +317,7 @@ dependencies {
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.lifecycle.runtime.compose)
 
-    // The net.rpcsx binding layer persists library and firmware state with
+    // The com.armsx3.core binding layer persists library and firmware state with
     // kotlinx-serialization.
     implementation(libs.kotlinxSerializationJson)
 

@@ -32,10 +32,10 @@ import com.armsx2.ui.common.canBrowse
 import com.armsx2.ui.settings.controllerFocusable
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import net.rpcsx.FirmwareRepository
-import net.rpcsx.FirmwareStatus
-import net.rpcsx.ProgressRepository
-import net.rpcsx.RPCSX
+import com.armsx3.core.FirmwareRepository
+import com.armsx3.core.FirmwareStatus
+import com.armsx3.core.ProgressRepository
+import com.armsx3.core.ARMSX3
 
 /**
  * PS3 firmware, replacing ARMSX2's PS2 BIOS manager.
@@ -93,7 +93,7 @@ fun BiosManagerScreen(onBack: () -> Unit) {
                         .use { afd ->
                             val fd = afd?.parcelFileDescriptor?.fd
                                 ?: return@runCatching false
-                            RPCSX.instance.installFw(fd, id)
+                            ARMSX3.instance.installFw(fd, id)
                         }
                 }.getOrDefault(false)
             }
@@ -112,6 +112,56 @@ fun BiosManagerScreen(onBack: () -> Unit) {
     val safPicker = androidx.activity.compose.rememberLauncherForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.OpenDocument(),
     ) { uri -> uri?.let(installFirmware) }
+
+    com.armsx2.ui.xmb.LocalXmbCollector.current?.let { c ->
+        val ok = str("action.ok")
+        val cancel = str("action.cancel")
+        val installWord = str("packages.updates.install")
+        val installAsk = str("xmb.packages.installAsk")
+        val roots = remember { com.armsx2.ui.xmb.XmbFiles.roots(context) }
+        val folderIcon = com.armsx2.ui.xmb.XmbIcon("explore_category_game", "item_tex_plain_folder", "\uD83D\uDCC2")
+        val driveIcon = com.armsx2.ui.xmb.XmbIcon("explore_category_photo", "item_tex_usb_connection", "\uD83D\uDCBE")
+        LaunchedEffect(message) {
+            val m = message ?: return@LaunchedEffect
+            com.armsx2.ui.xmb.XmbDialogs.target()?.tell(m, ok)
+            message = null
+        }
+        androidx.compose.foundation.layout.Column {
+            com.armsx2.ui.xmb.XmbCollected(
+                c,
+                com.armsx2.ui.xmb.XmbNode.Action(
+                    "fw.status",
+                    if (status == FirmwareStatus.None) str("bios.firmware.notInstalled") else version?.takeIf { it.isNotBlank() } ?: str("setup.status.installed"),
+                    c.icon,
+                    if (busy) str("setup.firmware.installing") else str("setup.step.bios.description"),
+                ) {},
+            )
+            if (!busy && canBrowse()) {
+                com.armsx2.ui.xmb.XmbCollectedSection(c, "fw.storage", str("xmb.update.storage")) {
+                    val inner = com.armsx2.ui.xmb.LocalXmbCollector.current ?: return@XmbCollectedSection
+                    roots.forEach { (label, dir) ->
+                        com.armsx2.ui.xmb.XmbCollected(
+                            inner,
+                            com.armsx2.ui.xmb.XmbFiles.folder(
+                                "fw.root.${dir.absolutePath}", label, dir, driveIcon, folderIcon, setOf("pup"), { c.icon },
+                            ) { f ->
+                                com.armsx2.ui.xmb.XmbDialogs.target()?.ask(installAsk.format(f.name), installWord, cancel, focusNo = true) {
+                                    installFirmware(android.net.Uri.fromFile(f))
+                                }
+                            },
+                        )
+                    }
+                }
+            }
+            if (!busy) {
+                com.armsx2.ui.xmb.XmbCollected(
+                    c,
+                    com.armsx2.ui.xmb.XmbNode.Action("fw.external", str("packages.select.external"), driveIcon) { safPicker.launch(arrayOf("*/*")) },
+                )
+            }
+        }
+        return
+    }
 
     if (showBrowser) {
         FileBrowserDialog(

@@ -41,6 +41,8 @@ import com.armsx2.ShaderRepo
 import com.armsx2.i18n.str
 import com.armsx2.ui.settings.HelpText
 import com.armsx2.ui.settings.IntSliderRow
+import com.armsx2.ui.settings.SegmentedRow
+import com.armsx2.ui.settings.StockSettings
 import com.armsx2.ui.settings.SettingsControllerNav
 import com.armsx2.ui.settings.SettingsDivider
 import com.armsx2.ui.settings.ToggleRow
@@ -64,12 +66,12 @@ import java.io.File
  *  shown and the judgement is left to the user. Do NOT resurrect a Lightweight/Heavy split
  *  on top of it: a wrong "Lightweight" badge misleads exactly the user who picked that tier
  *  because they wanted cheap. */
-private data class ShaderPreset(val label: String, val path: String, val passes: Int?)
+internal data class ShaderPreset(val label: String, val path: String, val passes: Int?)
 
 /** One directory in the on-disk shader tree. Only this directory's immediate [folders] and
  *  [presets] are composed at a time; navigating into a child replaces the visible rows
  *  instead of adding another expanded section to an ever-growing list. */
-private data class ShaderDirectory(
+internal data class ShaderDirectory(
     val key: String,
     val label: String,
     val count: Int,
@@ -77,8 +79,9 @@ private data class ShaderDirectory(
     val presets: List<ShaderPreset>,
 )
 
-/** Result of one scan, including the filesystem path used by the empty-state message. */
-private data class ShaderScan(val dir: String, val root: ShaderDirectory)
+/** Result of one scan, including the filesystem path used by the empty-state message. The video
+ *  player's RetroArch Shaders list reads the same scan. */
+internal data class ShaderScan(val dir: String, val root: ShaderDirectory)
 
 /** A preset plus the path segments of its folder, relative to the shaders root. */
 private class FoundPreset(val preset: ShaderPreset, val segments: List<String>)
@@ -157,6 +160,8 @@ fun ShaderChainSection(
     onEnabledChange: (Boolean) -> Unit,
     onPresetChange: (String) -> Unit,
     onParamsChange: (Map<String, Map<String, Float>>) -> Unit,
+    scale: Int,
+    onScaleChange: (Int) -> Unit,
 ) {
     ToggleRow(
         str("renderer.shaderChain.label"),
@@ -175,7 +180,39 @@ fun ShaderChainSection(
         // section would be a row that opens onto an empty list.
         if (preset.isNotBlank()) {
             SettingsDivider()
+            ShaderScaleRow(scale, onScaleChange)
+            SettingsDivider()
             ShaderParamPicker(preset, params, onParamsChange, onPresetChange)
+        }
+    }
+}
+
+/** What Shader Resolution offers, in percent of full size; see Settings.shaderChainScale. */
+private val SHADER_SCALES = listOf(100, 75, 67, 50)
+
+/**
+ * The share of full size the chain runs at, the game's picture going in and the chain's coming
+ * out, before it is scaled up to the screen. Saved through the caller's tier like the rows above,
+ * and pushed at a running game too, as the renderer reads it each frame.
+ */
+@Composable
+private fun ShaderScaleRow(scale: Int, onScaleChange: (Int) -> Unit) {
+    val change = androidx.compose.runtime.rememberUpdatedState(onScaleChange)
+    // A value set by hand in a config file shows as the nearest choice at or below it.
+    val index = SHADER_SCALES.indexOf(scale).takeIf { it >= 0 }
+        ?: SHADER_SCALES.indexOfFirst { it <= scale }.takeIf { it >= 0 }
+        ?: SHADER_SCALES.lastIndex
+    SegmentedRow(
+        label = str("renderer.shaderChain.scale.label"),
+        options = SHADER_SCALES.map { "$it%" },
+        selectedIndex = index,
+        description = str("renderer.shaderChain.scale.description"),
+        notDefault = scale != StockSettings.shaderChainScale,
+    ) { i ->
+        val percent = SHADER_SCALES[i]
+        change.value(percent)
+        if (com.armsx2.runtime.MainActivityRuntime.eState.value != com.armsx2.EmuState.STOPPED) {
+            runCatching { com.armsx3.Rpcs3Settings.setShaderPresetScale(percent) }
         }
     }
 }
@@ -279,13 +316,16 @@ private fun ShaderPresetPicker(preset: String, onPresetChange: (String) -> Unit)
     // The path relative to the shader root. An empty key is the root itself. Keeping one
     // current location is what makes this a browser rather than a set of nested accordions.
     val currentFolderKey = remember { mutableStateOf("") }
+    // Bumped each time the XMB's list opens: there it never closes and opens the way the screen's
+    // does, and a pack downloaded after the first look was never found, leaving only None.
+    val rescan = remember { androidx.compose.runtime.mutableIntStateOf(0) }
 
     // Rescan on every open: packs get dropped in with a file manager (or the Shader Packs
     // downloader) while the app is alive, so a one-shot scan at first composition goes
     // stale. Off the UI thread — a slang-shaders pack is a deep tree of thousands of files,
     // and the costing/grouping/sorting rides the same IO hop rather than landing in
     // composition.
-    LaunchedEffect(expanded.value) {
+    LaunchedEffect(expanded.value, rescan.intValue) {
         if (!expanded.value) return@LaunchedEffect
         scanning.value = true
         try {
@@ -299,6 +339,72 @@ private fun ShaderPresetPicker(preset: String, onPresetChange: (String) -> Unit)
             // the picker permanently reporting a scan merely because traversal threw.
             scanning.value = false
         }
+    }
+
+    // In the XMB: the presets as a tree of lists, None first, scanned as the list opens.
+    com.armsx2.ui.xmb.LocalXmbCollector.current?.let { c ->
+        // The list stays open while settings change around it, so a pick goes through the save as
+        // it is now, never one from when the list was opened (which could put other changes back).
+        val change = androidx.compose.runtime.rememberUpdatedState(onPresetChange)
+        fun pick(path: String) {
+            android.util.Log.i(
+                "ARMSX3-Shader",
+                "xmb pick '$path' scope=${com.armsx2.ui.InGameOverlay.settingsScope.value} serial=${com.armsx2.ui.InGameOverlay.currentSerial.value}",
+            )
+            change.value(path)
+            // A game running takes it at once, as the renderer reads the preset each frame: pushed
+            // here as well as saved, so it shows whatever tier of settings the save landed in.
+            if (com.armsx2.runtime.MainActivityRuntime.eState.value != com.armsx2.EmuState.STOPPED) {
+                runCatching {
+                    com.armsx3.Rpcs3Settings.setShaderPresetPath(path)
+                    if (path.isNotBlank()) com.armsx3.Rpcs3Settings.setOutputScaling("Shader chain (librashader)")
+                }
+            }
+            // Back to the list the presets hang from, where Shader Preset now reads the one picked.
+            com.armsx2.ui.xmb.XmbDialogs.target()?.let { x ->
+                val at = x.levels.indexOfLast { it.node.key == "xmb.shader.presets" }
+                if (at >= 0) while (x.levels.size > at) x.levels.removeAt(x.levels.lastIndex)
+            }
+        }
+        val title = str("renderer.shaderChain.preset.label")
+        val noneLabel = str("renderer.shaderChain.preset.none")
+        val emptyLabel = str("renderer.shaderChain.empty")
+        fun folderNode(dir: ShaderDirectory): com.armsx2.ui.xmb.XmbNode = com.armsx2.ui.xmb.XmbNode.Folder(
+            "xmb.shader.dir.${dir.key}", dir.label, c.icon, "${dir.count}",
+        ) {
+            dir.folders.map { folderNode(it) } + dir.presets.map { p ->
+                com.armsx2.ui.xmb.XmbNode.Action("xmb.shader.preset.${p.path}", p.label, c.icon, p.passes?.let { "$it" }) { pick(p.path) }
+            }
+        }
+        com.armsx2.ui.xmb.XmbCollected(
+            c,
+            com.armsx2.ui.xmb.XmbNode.Folder(
+                "xmb.shader.presets", title, c.icon, if (preset.isBlank()) noneLabel else File(preset).nameWithoutExtension,
+                live = true,
+                host = {
+                    LaunchedEffect(Unit) {
+                        expanded.value = true
+                        rescan.intValue++
+                    }
+                },
+            ) {
+                val r = scan.value?.root
+                when {
+                    r == null || (scanning.value && r.folders.isEmpty() && r.presets.isEmpty()) ->
+                        listOf(com.armsx2.ui.xmb.XmbNode.Action("xmb.shader.scanning", "...", c.icon) {})
+                    r.folders.isEmpty() && r.presets.isEmpty() -> listOf(
+                        com.armsx2.ui.xmb.XmbNode.Action("xmb.shader.none", noneLabel, c.icon) { pick("") },
+                        com.armsx2.ui.xmb.XmbNode.Action("xmb.shader.empty", emptyLabel, c.icon, scan.value?.dir) {},
+                    )
+                    else -> listOf<com.armsx2.ui.xmb.XmbNode>(
+                        com.armsx2.ui.xmb.XmbNode.Action("xmb.shader.none", noneLabel, c.icon) { pick("") },
+                    ) + r.folders.map { folderNode(it) } + r.presets.map { p ->
+                        com.armsx2.ui.xmb.XmbNode.Action("xmb.shader.preset.${p.path}", p.label, c.icon) { pick(p.path) }
+                    }
+                }
+            },
+        )
+        return
     }
 
     val root = scan.value?.root
@@ -581,7 +687,7 @@ private fun ShaderPresetRow(
  *  load-bearing: 691 of the stock pack's 2542 presets are thin wrappers pointing at a
  *  handful of shared roots, and without memoising those roots would be re-parsed hundreds
  *  of times each. */
-private fun scanShaderPresets(context: Context): ShaderScan {
+internal fun scanShaderPresets(context: Context): ShaderScan {
     val root = ShaderRepo.shadersRoot(context)
     if (!root.isDirectory) return ShaderScan(root.absolutePath, emptyShaderDirectory())
     val cache = HashMap<String, Int?>()
@@ -654,7 +760,7 @@ private fun ShaderDirectory.promoteDefaultPackContents(): ShaderDirectory {
     )
 }
 
-private fun ShaderDirectory.findDirectory(targetKey: String): ShaderDirectory? {
+internal fun ShaderDirectory.findDirectory(targetKey: String): ShaderDirectory? {
     if (key == targetKey) return this
     return folders.firstNotNullOfOrNull { it.findDirectory(targetKey) }
 }
@@ -667,7 +773,7 @@ private fun ShaderDirectory.findPresetDirectory(presetPath: String): String? {
 
 /** Parent inside the PRESENTED tree. The promoted pack wrapper is absent, so a category
  *  such as `shaders_slang/crt` returns the visible root instead of that hidden wrapper. */
-private fun ShaderDirectory.parentKeyWithin(root: ShaderDirectory?): String {
+internal fun ShaderDirectory.parentKeyWithin(root: ShaderDirectory?): String {
     if (root == null) return ""
     val parent = key.substringBeforeLast('/', "")
     return if (root.findDirectory(parent) != null) parent else root.key

@@ -76,9 +76,9 @@ private val ExitRed = Color(0xFFE60012)
 // Community/project links for the drawer's About section. Plain https on purpose: Android App
 // Links hand these to the Discord/GitHub apps when they're installed and fall back to the
 // browser when they aren't, so there's no app-specific scheme to special-case.
-private const val DiscordUrl = "https://discord.gg/2Tynvwhc4A"
-private const val GithubUrl = "https://github.com/ARMSX2/ARMSX3"
-private const val WebsiteUrl = "https://armsx2.net/"
+internal const val DiscordUrl = "https://discord.gg/2Tynvwhc4A"
+internal const val GithubUrl = "https://github.com/ARMSX2/ARMSX3"
+internal const val WebsiteUrl = "https://armsx2.net/armsx3"
 
 /**
  * Opens an external link, telling the user when nothing on the device can handle it.
@@ -93,7 +93,7 @@ private const val WebsiteUrl = "https://armsx2.net/"
  * handle this?" guard can read null for a link that would in fact open — turning a working row
  * into a silent no-op. startActivity() is NOT filtered, so launch it and catch the real miss.
  */
-private fun openExternalUrl(context: Context, url: String) {
+internal fun openExternalUrl(context: Context, url: String) {
     try {
         context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
     } catch (_: ActivityNotFoundException) {
@@ -117,6 +117,8 @@ private data class DrawerItem(
     val friendsBadge: Boolean = false,
     // RPCN shows the firmware's own avatar for this user in place of its glyph, once it is read
     val rpcnAvatar: Boolean = false,
+    // XMB Mode shows the ARMSX3 logo's wave in place of a glyph
+    val xmbWave: Boolean = false,
 )
 
 @Composable
@@ -203,6 +205,8 @@ private fun DrawerContent(selected: AppRoute, onNavigate: (AppRoute) -> Unit, on
         // Boot straight into the PS2 system BIOS with no disc — distinct from "BIOS Location"
         // below, which only points the emulator at your BIOS file.
         DrawerItem("bios.boot.title", "▶️", onAction = { MainActivityRuntime.startBios(); onDismiss() }),
+        // The app itself laid out as the console's XMB, coming up with its boot animation.
+        DrawerItem("xmb.mode", "", onAction = { com.armsx2.ui.xmb.XmbMode.enter(); onDismiss() }, xmbWave = true),
         // ARMSX3: RetroAchievements removed - RA has no PS3 support at all, so
         // the screen could only ever be empty. PS3 TROPHIES take its slot: RPCS3
         // tracks the real ones the games unlock, and its own list is reachable only
@@ -334,6 +338,7 @@ private fun DrawerSection(
             iconTint = item.iconTint,
             friendsBadge = item.friendsBadge,
             rpcnAvatar = item.rpcnAvatar,
+            xmbWave = item.xmbWave,
             selected = item.destination != null && sameDestination(selected, item.destination),
             onClick = { item.onAction?.invoke() ?: item.destination?.let(onNavigate) },
         )
@@ -351,6 +356,7 @@ private fun DrawerRow(
     iconTint: Color? = null,
     friendsBadge: Boolean = false,
     rpcnAvatar: Boolean = false,
+    xmbWave: Boolean = false,
     selected: Boolean,
     onClick: () -> Unit,
 ) {
@@ -373,6 +379,10 @@ private fun DrawerRow(
             if (iconRes != null) {
                 Box(Modifier.width(32.dp), contentAlignment = Alignment.Center) {
                     Icon(painterResource(iconRes), contentDescription = null, tint = iconTint ?: contentColor, modifier = Modifier.size(24.dp))
+                }
+            } else if (xmbWave) {
+                Box(Modifier.width(32.dp), contentAlignment = Alignment.CenterStart) {
+                    com.armsx2.ui.xmb.XmbWaveIcon(Modifier.size(26.dp))
                 }
             } else if (rpcnAvatar) {
                 // The glyph until the picture is read, and for good without the firmware

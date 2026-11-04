@@ -221,6 +221,9 @@ object LibraryBackground {
 
     private const val SAVED_PREFIX = "bg_"
     private const val META_NAME = "meta.json"
+
+    /** A saved picture's file name, before its extension; a theme's pictures are named otherwise. */
+    private const val PICTURE_NAME = "picture"
     private const val MAX_PICTURE_BYTES = 64L shl 20
 
     /** A background the user added: its picture, and its slides or live scene when it has them. */
@@ -233,6 +236,11 @@ object LibraryBackground {
     fun current(): Saved? {
         val shown = uri.value ?: return null
         return saved.value.firstOrNull { Uri.fromFile(it.picture).toString() == shown }
+    }
+
+    /** Add [entry] to [saved] without showing it: an XMB theme imported in XMB mode. */
+    fun add(entry: Saved) {
+        if (saved.value.none { it.folder == entry.folder }) saved.value = saved.value + entry
     }
 
     /** Show [entry], adding it to [saved] when it is new, or the default background for null. */
@@ -248,6 +256,23 @@ object LibraryBackground {
         slideshow.value = null
         scene.value = null
         runCatching { MainActivityRuntime.prefs.edit().remove(PREF).remove(PREF_SLIDESHOW).remove(PREF_SCENE).apply() }
+    }
+
+    /**
+     * After the theme [entry] is imported: an older copy of it (the same title) is dropped, and
+     * whatever showed that copy, the library's background or XMB mode's theme, shows [entry]
+     * instead. Importing a theme again is how one added before its icons and sounds were read gets
+     * them, and that should not leave two of it. Returns the old folders, for the caller to delete
+     * off the main thread.
+     */
+    fun replaceOlder(entry: Saved): List<File> {
+        val older = saved.value.filter { it.folder != entry.folder && it.name == entry.name }
+        for (old in older) {
+            if (current()?.folder == old.folder) setImported(entry.picture, entry.slideshow, entry.scene)
+            if (com.armsx2.ui.xmb.XmbTheme.selected.value == old.folder.name) com.armsx2.ui.xmb.XmbTheme.select(entry)
+        }
+        if (older.isNotEmpty()) saved.value = saved.value.filter { s -> older.none { it.folder == s.folder } }
+        return older.map { it.folder }
     }
 
     /** Delete [entry]'s files; the default background comes back when it was on show. */
@@ -275,6 +300,8 @@ object LibraryBackground {
             } else if (!file.renameTo(File(folder, file.name))) {
                 throw IOException("could not move ${file.name}")
             }
+            // A theme's XMB icons and sounds go with it (see ThemeImport.xmb).
+            result.xmb?.let { if (!it.renameTo(File(folder, XMB_DIR))) it.deleteRecursively() }
             fun moved(f: File) = File(folder, f.name)
             val entry = Saved(
                 folder, name, moved(file),
@@ -301,7 +328,7 @@ object LibraryBackground {
                 "image/webp" -> "webp"
                 else -> "jpg"
             }
-            val file = File(folder, "picture.$extension")
+            val file = File(folder, "$PICTURE_NAME.$extension")
             val input = context.contentResolver.openInputStream(source) ?: throw IOException("unreadable")
             input.use { from ->
                 file.outputStream().use { to ->
@@ -325,6 +352,8 @@ object LibraryBackground {
 
     /** The picked file's name without its extension, to name what it becomes. */
     fun displayName(context: Context, source: Uri): String? = runCatching {
+        // A file taken in the XMB's own browser has no provider to ask.
+        if (source.scheme == "file") return@runCatching source.lastPathSegment
         context.contentResolver.query(source, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
             if (c.moveToFirst()) c.getString(0) else null
         }
@@ -393,6 +422,9 @@ object LibraryBackground {
     // kept as a saved background (see keep), in a folder of its own, until the user removes it.
 
     private const val IMPORTED_DIR = "library_backgrounds"
+
+    /** In a saved theme's folder: its XMB icons and sounds, for XMB mode (see XmbTheme). */
+    const val XMB_DIR = "xmb"
     private const val IMPORTED_PREFIX = "p3t_"
     private const val MAX_STREAMED_THEME_BYTES = 128 shl 20
     private const val MAX_SCENE_BYTES = 256L shl 20
@@ -414,6 +446,8 @@ object LibraryBackground {
         val scene: File? = null,
         /** The theme's own name, when it has one. */
         val name: String? = null,
+        /** A folder of the theme's XMB icons and sounds, moved into its saved folder by [keep]. */
+        val xmb: File? = null,
     )
 
     /** True when [source] starts with the PS3 theme magic. Reads four bytes. */
@@ -448,7 +482,7 @@ object LibraryBackground {
         // other theme.
         result.anim?.let { anim ->
             runCatching { importAnimation(theme, anim, dir) }.getOrNull()?.let {
-                return ThemeImport(it.file, it.messageKey, it.slideshow, it.scene, result.name)
+                return ThemeImport(it.file, it.messageKey, it.slideshow, it.scene, result.name, xmbAssets(theme, dir))
             }
         }
         val picture = result.picture ?: return ThemeImport(
@@ -487,8 +521,126 @@ object LibraryBackground {
         }.getOrNull() ?: return ThemeImport(null, "library.bg.readFailed")
         // A dynamic theme that is not a slideshow only gets its preview, which has the theme's own
         // icons drawn into it.
-        return ThemeImport(saved, if (picture.source == P3tTheme.Source.PREVIEW) "library.bg.themePreview" else null, name = result.name)
+        return ThemeImport(
+            saved,
+            if (picture.source == P3tTheme.Source.PREVIEW) "library.bg.themePreview" else null,
+            name = result.name,
+            xmb = xmbAssets(theme, dir),
+        )
     }
+
+    /**
+     * The theme's XMB icons and sounds, taken out into a new folder for [keep] to move in with the
+     * rest. The folder is kept when the theme has none, to say it was read (see [lacksXmbAssets]).
+     * Null when it could not be made.
+     */
+    private fun xmbAssets(theme: P3tTheme.Bytes, dir: File): File? {
+        val folder = File(dir, "${IMPORTED_PREFIX}xmb_${System.nanoTime().toString(16)}")
+        return try {
+            if (folder.mkdirs()) folder.also { com.armsx2.ui.xmb.XmbThemeAssets.extract(theme, it) } else null
+        } catch (_: Exception) {
+            null
+        }.also { if (it == null) folder.deleteRecursively() }
+    }
+
+    // ---- themes kept before their XMB icons and sounds were ----
+    //
+    // A theme imported before XMB mode read icons and sounds kept its background alone. Its .p3t is
+    // usually still where it was downloaded, so it is found there by the name the theme was saved
+    // under and read again, with nothing for the user to do. Without all-files access nothing can
+    // be looked for, and importing the theme again is the way (XMB mode says so when it is picked).
+
+    /** Where downloaded themes are looked for on every storage volume, down to [THEME_SEARCH_DEPTH] folders. */
+    private val THEME_FOLDERS = listOf(android.os.Environment.DIRECTORY_DOWNLOADS, android.os.Environment.DIRECTORY_DOCUMENTS)
+    private const val THEME_SEARCH_DEPTH = 4
+    private const val MAX_THEME_SEARCH_ENTRIES = 20_000
+
+    /** True when [entry] is a theme whose XMB icons and sounds were never read: one kept before they were. */
+    fun lacksXmbAssets(entry: Saved): Boolean =
+        entry.picture.nameWithoutExtension != PICTURE_NAME && !File(entry.folder, XMB_DIR).isDirectory
+
+    @Volatile private var lookedForThemes = false
+
+    /**
+     * Read the XMB icons and sounds of every saved theme that [lacksXmbAssets] from its .p3t, found
+     * on the device by the name it was saved under: the theme's own title, or the file's name.
+     * Looks once a run. Returns the themes that were read. Blocking: call it off the main thread,
+     * after [loadSaved].
+     */
+    fun restoreXmbAssets(context: Context): List<Saved> {
+        if (lookedForThemes) return emptyList()
+        lookedForThemes = true
+        val missing = saved.value.filter(::lacksXmbAssets)
+        if (missing.isEmpty() || !android.os.Environment.isExternalStorageManager()) return emptyList()
+        val files = themeFiles(context)
+        val titles = files.associateWith { f -> runCatching { withFile(f, P3tTheme::name) }.getOrNull() }
+        val restored = ArrayList<Saved>()
+        for (entry in missing) {
+            val named = files.filter { titles[it] == entry.name }.ifEmpty { files.filter { it.nameWithoutExtension == entry.name } }
+            val source = sourceOf(entry, named)
+            if (source == null) {
+                android.util.Log.i(
+                    "ARMSX3-Theme",
+                    if (named.isEmpty()) "'${entry.name}': no theme file by that name was found"
+                    else "'${entry.name}': different theme files go by that name and none has its picture, so none was read",
+                )
+                continue
+            }
+            // Read beside the theme and moved into place whole, so a half-read folder is never used.
+            val part = File(entry.folder, "$XMB_DIR.part")
+            val read = runCatching {
+                part.deleteRecursively()
+                part.mkdirs() && withFile(source) { com.armsx2.ui.xmb.XmbThemeAssets.extract(it, part); true } &&
+                    part.renameTo(File(entry.folder, XMB_DIR))
+            }.getOrDefault(false)
+            if (!read) {
+                part.deleteRecursively()
+                continue
+            }
+            android.util.Log.i("ARMSX3-Theme", "'${entry.name}': XMB icons and sounds read from ${source.name}")
+            restored += entry
+        }
+        return restored
+    }
+
+    /**
+     * Which of the theme files [named] for [entry] is its own: the one, or one of several copies of
+     * it, or, when different themes share the name, the one whose picture [entry] saved, since a
+     * still theme's picture is saved under its digest. Null when that cannot tell them apart.
+     */
+    private fun sourceOf(entry: Saved, named: List<File>): File? {
+        val distinct = named.distinctBy { it.length() }
+        if (distinct.size <= 1) return distinct.firstOrNull()
+        if (!entry.picture.name.startsWith(IMPORTED_PREFIX)) return null
+        val pictureDigest = entry.picture.nameWithoutExtension.removePrefix(IMPORTED_PREFIX)
+        return distinct.firstOrNull { f ->
+            runCatching { withFile(f) { P3tTheme.read(it).picture?.let { p -> p.jpeg ?: p.rgba } }?.let(::digest) == pictureDigest }
+                .getOrDefault(false)
+        }
+    }
+
+    /** The .p3t files in [THEME_FOLDERS] on every storage volume. Blocking. */
+    private fun themeFiles(context: Context): List<File> {
+        val roots = context.getSystemService(android.os.storage.StorageManager::class.java)
+            ?.storageVolumes?.mapNotNull { it.directory }.orEmpty()
+        val found = ArrayList<File>()
+        var seen = 0
+        fun walk(dir: File, depth: Int) {
+            for (f in dir.listFiles() ?: return) {
+                if (++seen > MAX_THEME_SEARCH_ENTRIES) return
+                when {
+                    f.name.startsWith(".") -> {}
+                    f.isDirectory -> if (depth < THEME_SEARCH_DEPTH) walk(f, depth + 1)
+                    f.extension.equals("p3t", ignoreCase = true) -> found += f
+                }
+            }
+        }
+        for (root in roots) for (name in THEME_FOLDERS) walk(File(root, name), 1)
+        return found
+    }
+
+    private fun <T> withFile(file: File, block: (P3tTheme.Bytes) -> T): T =
+        RandomAccessFile(file, "r").use { block(ChannelBytes(it.channel, it.length())) }
 
     /**
      * Unpack a dynamic theme's scene into a new folder (it is tens of MB, too much to hold) and make

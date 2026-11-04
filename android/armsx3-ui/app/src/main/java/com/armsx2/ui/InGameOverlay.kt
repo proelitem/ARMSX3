@@ -89,6 +89,12 @@ object InGameOverlay {
             MainActivityRuntime.eState.value != EmuState.STOPPED
         ) runCatching { ConfigStore.resolveForGame(currentSerial.value) }.getOrNull() else null
         settingsState.value = updated
+        if (previous.shaderChainEnabled != updated.shaderChainEnabled || previous.shaderChainPreset != updated.shaderChainPreset) {
+            android.util.Log.i(
+                "ARMSX3-Shader",
+                "save scope=${settingsScope.value} serial=${currentSerial.value} enabled=${updated.shaderChainEnabled} preset='${updated.shaderChainPreset}'",
+            )
+        }
         // `previous` matters: it's how ConfigStore tells a field the user just changed in
         // Game scope from one they never touched, so setting a per-game value that happens
         // to equal global still pins it instead of vanishing.
@@ -157,6 +163,8 @@ object InGameOverlay {
 
     fun open() {
         if (WindowImpl.overlayVisible.value) return
+        // XMB mode opens on the XMB each time, even after Quick Menu showed this pause menu.
+        com.armsx2.ui.xmb.XmbInGame.classic.value = false
         // getPauseGameSerial() formats as "SLUS-21621 (A422BB13)", but GameInfo.settingsKey — what
         // every other reader and writer keys on — is the BARE serial. Used raw, this stored
         // settings under "SLUS-21621 (A422BB13)" while boot looked up "SLUS-21621", so per-game
@@ -172,7 +180,8 @@ object InGameOverlay {
         frameLimitOn.value = settingsState.value.frameLimitEnable
         hardcoreOn.value = runCatching { NativeApp.isHardcoreMode() }.getOrDefault(false)
         if (MainActivityRuntime.eState.value != EmuState.STOPPED) MainActivityRuntime.pauseForOverlay()
-        com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.MENU_OPEN)
+        // The pause chime is the regular menu's; the XMB comes up quietly, as the console's does.
+        if (!com.armsx2.ui.xmb.XmbMode.active.value) com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.MENU_OPEN)
         WindowImpl.overlayVisible.value = true
     }
 

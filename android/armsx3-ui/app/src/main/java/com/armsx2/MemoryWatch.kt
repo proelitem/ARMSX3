@@ -6,7 +6,7 @@ import android.content.Context
 import android.os.SystemClock
 import android.util.Log
 import com.armsx2.runtime.MainActivityRuntime
-import net.rpcsx.RPCSX
+import com.armsx3.core.ARMSX3
 
 /**
  * System memory, watched for the core.
@@ -56,7 +56,7 @@ object MemoryWatch {
                 val availMb = info.availMem / (1024 * 1024)
                 val totalMb = info.totalMem / (1024 * 1024)
                 val thresholdMb = info.threshold / (1024 * 1024)
-                RPCSX.instance.memoryStatus(availMb, totalMb, thresholdMb, info.lowMemory)
+                ARMSX3.instance.memoryStatus(availMb, totalMb, thresholdMb, info.lowMemory)
                 when {
                     info.lowMemory -> trim(1, "lowMemory")
                     // Inside 1.5x of the threshold the next allocation burst is the kill.
@@ -84,7 +84,7 @@ object MemoryWatch {
         if (level < 1 && now - lastTrimAt < MIN_TRIM_GAP_MS) return
         lastTrimAt = now
         Log.w(TAG, "memory pressure ($reason) -> trim level $level")
-        runCatching { RPCSX.instance.memoryPressure(level) }
+        runCatching { ARMSX3.instance.memoryPressure(level) }
             .onFailure { Log.w(TAG, "memoryPressure unavailable", it) }
     }
 }

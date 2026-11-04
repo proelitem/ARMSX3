@@ -37,6 +37,7 @@ namespace rsx
 			ellipse,
 			box,
 			rounded_box,
+			pie,
 		};
 
 		struct image_info_base
@@ -139,6 +140,7 @@ namespace rsx
 				f32 hy {}; // Half-size in Y
 				f32 br {}; // Border radius
 				f32 bw {}; // Border width
+				f32 ca {}; // Cutoff angle in degrees, clockwise from 12
 
 				color4f border_color;
 
@@ -272,7 +274,7 @@ namespace rsx
 			virtual void set_unicode_text(std::u32string_view text);
 			void set_text(localized_string_id id);
 			void set_text(const localized_string& container);
-			virtual void set_font(const char* font_name, u16 font_size);
+			virtual void set_font(u16 font_size, std::string_view font_name = {});
 			virtual void align_text(text_align align);
 			virtual void set_wrap_text(bool state);
 			virtual font* get_font() const;
@@ -388,6 +390,18 @@ namespace rsx
 			compiled_resource& get_compiled() override;
 		};
 
+		struct pie : public ellipse
+		{
+			using ellipse::ellipse;
+			compiled_resource& get_compiled() override;
+
+			void set_cutoff_angle(f32 degrees);
+			f32 get_cutoff_angle() const { return m_cutoff_angle; }
+
+		protected:
+			f32 m_cutoff_angle = 0.f;
+		};
+
 		struct image_view : public overlay_element
 		{
 		protected:
@@ -467,8 +481,8 @@ namespace rsx
 			graph();
 			void set_pos(s16 _x, s16 _y) override;
 			void set_size(u16 _w, u16 _h) override;
-			void set_title(const char* title);
-			void set_font(const char* font_name, u16 font_size) override;
+			void set_title(std::string&& title);
+			void set_font(u16 font_size, std::string_view font_name = {}) override;
 			void set_font_size(u16 font_size);
 			void set_count(u32 datapoint_count);
 			void set_color(color4f color);

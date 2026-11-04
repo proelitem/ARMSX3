@@ -502,6 +502,11 @@ open class MainActivityRuntime : ComponentActivity() {
         @Volatile private var vmStopInProgress = false
         @Volatile private var vmRestartAfterStop = false
         @Volatile private var vmRunLoopActive = false
+        // A run loop took vmRestartAfterStop and queued start(), which has not begun yet. stop()'s
+        // shutdown task finishes after the run loop on a Restart, finds the flag already taken, and
+        // must not then treat the stop as a return to the library: that cleared currentGame, so the
+        // restarted game booted on global settings, without everything set for it in-game.
+        @Volatile private var vmRestartQueued = false
 
         // Quit-after-the-VM-stops latch — set by the "Close Game & Quit" hotkey, or by
         // a frontend-launched game's Close Game. One-shot: read+cleared by
@@ -690,6 +695,7 @@ open class MainActivityRuntime : ComponentActivity() {
                     return
                 }
                 vmRunLoopActive = true
+                vmRestartQueued = false
             }
 
             invoke {
@@ -834,6 +840,7 @@ open class MainActivityRuntime : ComponentActivity() {
                         vmStopInProgress = false
                         if (vmRestartAfterStop) {
                             vmRestartAfterStop = false
+                            vmRestartQueued = true
                             true
                         } else {
                             false
@@ -955,7 +962,7 @@ open class MainActivityRuntime : ComponentActivity() {
             // Safe unconditionally: adrenotools no-ops on non-Adreno hardware and if /dev/kgsl-3d0
             // cannot be opened. Re-applied on every start so turning it off actually releases the
             // clocks on the next boot rather than persisting until reboot.
-            runCatching { net.rpcsx.RPCSX.instance.setGpuTurbo(resolved.ps3.gpuTurbo) }
+            runCatching { com.armsx3.core.ARMSX3.instance.setGpuTurbo(resolved.ps3.gpuTurbo) }
 
             NativeApp.renderUpscalemultiplier(upscale.value)
             // Pin custom Vulkan driver (if any) BEFORE the renderer write —
@@ -1281,7 +1288,7 @@ open class MainActivityRuntime : ComponentActivity() {
             }
             // Its own staging name: the library scan may be probing at the same time.
             val staged = com.armsx2.DiscIcons.fileFor("__external")
-            val info = org.json.JSONObject(net.rpcsx.RPCSX.instance.probeDiscInfo(target, staged.absolutePath))
+            val info = org.json.JSONObject(com.armsx3.core.ARMSX3.instance.probeDiscInfo(target, staged.absolutePath))
             val id = info.optString("titleId").takeIf { it.isNotBlank() }
             if (id != null && info.optBoolean("icon") && staged.length() > 0L && !com.armsx2.DiscIcons.has(id)) {
                 staged.renameTo(com.armsx2.DiscIcons.fileFor(id))
@@ -1332,6 +1339,7 @@ open class MainActivityRuntime : ComponentActivity() {
                         vmStopInProgress = false
                         if (vmRestartAfterStop) {
                             vmRestartAfterStop = false
+                            vmRestartQueued = true
                             true
                         } else {
                             false
@@ -1463,8 +1471,10 @@ open class MainActivityRuntime : ComponentActivity() {
                 println("@@ANDROID_STOP_JAVA@@ shutdown_return active=${NativeApp.hasActiveVM()} runLoop=$vmRunLoopActive state=${eState.value}")
                 if (!vmRunLoopActive && (eState.value == EmuState.STOPPED || !NativeApp.hasActiveVM())) {
                     eState.value = EmuState.STOPPED
+                    var restartQueued = false
                     val restartNow = synchronized(vmLifecycleLock) {
                         vmStopInProgress = false
+                        restartQueued = vmRestartQueued
                         if (vmRestartAfterStop) {
                             vmRestartAfterStop = false
                             true
@@ -1474,7 +1484,7 @@ open class MainActivityRuntime : ComponentActivity() {
                     }
                     if (restartNow) {
                         start()
-                    } else {
+                    } else if (!restartQueued) {
                         synchronized(vmLifecycleLock) {
                             WindowImpl.toolbarVisible.value = true
                             WindowImpl.showLibrary.value = false
@@ -1677,7 +1687,7 @@ open class MainActivityRuntime : ComponentActivity() {
          *  minute of history; the core reports what it then loaded right after this line. */
         private fun angleEmit(msg: String) {
             android.util.Log.i("ARMSX2", "@@ANGLE@@ $msg")
-            runCatching { net.rpcsx.RPCSX.instance.logAndroid("@@ANGLE@@ $msg") }
+            runCatching { com.armsx3.core.ARMSX3.instance.logAndroid("@@ANGLE@@ $msg") }
         }
 
         /** A state to boot in place of the game at this launch path, once. See [launchGameFromState]. */
@@ -1771,10 +1781,10 @@ open class MainActivityRuntime : ComponentActivity() {
                     if (currentGame.value != null) return
                     // The core keeps the last game's serial and title until the next boot reads
                     // its disc, which happens while it is loading. Past that, they are this game's.
-                    val booted = when (runCatching { net.rpcsx.RPCSX.getState() }.getOrNull()) {
-                        net.rpcsx.EmulatorState.Ready, net.rpcsx.EmulatorState.Starting,
-                        net.rpcsx.EmulatorState.Running, net.rpcsx.EmulatorState.Paused,
-                        net.rpcsx.EmulatorState.Frozen -> true
+                    val booted = when (runCatching { com.armsx3.core.ARMSX3.getState() }.getOrNull()) {
+                        com.armsx3.core.EmulatorState.Ready, com.armsx3.core.EmulatorState.Starting,
+                        com.armsx3.core.EmulatorState.Running, com.armsx3.core.EmulatorState.Paused,
+                        com.armsx3.core.EmulatorState.Frozen -> true
                         else -> false
                     }
                     // "00000000" is the placeholder the core reports before the disc is
@@ -1818,10 +1828,10 @@ open class MainActivityRuntime : ComponentActivity() {
                 var attempts = 0
                 override fun run() {
                     if (vmStopInProgress || eState.value == EmuState.STOPPED) return
-                    val booted = when (runCatching { net.rpcsx.RPCSX.getState() }.getOrNull()) {
-                        net.rpcsx.EmulatorState.Ready, net.rpcsx.EmulatorState.Starting,
-                        net.rpcsx.EmulatorState.Running, net.rpcsx.EmulatorState.Paused,
-                        net.rpcsx.EmulatorState.Frozen -> true
+                    val booted = when (runCatching { com.armsx3.core.ARMSX3.getState() }.getOrNull()) {
+                        com.armsx3.core.EmulatorState.Ready, com.armsx3.core.EmulatorState.Starting,
+                        com.armsx3.core.EmulatorState.Running, com.armsx3.core.EmulatorState.Paused,
+                        com.armsx3.core.EmulatorState.Frozen -> true
                         else -> false
                     }
                     val serial = if (!booted) null else runCatching { NativeApp.getGameSerial() }.getOrNull()
@@ -2264,7 +2274,7 @@ open class MainActivityRuntime : ComponentActivity() {
             // written to Default.yml last run is overwritten with the default and the app's copy
             // is the one that survives. That part was right. What was wrong is where it ran: this
             // used to sit at the top of kickoffEmucoreInit, 125 lines before initializeOnce, and
-            // the JNI bridge resolves every _rpcsx_ entry point from a library that openLibrary
+            // the JNI bridge resolves every _armsx3_ entry point from a library that openLibrary
             // has not dlopen()ed yet. Every wrapper in native-lib.cpp null checks its function
             // pointer and returns quietly, so the call succeeded at doing nothing, with no
             // throw for runCatching to catch and no log line anywhere.
@@ -2603,6 +2613,8 @@ open class MainActivityRuntime : ComponentActivity() {
         com.armsx2.ui.home.LibraryScreensaver.load()
         com.armsx2.ui.theme.LauncherOrientationPreferences.load()
         com.armsx2.ui.theme.LibraryBackgroundColorPreferences.load()
+        // After the colours: XMB mode forces the monthly ones while it is up.
+        com.armsx2.ui.xmb.XmbMode.load()
         com.armsx2.LibraryMusic.load()
         com.armsx2.PauseMusic.load()
         com.armsx2.MenuSfx.load(applicationContext)
@@ -3382,6 +3394,18 @@ open class MainActivityRuntime : ComponentActivity() {
         if (com.armsx2.ui.home.LibraryKeyboard.visible.value) {
             // The phone's volume keys stay the system's, as they are with any modal up.
             if (isVolumeKey(kc)) return false
+            // Typing in XMB mode's field, on the phone's keyboard (after a touch on the field) or a
+            // real one: those keys are the field's. The pad keeps the key grid, and Back still closes.
+            val keyboard = com.armsx2.ui.home.LibraryKeyboard
+            if (keyboard.fieldShown.value && kc != KeyEvent.KEYCODE_BACK &&
+                !event.isFromSource(InputDevice.SOURCE_GAMEPAD) &&
+                !event.isFromSource(InputDevice.SOURCE_JOYSTICK) &&
+                (keyboard.typing.value ||
+                    (event.isPrintingKey && event.device?.keyboardType == InputDevice.KEYBOARD_TYPE_ALPHABETIC))
+            ) {
+                keyboard.typing.value = true
+                return super.dispatchKeyEvent(event)
+            }
             if (event.action == KeyEvent.ACTION_DOWN) {
                 when (kc) {
                     KeyEvent.KEYCODE_DPAD_UP -> com.armsx2.ui.home.LibraryKeyboard.move(0, -1)
@@ -3393,6 +3417,12 @@ open class MainActivityRuntime : ComponentActivity() {
                         if (event.repeatCount == 0) com.armsx2.ui.home.LibraryKeyboard.press()
                     KeyEvent.KEYCODE_BUTTON_X ->
                         if (event.repeatCount == 0) com.armsx2.ui.home.LibraryKeyboard.backspace()
+                    KeyEvent.KEYCODE_BUTTON_Y ->
+                        if (event.repeatCount == 0) com.armsx2.ui.home.LibraryKeyboard.pressKey(com.armsx2.ui.home.LibraryKeyboard.SPACE)
+                    KeyEvent.KEYCODE_BUTTON_START ->
+                        if (event.repeatCount == 0) com.armsx2.ui.home.LibraryKeyboard.pressKey(com.armsx2.ui.home.LibraryKeyboard.DONE)
+                    KeyEvent.KEYCODE_BUTTON_SELECT ->
+                        if (event.repeatCount == 0) com.armsx2.ui.home.LibraryKeyboard.pressKey(com.armsx2.ui.home.LibraryKeyboard.PASTE)
                     KeyEvent.KEYCODE_BUTTON_B, KeyEvent.KEYCODE_BACK ->
                         if (event.repeatCount == 0) com.armsx2.ui.home.LibraryKeyboard.close()
                 }
@@ -3534,7 +3564,7 @@ open class MainActivityRuntime : ComponentActivity() {
                 com.armsx2.ui.home.HomeInputController.active()
             ) {
                 // Square button (or the Menu hotkey) opens settings for the
-                // highlighted cover — the controller equivalent of long-press.
+                // highlighted cover.
                 if (ControllerMappings.hotkeyFor(kc) == ControllerMappings.SysHotkey.MENU ||
                     kc == KeyEvent.KEYCODE_BUTTON_X
                 ) {
@@ -3542,10 +3572,14 @@ open class MainActivityRuntime : ComponentActivity() {
                         com.armsx2.ui.home.HomeInputController.openSelectedSettings()
                     return true
                 }
-                // #267: Y (Triangle) opens the library SEARCH — the requested
-                // single-button access. While the panel is open Y is swallowed
-                // (the panel owns nav; B closes it).
-                if (kc == KeyEvent.KEYCODE_BUTTON_Y) return true
+                // Y (Triangle) opens the highlighted game's long-press menu, the controller
+                // equivalent of long-press. It used to be swallowed here and do nothing: the
+                // library search it once opened (#267) is reached from the Search row instead.
+                if (kc == KeyEvent.KEYCODE_BUTTON_Y) {
+                    if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0)
+                        com.armsx2.ui.home.HomeInputController.openSelectedMenu()
+                    return true
+                }
                 // Shoulder buttons drive the touch-only toolbar toggles so the
                 // whole library is controller-reachable: R1 cycles the view mode
                 // (Grid → List → Shelf — "all 3 modes"), L1 cycles the sort order.
@@ -3663,6 +3697,12 @@ open class MainActivityRuntime : ComponentActivity() {
                 // Triangle: the selected control's second action, where it has one
                 KeyEvent.KEYCODE_BUTTON_Y -> {
                     if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0 && nav.secondary()) return true
+                }
+                // L1, R1 and Square, for an XMB panel with a use for them (the music and video players)
+                KeyEvent.KEYCODE_BUTTON_L1, KeyEvent.KEYCODE_BUTTON_R1, KeyEvent.KEYCODE_BUTTON_X -> {
+                    if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0 &&
+                        com.armsx2.ui.xmb.XmbPanelKeys.press(kc)
+                    ) return true
                 }
             }
         }
@@ -4105,7 +4145,7 @@ open class MainActivityRuntime : ComponentActivity() {
         android.util.Log.i("ARMSX3-Touch", line)
         // And into the emulator's log, which is the file testers send. logcat alone is why
         // this diagnostic has never appeared in a single report about #132.
-        runCatching { net.rpcsx.RPCSX.instance.logAndroid("touch scale: $line") }
+        runCatching { com.armsx3.core.ARMSX3.instance.logAndroid("touch scale: $line") }
     }
 
     /** Un-scaled physical display size in the current rotation. Only a SEED for the touch-space
@@ -4319,6 +4359,13 @@ open class MainActivityRuntime : ComponentActivity() {
         if (com.armsx2.ui.MemoryCardManager.visible.value) {
             handleMemcardControllerMotion(ev)
             return true
+        }
+        // A visualizer that reads the right stick (Valley's presets) gets it as well.
+        com.armsx2.ui.xmb.XmbVisualizerStick.handler?.let { stick ->
+            if (ev.isFromSource(InputDevice.SOURCE_JOYSTICK) || ev.isFromSource(InputDevice.SOURCE_GAMEPAD)) {
+                val (rx, ry) = rightStickAxes(ev.deviceId)
+                stick(ev.getAxisValue(rx), ev.getAxisValue(ry))
+            }
         }
         if (controllerDrivesFrontend() && handleControllerUiMotion(ev)) {
             return true
@@ -4627,6 +4674,8 @@ open class MainActivityRuntime : ComponentActivity() {
             com.armsx2.ui.settings.RpcnAvatarPicker.open.value -> com.armsx2.ui.settings.RpcnAvatarPicker.open.value = false
             nav.drawerOpen.value -> nav.drawerOpen.value = false
             WindowImpl.inGameScreen.value != null -> WindowImpl.dismissInGameScreen()
+            // An app screen open in an XMB panel: B closes the panel, back to the XMB behind it.
+            com.armsx2.ui.xmb.XmbInput.controller?.panel != null -> com.armsx2.ui.xmb.XmbInput.controller?.back()
             WindowImpl.showLibrary.value && !onHome -> nav.back()
             WindowImpl.showLibrary.value -> WindowImpl.showLibrary.value = false
             !onHome -> nav.back()
@@ -5685,8 +5734,11 @@ open class MainActivityRuntime : ComponentActivity() {
         runCatching { NativeApp.dumpPgoProfile() }
         // Library music must not keep playing out of a backgrounded app — it would sound
         // like the emulator ignoring the home button. Paused, not stopped, so returning
-        // to the library picks it back up.
-        com.armsx2.LibraryMusic.pause()
+        // to the library picks it back up, and held paused until onResume: XMB mode's music
+        // hands the track back as it stops, which is exactly when the app is leaving.
+        com.armsx2.LibraryMusic.setForeground(false)
+        // The XMB's boot sound plays its ten seconds out past the animation; leaving fades it.
+        com.armsx2.ui.xmb.XmbBootMusic.skip()
         // Pause-menu track was already paused by setForeground(false) at the top of onPause.
         super.onPause()
     }
@@ -5722,7 +5774,17 @@ open class MainActivityRuntime : ComponentActivity() {
 
                     if (invites != null) {
                         com.armsx2.online.OnlineSession.keepAlive(applicationContext)
-                        com.armsx2.ui.friends.RpcnInviteNotice.update(com.armsx2.ui.settings.parseRpcnInvites(invites))
+                        val parsed = com.armsx2.ui.settings.parseRpcnInvites(invites)
+                        com.armsx2.ui.friends.RpcnInviteNotice.update(parsed)
+                        com.armsx2.ui.xmb.XmbRpcn.invites.value = parsed
+
+                        // A friend request, told in XMB mode as the console tells it (XmbNotices)
+                        if (com.armsx2.ui.xmb.XmbMode.active.value) {
+                            val friends = com.armsx2.ui.settings.parseRpcnFriends(
+                                withContext(Dispatchers.IO) { com.armsx3.Rpcs3Bridge.rpcnGetFriends() },
+                            )
+                            if (friends.signedIn) com.armsx2.ui.friends.RpcnRequestNotice.update(friends.received)
+                        }
                     }
                 } else {
                     com.armsx2.ui.friends.RpcnInviteNotice.reset()
@@ -5751,7 +5813,7 @@ open class MainActivityRuntime : ComponentActivity() {
             wasAsleep = false
             com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.WAKE)
             if (prefs.getBoolean("ui.hotkeyToasts", true))
-                com.armsx2.ui.WelcomeBanner.show(com.armsx2.i18n.I18n.get("app.welcomeBack"))
+                com.armsx2.ui.WelcomeBanner.show(com.armsx2.i18n.I18n.get("app.welcomeBack"), welcome = true)
         }
         // #394 backstop: a controller that slept and woke returns with a NEW deviceId, so drop any
         // pad slot whose device is no longer connected — the re-enumerated pad then re-claims Player 1
@@ -5764,6 +5826,7 @@ open class MainActivityRuntime : ComponentActivity() {
         // full app restart (#398-adjacent report). start() rebuilds a released player — and
         // still just un-pauses a merely-paused one — while its own guards keep it a no-op
         // when the setting is off, a VM is running, or that other app is still playing.
+        com.armsx2.LibraryMusic.setForeground(true)
         com.armsx2.LibraryMusic.start(this)
         // Back in the foreground: clear the background guard first, THEN restart the pause track if a
         // menu is still up. The LaunchedEffect won't do it — the overlay states didn't change while

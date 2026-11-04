@@ -217,7 +217,7 @@ data class Ps3Settings(
     /** SingStar's second singer, the same kind of name; empty for none. */
     val micDevice2: String = "",
     /** Pin Adreno to max clocks: removes DVFS ramp-up stutter in GPU-bound scenes, costs heat
-     *  and battery. Off by default, matching the RPCSX fork this came from. */
+     *  and battery. Off by default, matching the Android fork this came from. */
     val gpuTurbo: Boolean = false,
     /** Stops the core writing any log after startup. A real performance lever on games that
      *  log heavily, but it also destroys the only artifact a bug report can carry, so it is
@@ -888,6 +888,11 @@ data class Settings(
      *  off regardless of the flag, and it's a no-op if this build has no librashader. */
     val shaderChainEnabled: Boolean = false,
     val shaderChainPreset: String = "",
+    /** EmuCore/GS/ShaderChainScale: the share of full size the chain runs at, in percent. The
+     *  game's picture is shrunk by it going in, and the chain's picture is scaled up from it to
+     *  the screen. 67 by default, about 0.44 of the pixels, which is what makes a heavy preset
+     *  playable on a phone GPU. */
+    val shaderChainScale: Int = 67,
     /** Tweaked shader parameters, as `preset path -> (parameter name -> value)`.
      *
      *  Sparse: a parameter the user hasn't touched is simply absent, and the author's own
@@ -1086,11 +1091,11 @@ data class Settings(
      */
     fun applyTo() {
         val batched = emitSink == null && MainActivityRuntime.nativeReady.value
-        if (batched) runCatching { net.rpcsx.RPCSX.instance.settingsBeginBatch() }
+        if (batched) runCatching { com.armsx3.core.ARMSX3.instance.settingsBeginBatch() }
         try {
             applyToInner()
         } finally {
-            if (batched) runCatching { net.rpcsx.RPCSX.instance.settingsEndBatch() }
+            if (batched) runCatching { com.armsx3.core.ARMSX3.instance.settingsEndBatch() }
         }
     }
 
@@ -1470,7 +1475,7 @@ data class Settings(
         //
         // A deliberate change in All Core Settings still wins, because CoreSettingOverrides
         // replays immediately below this.
-        runCatching { net.rpcsx.RPCSX.instance.settingsSet("Video@@Vblank Rate", "60") }
+        runCatching { com.armsx3.core.ARMSX3.instance.settingsSet("Video@@Vblank Rate", "60") }
         // Frame limit is deliberately NOT forced here any more.
         //
         // It used to be written to "60" on every push as a belt-and-braces way to reach a 60Hz cap
@@ -1496,7 +1501,7 @@ data class Settings(
         // Nothing is saturated at that point, so the frame is waiting on a dependency chain
         // rather than on throughput, and sleeping to save a core that nobody wants only adds
         // wake-up latency to the chain that is actually holding the frame.
-        runCatching { net.rpcsx.RPCSX.instance.settingsSet("Core@@SPU GETLLAR Busy Waiting Percentage", "100") }
+        runCatching { com.armsx3.core.ARMSX3.instance.settingsSet("Core@@SPU GETLLAR Busy Waiting Percentage", "100") }
         // Compatible Savestate Mode is no longer forced off here; applyTo writes it from
         // ps3.savestateCompatibleMode above, so the two costs it carries -- SPU performance
         // and a 500MB to 3GB state file -- are the user's to accept rather than a decision
@@ -1737,6 +1742,7 @@ data class Settings(
             fxaa = boolAt("EmuCore/GS/fxaa") ?: this.fxaa,
             shaderChainEnabled = boolAt("EmuCore/GS/ShaderChainEnabled") ?: this.shaderChainEnabled,
             shaderChainPreset = strAt("EmuCore/GS/ShaderChainPreset") ?: this.shaderChainPreset,
+            shaderChainScale = intAt("EmuCore/GS/ShaderChainScale") ?: this.shaderChainScale,
             shaderChainParams = strAt("EmuCore/GS/ShaderChainParams")?.let { raw ->
                 // Hand-editable file, so a malformed blob is a real possibility: keep the
                 // rest of the recovered settings rather than throwing the lot away.
@@ -1955,6 +1961,7 @@ data class Settings(
         put("EmuCore/GS", "CASSharpness", "int", casSharpness.coerceIn(0, 100).toString())
         put("EmuCore/GS", "ShaderChainEnabled", "bool", shaderChainEnabled.toString())
         put("EmuCore/GS", "ShaderChainPreset", "string", shaderChainPreset)
+        put("EmuCore/GS", "ShaderChainScale", "int", shaderChainScale.coerceIn(25, 100).toString())
         // Parameter overrides, as one opaque JSON blob. Nothing in emucore reads this key —
         // there is no GSConfig field behind it, and the live values reach the renderer via
         // the push below, not through here. It is written so the map survives the same
@@ -2446,6 +2453,7 @@ data class Settings(
         put("fxaa", fxaa)
         put("shaderChainEnabled", shaderChainEnabled)
         put("shaderChainPreset", shaderChainPreset)
+        put("shaderChainScale", shaderChainScale)
         put("shaderChainParams", shaderChainParamsToJson(shaderChainParams))
         put("casMode", casMode)
         put("sgsrSharpness", sgsrSharpness)
@@ -2829,6 +2837,7 @@ data class Settings(
                 fxaa = json.optBoolean("fxaa", def.fxaa),
                 shaderChainEnabled = json.optBoolean("shaderChainEnabled", def.shaderChainEnabled),
                 shaderChainPreset = json.optString("shaderChainPreset", def.shaderChainPreset),
+                shaderChainScale = json.optInt("shaderChainScale", def.shaderChainScale),
                 shaderChainParams = json.optJSONObject("shaderChainParams")
                     ?.let { shaderChainParamsFromJson(it) } ?: def.shaderChainParams,
                 casMode = json.optInt("casMode", def.casMode),
@@ -3162,6 +3171,7 @@ data class Settings(
             if (current.fxaa                != base.fxaa)                j.put("fxaa", current.fxaa)
             if (current.shaderChainEnabled  != base.shaderChainEnabled)  j.put("shaderChainEnabled", current.shaderChainEnabled)
             if (current.shaderChainPreset   != base.shaderChainPreset)   j.put("shaderChainPreset", current.shaderChainPreset)
+            if (current.shaderChainScale    != base.shaderChainScale)    j.put("shaderChainScale", current.shaderChainScale)
             if (current.shaderChainParams   != base.shaderChainParams)   j.put("shaderChainParams", shaderChainParamsToJson(current.shaderChainParams))
             if (current.casMode             != base.casMode)             j.put("casMode", current.casMode)
             if (current.sgsrSharpness       != base.sgsrSharpness)       j.put("sgsrSharpness", current.sgsrSharpness)
@@ -3505,6 +3515,7 @@ data class Settings(
             fxaa = if (overrides.has("fxaa")) overrides.getBoolean("fxaa") else base.fxaa,
             shaderChainEnabled = if (overrides.has("shaderChainEnabled")) overrides.getBoolean("shaderChainEnabled") else base.shaderChainEnabled,
             shaderChainPreset = if (overrides.has("shaderChainPreset")) overrides.getString("shaderChainPreset") else base.shaderChainPreset,
+            shaderChainScale = if (overrides.has("shaderChainScale")) overrides.getInt("shaderChainScale") else base.shaderChainScale,
             // Replaces the global map wholesale rather than merging per parameter: a
             // per-game tweak means "this game's chain looks like THIS", and merging would
             // let a later global edit leak into a game the user had already dialled in.

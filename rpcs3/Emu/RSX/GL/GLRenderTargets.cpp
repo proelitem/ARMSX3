@@ -110,6 +110,12 @@ bool GLGSRender::is_framebuffer_bound() const
 
 bool GLGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
 {
+	// Frame dump, every pass: the targets about to be replaced are finished, so save them first
+	if (m_frame_dump.active && m_frame_dump.mode == rsx::frame_dump::dump_mode::every_pass && m_draw_fbo && m_frame_dump.draws) [[unlikely]]
+	{
+		frame_dump_capture("target switch");
+	}
+
 	if (m_draw_fbo && layout.ignore_change)
 	{
 		// Nothing has changed, we're still using the same framebuffer
@@ -118,6 +124,17 @@ bool GLGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
 		set_viewport();
 		return true;
 	}
+
+#ifdef RSX_GLES
+	// Adreno's own GLES driver lost a depth-only pass between two passes on the same colour target: in
+	// South Park: The Stick of Truth the characters and props drawn after it were missing from most
+	// frames, while every frame dump, which read the target back at each switch, came out whole.
+	// Submitting each finished pass at the switch keeps them in order.
+	if (m_draw_fbo && gl::get_driver_caps().vendor_QUALCOMM_GLES)
+	{
+		glFlush();
+	}
+#endif
 
 	gl::command_context cmd{ gl_state };
 	res()->surface_cache.prepare_render_target(cmd,
@@ -296,6 +313,16 @@ bool GLGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
 	{
 		// Tell the GRAPH engine the framebuffer cannot be used
 		return false;
+	}
+
+	if (m_frame_dump.active) [[unlikely]]
+	{
+		const auto& l = m_ctx->fb.layout;
+		m_frame_dump.fb_desc = fmt::format("%ux%u colour format %d at [0x%x 0x%x 0x%x 0x%x] writing [%d%d%d%d], depth format %d at 0x%x",
+			l.width, l.height, static_cast<int>(l.color_format),
+			l.color_addresses[0], l.color_addresses[1], l.color_addresses[2], l.color_addresses[3],
+			+l.color_write_enabled[0], +l.color_write_enabled[1], +l.color_write_enabled[2], +l.color_write_enabled[3],
+			static_cast<int>(l.depth_format), l.zeta_address);
 	}
 
 	set_viewport();

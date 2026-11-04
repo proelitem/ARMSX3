@@ -21,6 +21,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -42,16 +43,25 @@ import com.armsx2.packages.FrontendExport
 import com.armsx2.runtime.MainActivityRuntime
 import com.armsx2.ui.common.ArmsBackdrop
 import com.armsx2.ui.common.FileBrowserDialog
+import com.armsx2.ui.xmb.LocalXmbCollector
+import com.armsx2.ui.xmb.XmbCollected
+import com.armsx2.ui.xmb.XmbCollectedSection
+import com.armsx2.ui.xmb.XmbCollector
+import com.armsx2.ui.xmb.XmbDialogs
+import com.armsx2.ui.xmb.XmbFiles
+import com.armsx2.ui.xmb.XmbIcon
+import com.armsx2.ui.xmb.XmbNode
+import com.armsx2.ui.xmb.XmbOption
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import net.rpcsx.ProgressRepository
-import net.rpcsx.RPCSX
+import com.armsx3.core.ProgressRepository
+import com.armsx3.core.ARMSX3
 
 /**
  * Install a .pkg (game, update or DLC) into the emulator's own storage.
  *
- * The native side already did all of this -- _rpcsx_install dispatches on the file's
- * magic and hands a PKG to installPkg -- but RPCSX.instance.install() had ZERO callers,
+ * The native side already did all of this -- _armsx3_install dispatches on the file's
+ * magic and hands a PKG to installPkg -- but ARMSX3.instance.install() had ZERO callers,
  * so there was no way to reach it from the UI. Reported by two testers as a serious
  * oversight, and it read as a missing feature rather than a missing button.
  *
@@ -90,7 +100,7 @@ internal fun isLicenceName(name: String): Boolean =
  * release big enough to be split is exactly the one that reaches ten parts. Compared as digit
  * strings rather than parsed, so a pathologically long run of digits cannot overflow.
  */
-private val NaturalOrder = Comparator<String> { first, second ->
+internal val NaturalOrder = Comparator<String> { first, second ->
     var i = 0
     var j = 0
     while (i < first.length && j < second.length) {
@@ -189,7 +199,7 @@ private fun installedTitleFor(dir: java.io.File): InstalledTitle {
 }
 
 private fun readInstalled(): List<InstalledTitle> =
-    java.io.File(RPCSX.rootDirectory, "config/dev_hdd0/game")
+    java.io.File(ARMSX3.rootDirectory, "config/dev_hdd0/game")
         .listFiles()
         ?.filter { it.isDirectory && isInstalledContent(it) }
         ?.map { installedTitleFor(it) }
@@ -254,7 +264,7 @@ internal fun isInstalledContent(dir: java.io.File): Boolean {
  * why uninstalling without it leaves the bulk of the disk usage behind.
  */
 private fun cacheDirFor(titleId: String): java.io.File =
-    java.io.File(RPCSX.rootDirectory, "cache/cache/$titleId")
+    java.io.File(ARMSX3.rootDirectory, "cache/cache/$titleId")
 
 private fun dirSize(dir: java.io.File): Long =
     if (!dir.isDirectory) 0L else dir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
@@ -343,8 +353,8 @@ private fun usableSpaceAt(dir: java.io.File): Long {
  */
 private fun stagingDir(context: android.content.Context): java.io.File? {
     val candidates = buildList {
-        if (RPCSX.rootDirectory.isNotBlank()) {
-            add(java.io.File(RPCSX.rootDirectory, "cache/install"))
+        if (ARMSX3.rootDirectory.isNotBlank()) {
+            add(java.io.File(ARMSX3.rootDirectory, "cache/install"))
         }
         add(java.io.File(context.cacheDir, "install"))
     }
@@ -436,8 +446,13 @@ fun PackageInstallerScreen(onBack: () -> Unit) {
     var tab by remember { mutableStateOf(0) }
     var showBrowser by remember { mutableStateOf(false) }
     var progressId by remember { mutableStateOf<Long?>(null) }
-    var installed by remember { mutableStateOf(readInstalled()) }
-    var licences by remember { mutableStateOf(readLicences()) }
+    // Read off the main thread: a stat and a PARAM.SFO per installed title is a stall on opening.
+    var installed by remember { mutableStateOf<List<InstalledTitle>>(emptyList()) }
+    var licences by remember { mutableStateOf<List<java.io.File>>(emptyList()) }
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        installed = withContext(Dispatchers.IO) { readInstalled() }
+        licences = withContext(Dispatchers.IO) { readLicences() }
+    }
     var confirmRemove by remember { mutableStateOf<InstalledTitle?>(null) }
     var confirmRemoveLicence by remember { mutableStateOf<java.io.File?>(null) }
 
@@ -520,9 +535,9 @@ fun PackageInstallerScreen(onBack: () -> Unit) {
                                 id, 0, 0, I18n.get("packages.installingFile").format(label),
                             )
                             result = if (opened.size == 1) {
-                                RPCSX.instance.install(opened[0].descriptor.fd, id)
+                                ARMSX3.instance.install(opened[0].descriptor.fd, id)
                             } else {
-                                RPCSX.instance.installSplitPkg(
+                                ARMSX3.instance.installSplitPkg(
                                     opened.map { it.descriptor.fd }.toIntArray(), id,
                                 )
                             }
@@ -554,7 +569,7 @@ fun PackageInstallerScreen(onBack: () -> Unit) {
                             Licences.installRap(staged)
                         } else {
                             val d = ParcelFileDescriptor.open(staged, ParcelFileDescriptor.MODE_READ_ONLY)
-                            try { RPCSX.instance.installKey(d.fd, id, "") } finally { runCatching { d.close() } }
+                            try { ARMSX3.instance.installKey(d.fd, id, "") } finally { runCatching { d.close() } }
                         }
                         runCatching { staged.delete() }
                     }
@@ -621,9 +636,9 @@ fun PackageInstallerScreen(onBack: () -> Unit) {
                         }
                         try {
                             result = if (descriptors.size == 1) {
-                                RPCSX.instance.install(descriptors[0].fd, id)
+                                ARMSX3.instance.install(descriptors[0].fd, id)
                             } else {
-                                RPCSX.instance.installSplitPkg(
+                                ARMSX3.instance.installSplitPkg(
                                     descriptors.map { it.fd }.toIntArray(), id,
                                 )
                             }
@@ -643,7 +658,7 @@ fun PackageInstallerScreen(onBack: () -> Unit) {
                                 licence, ParcelFileDescriptor.MODE_READ_ONLY,
                             )
                             try {
-                                RPCSX.instance.installKey(descriptor.fd, id, "")
+                                ARMSX3.instance.installKey(descriptor.fd, id, "")
                             } finally {
                                 runCatching { descriptor.close() }
                             }
@@ -685,6 +700,46 @@ fun PackageInstallerScreen(onBack: () -> Unit) {
         }
     }
 
+    fun removeLicence(file: java.io.File) {
+        MainActivityRuntime.invoke {
+            val ok = withContext(Dispatchers.IO) {
+                runCatching { file.delete() }.getOrDefault(false)
+            }
+            licences = readLicences()
+            message = if (ok) I18n.get("packages.licence.removed")
+            else I18n.get("packages.licence.remove.failed")
+        }
+    }
+
+    fun uninstall(target: InstalledTitle, removeCache: Boolean) {
+        val titleId = target.id
+        // Deleting gigabytes from an SD card takes minutes, and the dialog closes at once:
+        // with nothing said until the end, a working uninstall looked like one that did
+        // nothing.
+        message = I18n.get("packages.uninstall.working").format(target.name)
+        MainActivityRuntime.invoke {
+            val ok = withContext(Dispatchers.IO) {
+                runCatching {
+                    ARMSX3.instance.uninstallGame(target.dir.absolutePath)
+                }.getOrDefault(false)
+            }
+            // Only after the game itself is gone: dropping the cache for a title that
+            // is still installed would just cost the user a recompile.
+            if (ok && removeCache) {
+                withContext(Dispatchers.IO) { removeCacheFor(titleId) }
+            }
+            installed = readInstalled()
+            licences = readLicences()
+            if (ok) {
+                GameLibraryRepository(context).invalidateCache()
+                FrontendExport.requestSync(context)
+            }
+            message = I18n.get(
+                if (ok) "packages.uninstall.done" else "packages.uninstall.failed",
+            )
+        }
+    }
+
     // Same treatment as a title: deleting the licence is not undoable, and the content it
     // unlocks stops working without it, so it is confirmed rather than done on tap.
     confirmRemoveLicence?.let { target ->
@@ -694,16 +749,8 @@ fun PackageInstallerScreen(onBack: () -> Unit) {
             text = { Text(I18n.get("packages.licence.remove.body").replace("%s", target.name)) },
             confirmButton = {
                 TextButton(onClick = {
-                    val file = target
                     confirmRemoveLicence = null
-                    MainActivityRuntime.invoke {
-                        val ok = withContext(Dispatchers.IO) {
-                            runCatching { file.delete() }.getOrDefault(false)
-                        }
-                        licences = readLicences()
-                        message = if (ok) I18n.get("packages.licence.removed")
-                        else I18n.get("packages.licence.remove.failed")
-                    }
+                    removeLicence(target)
                 }) { Text(str("action.remove")) }
             },
             dismissButton = {
@@ -762,33 +809,7 @@ fun PackageInstallerScreen(onBack: () -> Unit) {
             confirmButton = {
                 TextButton(onClick = {
                     confirmRemove = null
-                    val removeCache = alsoRemoveCache
-                    val titleId = target.id
-                    // Deleting gigabytes from an SD card takes minutes, and the dialog closes at once:
-                    // with nothing said until the end, a working uninstall looked like one that did
-                    // nothing.
-                    message = I18n.get("packages.uninstall.working").format(target.name)
-                    MainActivityRuntime.invoke {
-                        val ok = withContext(Dispatchers.IO) {
-                            runCatching {
-                                RPCSX.instance.uninstallGame(target.dir.absolutePath)
-                            }.getOrDefault(false)
-                        }
-                        // Only after the game itself is gone: dropping the cache for a title that
-                        // is still installed would just cost the user a recompile.
-                        if (ok && removeCache) {
-                            withContext(Dispatchers.IO) { removeCacheFor(titleId) }
-                        }
-                        installed = readInstalled()
-                        licences = readLicences()
-                        if (ok) {
-                            GameLibraryRepository(context).invalidateCache()
-                            FrontendExport.requestSync(context)
-                        }
-                        message = I18n.get(
-                            if (ok) "packages.uninstall.done" else "packages.uninstall.failed",
-                        )
-                    }
+                    uninstall(target, alsoRemoveCache)
                 }) { Text(str("packages.uninstall")) }
             },
             dismissButton = {
@@ -800,6 +821,26 @@ fun PackageInstallerScreen(onBack: () -> Unit) {
     val safPicker = androidx.activity.compose.rememberLauncherForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.OpenMultipleDocuments(),
     ) { uris -> if (!uris.isNullOrEmpty()) installFromUris(uris) }
+
+    // XMB mode: the manager as XMB lists, composed out of sight (see XmbPackageLists).
+    com.armsx2.ui.xmb.LocalXmbCollector.current?.let { collector ->
+        XmbPackageLists(
+            collector = collector,
+            busy = busy,
+            fraction = fraction,
+            progressText = progress?.message?.value,
+            message = message,
+            installed = installed,
+            licences = licences,
+            onInstall = { files -> install(files) },
+            onInstallUpdate = { files, last, done -> install(files, done, refreshLibrary = last) },
+            onExternal = { safPicker.launch(arrayOf("*/*")) },
+            onUninstall = { target -> uninstall(target, removeCache = true) },
+            onRemoveLicence = { removeLicence(it) },
+            onMessageShown = { message = null },
+        )
+        return
+    }
 
     if (showBrowser) {
         FileBrowserDialog(
@@ -1107,6 +1148,168 @@ fun PackageInstallerScreen(onBack: () -> Unit) {
             }
 
             TextButton(onClick = onBack) { Text(str("action.back")) }
+        }
+    }
+}
+
+/**
+ * The manager in XMB mode, as XMB lists (see XmbCollector). Install Package Files lists each
+ * storage's folders and the packages and licences in them, as the console lists a USB drive's;
+ * then come what is installed, the licences, the title updates and the add-ons. Questions and
+ * results go in the XMB's own dialogs.
+ */
+@Composable
+private fun XmbPackageLists(
+    collector: XmbCollector,
+    busy: Boolean,
+    fraction: Float?,
+    progressText: String?,
+    message: String?,
+    installed: List<InstalledTitle>,
+    licences: List<java.io.File>,
+    onInstall: (List<java.io.File>) -> Unit,
+    onInstallUpdate: (List<java.io.File>, Boolean, (Boolean) -> Unit) -> Unit,
+    onExternal: () -> Unit,
+    onUninstall: (InstalledTitle) -> Unit,
+    onRemoveLicence: (java.io.File) -> Unit,
+    onMessageShown: () -> Unit,
+) {
+    val context = LocalContext.current
+    val ok = str("action.ok")
+    val cancel = str("action.cancel")
+    val installWord = str("packages.updates.install")
+    val installAsk = str("xmb.packages.installAsk")
+    val allHere = str("xmb.packages.installAll")
+    val uninstallWord = str("packages.uninstall")
+    val uninstallBody = str("packages.uninstall.confirmBody")
+    val updatesWarning = str("packages.uninstall.updatesWarning")
+    val updatesWarningNoVersion = str("packages.uninstall.updatesWarningNoVersion")
+    val removeWord = str("action.remove")
+    val licenceBody = str("packages.licence.remove.body")
+    val licenceCount = str("packages.licences.count")
+    val installing = str("packages.installing")
+    val packageIcon = XmbIcon("explore_category_game", "item_tex_disc_install", "\uD83D\uDCE6")
+    val folderIcon = XmbIcon("explore_category_game", "item_tex_plain_folder", "\uD83D\uDCC2")
+    val licenceIcon = XmbIcon("explore_category_game", "tex_lock_icon", "\uD83D\uDD11")
+    val driveIcon = XmbIcon("explore_category_photo", "item_tex_usb_connection", "\uD83D\uDCBE")
+
+    LaunchedEffect(message) {
+        val m = message ?: return@LaunchedEffect
+        XmbDialogs.target()?.tell(m, ok, error = false)
+        onMessageShown()
+    }
+    fun ask(question: String, confirm: String, onYes: () -> Unit) {
+        XmbDialogs.target()?.ask(question, confirm, cancel, focusNo = true, onYes = onYes)
+    }
+    fun fileIcon(f: java.io.File) = if (isLicence(f)) licenceIcon else packageIcon
+
+    Column {
+        // While something goes on: what it is doing, and how far along, as a bar under it.
+        if (busy) {
+            XmbCollected(
+                collector,
+                XmbNode.Action(
+                    "pkg.progress",
+                    progressText?.takeIf { it.isNotBlank() } ?: installing,
+                    packageIcon,
+                    fraction?.let { "${(it * 100).toInt()}%" } ?: installing,
+                    meter = fraction?.let { f -> { f } },
+                ) {},
+            )
+        }
+        XmbCollectedSection(collector, "pkg.install", str("xmb.packages.install"), str("xmb.packages.install.desc")) {
+            val child = LocalXmbCollector.current ?: return@XmbCollectedSection
+            // Storage the app can walk by path. The Play build cannot, and has the system's picker only.
+            if (com.armsx2.BuildConfig.STORAGE_ALL_FILES && com.armsx2.ui.common.canBrowse()) {
+                val roots = remember { XmbFiles.roots(context) }
+                roots.forEach { (label, dir) ->
+                    XmbCollected(
+                        child,
+                        XmbFiles.folder(
+                            key = "pkg.root.${dir.absolutePath}",
+                            title = label,
+                            dir = dir,
+                            icon = driveIcon,
+                            folderIcon = folderIcon,
+                            extensions = setOf("pkg", "rap", "edat"),
+                            fileIcon = ::fileIcon,
+                            together = setOf("pkg"),
+                            allTitle = { n -> allHere.format(n) },
+                            onPickAll = { files -> ask(installAsk.format(allHere.format(files.size)), installWord) { onInstall(files) } },
+                        ) { f -> ask(installAsk.format(f.name), installWord) { onInstall(listOf(f)) } },
+                    )
+                }
+            }
+            // The system's own picker reaches storage that cannot be walked by path: some USB drives and SD cards.
+            XmbCollected(child, XmbNode.Action("pkg.external", str("packages.select.external"), driveIcon) { onExternal() })
+        }
+        XmbCollectedSection(collector, "pkg.installed", str("packages.installed.header")) {
+            val child = LocalXmbCollector.current ?: return@XmbCollectedSection
+            installed.forEach { title ->
+                val askUninstall = {
+                    val name = if (title.name == title.id) title.id else "${title.name} (${title.id})"
+                    val warning = when {
+                        !title.holdsUpdates -> null
+                        title.updateVersion != null -> updatesWarning.format(title.updateVersion)
+                        else -> updatesWarningNoVersion
+                    }
+                    ask(listOfNotNull(uninstallBody.format(name), warning).joinToString("\n"), uninstallWord) { onUninstall(title) }
+                }
+                XmbCollected(
+                    child,
+                    XmbNode.Action(
+                        "pkg.installed.${title.id}",
+                        title.name,
+                        XmbIcon(file = java.io.File(title.dir, "ICON0.PNG"), glyph = "\uD83C\uDFAE"),
+                        listOfNotNull(title.id, title.updateVersion).joinToString("   "),
+                        options = listOf(XmbOption(uninstallWord) { askUninstall() }),
+                    ) { askUninstall() },
+                )
+            }
+        }
+        XmbCollectedSection(collector, "pkg.licences", str("packages.licences.header")) {
+            val child = LocalXmbCollector.current ?: return@XmbCollectedSection
+            licences.groupBy { licenceTitleId(it) }.entries
+                .sortedWith(compareBy({ it.key == null }, { groupLabelFor(it.key, installed) }))
+                .forEach { (titleId, files) ->
+                    XmbCollectedSection(child, "pkg.licences.${titleId ?: "none"}", groupLabelFor(titleId, installed), licenceCount.format(files.size)) {
+                        val group = LocalXmbCollector.current ?: return@XmbCollectedSection
+                        files.forEach { file ->
+                            val askRemove = { ask(licenceBody.replace("%s", file.name), removeWord) { onRemoveLicence(file) } }
+                            XmbCollected(
+                                group,
+                                XmbNode.Action(
+                                    "pkg.licence.${file.name}",
+                                    file.nameWithoutExtension,
+                                    licenceIcon,
+                                    file.extension.uppercase(),
+                                    options = listOf(XmbOption(removeWord) { askRemove() }),
+                                ) { askRemove() },
+                            )
+                        }
+                    }
+                }
+        }
+        // The title updates and add-ons are looked for once their list is opened, not on the way in:
+        // the updates ask Sony's server about every game in the library.
+        val open = com.armsx2.ui.xmb.XmbHomeState.controller.levels.map { it.node.key }
+        XmbCollectedSection(collector, "pkg.updates", str("packages.tab.updates"), str("xmb.packages.updates.desc")) {
+            if ("pkg.updates" in open) {
+                GameUpdatesTab(busy = busy, onInstall = onInstallUpdate)
+            } else {
+                LocalXmbCollector.current?.let { child ->
+                    XmbCollected(child, XmbNode.Action("pkg.updates.wait", str("packages.updates.checking"), packageIcon) {})
+                }
+            }
+        }
+        XmbCollectedSection(collector, "pkg.dlc", str("packages.tab.dlc"), str("xmb.packages.dlc.desc")) {
+            if ("pkg.dlc" in open) {
+                DlcTab()
+            } else {
+                LocalXmbCollector.current?.let { child ->
+                    XmbCollected(child, XmbNode.Action("pkg.dlc.wait", "\u2026", packageIcon) {})
+                }
+            }
         }
     }
 }

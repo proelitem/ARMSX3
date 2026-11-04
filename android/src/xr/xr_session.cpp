@@ -35,11 +35,11 @@
 
 LOG_CHANNEL(xr_log, "XR");
 
-// The virtual pad's door, in rpcsx-android.cpp. Declared rather than included: those exports
+// The virtual pad's door, in armsx3-core.cpp. Declared rather than included: those exports
 // have no header, and this is the same contract the JNI glue uses.
-extern "C" bool _rpcsx_overlayPadData(int port, int digital1, int digital2, int leftStickX, int leftStickY, int rightStickX, int rightStickY);
-extern "C" bool _rpcsx_overlayPadPressure(int port, const int* values, int count);
-extern "C" int _rpcsx_getPadRumble(int port);
+extern "C" bool _armsx3_overlayPadData(int port, int digital1, int digital2, int leftStickX, int leftStickY, int rightStickX, int rightStickY);
+extern "C" bool _armsx3_overlayPadPressure(int port, const int* values, int count);
+extern "C" int _armsx3_getPadRumble(int port);
 
 namespace armsx3::xr
 {
@@ -272,7 +272,7 @@ namespace armsx3::xr
 		// ---- Touch controllers -> PS3 pad ----------------------------------------------------
 		//
 		// The controllers reach the game through the same door as the touch overlay and the
-		// Bluetooth pads: the virtual pad on port 0, fed by _rpcsx_overlayPadData (rpcsx-android.cpp).
+		// Bluetooth pads: the virtual pad on port 0, fed by _armsx3_overlayPadData (armsx3-core.cpp).
 		// Polled once per presented frame from the RSX thread, which is where the session's frame
 		// loop already runs; only a changed state is pushed, so a Bluetooth pad held in the other
 		// hand is not overwritten every frame by an idle Touch controller.
@@ -531,7 +531,7 @@ namespace armsx3::xr
 
 				if (pressure_changed)
 				{
-					if (_rpcsx_overlayPadPressure(0, pressure, 12))
+					if (_armsx3_overlayPadPressure(0, pressure, 12))
 					{
 						std::memcpy(sent_pressure, pressure, sizeof(sent_pressure));
 					}
@@ -544,7 +544,7 @@ namespace armsx3::xr
 					return;
 				}
 
-				if (_rpcsx_overlayPadData(0, digital1, digital2, lx, ly, rx, ry))
+				if (_armsx3_overlayPadData(0, digital1, digital2, lx, ly, rx, ry))
 				{
 					sent_digital1 = digital1;
 					sent_digital2 = digital2;
@@ -557,7 +557,7 @@ namespace armsx3::xr
 
 			void rumble(XrTime period_ns)
 			{
-				const int packed = _rpcsx_getPadRumble(0);
+				const int packed = _armsx3_getPadRumble(0);
 				const int large = (packed >> 8) & 0xff;
 				const int small = packed & 0xff;
 				const float amplitude = static_cast<float>(std::max(large, small)) / 255.f;

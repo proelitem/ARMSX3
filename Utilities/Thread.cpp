@@ -2762,11 +2762,35 @@ bool handle_access_violation(u32 addr, bool is_writing, bool is_exec, ucontext_t
 			// SPUThread: Send sys_spu exception event
 			cpu->state += cpu_flag::dbg_pause;
 
-			if (cpu->check_state() && !hack_alloc())
-			{
-				return false;
+			// Remove flags preventing check_state() from waiting here (access violation cannot be returned without being handled)
+			bs_t<cpu_flag> to_restore_flags = {};
+			constexpr bs_t<cpu_flag> remove_cpu_flags = cpu_flag::stop + cpu_flag::ret;
+
+			while (cpu->check_state())
+			{ 
+				const bool is_emu_stopped = ::is_stopped(cpu->state - cpu_flag::stop);
+
+				if (is_emu_stopped)
+				{	
+					for (u32 try_count = 0; !hack_alloc(); try_count++)
+					{
+						if (try_count == 100)
+						{
+							fmt::throw_exception("Failed to rescue CPU thread from access violation handler.");
+						}
+
+						thread_ctrl::wait_for(10000);
+					}
+
+					break;
+				}
+
+				ensure(cpu->state & cpu_flag::stop);
+				to_restore_flags += cpu->state.fetch_sub(remove_cpu_flags) & remove_cpu_flags;
 			}
 
+			// Restore them
+			cpu->state += to_restore_flags;
 			return true;
 		}
 		else
@@ -2870,9 +2894,14 @@ bool handle_access_violation(u32 addr, bool is_writing, bool is_exec, ucontext_t
 	{
 		// Keep retrying until the page is mapped: the thread must be able to resume so it can observe cpu_flag::exit and terminate cleanly.
 		// Reporting the violation as unhandled here would escalate a guest crash into an unhandled host exception.
-		while (!hack_alloc())
+		for (u32 try_count = 0; !hack_alloc(); try_count++)
 		{
-			thread_ctrl::wait_for(1000);
+			if (try_count == 100)
+			{
+				fmt::throw_exception("Failed to rescue CPU thread from access violation handler.");
+			}
+
+			thread_ctrl::wait_for(10000);
 		}
 	}
 
@@ -3126,6 +3155,18 @@ static struct ::sigaction s_prev_fault_action[NSIG]{};
 // Everything else is somebody else's fault, in both senses.
 static bool is_emulator_fault(void* addr)
 {
+	// None is, until vm's reservations exist. This handler is installed by a static initializer
+	// (s_exception_handler_set below) and vm's bases are set by others, in vm.cpp, in no order the
+	// language promises. In between, g_base_addr and g_exec_addr are still null, so every address
+	// below 8GiB reads as guest memory and address 0 as offset 0 of the exec map, and ART's own
+	// suspend and null checks -- faults at address 0 on whichever managed thread is running -- were
+	// taken for ours and made fatal. Seen at launch on the test emulator: the main thread in
+	// Thread.join under MediaPlayer.prepare, while the core library was still loading.
+	if (!vm::g_base_addr || !vm::g_exec_addr)
+	{
+		return false;
+	}
+
 	const u64 exec64 = (reinterpret_cast<u64>(addr) - reinterpret_cast<u64>(vm::g_exec_addr)) / 2;
 	const u64 seg_off = (reinterpret_cast<u64>(addr) - reinterpret_cast<u64>(vm::g_exec_addr)) - vm::g_exec_addr_seg_offset;
 
@@ -3819,7 +3860,7 @@ const bool s_exception_handler_set = []() -> bool
 #if defined(__APPLE__) || defined(__ANDROID__)
 	// Android too, and not for tidiness: with no handler, SIGBUS takes the default action and
 	// the process dies having written nothing at all -- no line from this handler, no tombstone,
-	// and an RPCSX.log that simply stops mid-sentence. The only record of Borderlands 2 dying
+	// and an ARMSX3.log that simply stops mid-sentence. The only record of Borderlands 2 dying
 	// this way was one Zygote line, "exited due to signal 7 (Bus error)".
 	//
 	// It is a fault class this emulator can genuinely hit. Guest memory is a MAP_SHARED mapping
@@ -3863,7 +3904,7 @@ const bool s_terminate_handler_set = []() -> bool
 		// allocation calls std::terminate again), which recurses forever and buries the real
 		// crash under a stack of aborts. If terminate re-enters, hard-stop without allocating
 		// so there is exactly one clean tombstone.
-		// Ported from ouroboros420/rpcsx (281654906).
+		// Ported from an earlier Android fork (281654906).
 		static atomic_t<int> s_terminating{0};
 
 		if (s_terminating.exchange(1) != 0)
@@ -4486,8 +4527,10 @@ bool thread_base::join(bool dtor) const
 void thread_base::notify()
 {
 	// Set notification
-	m_sync |= 4;
-	m_sync.notify_all();
+	if (~m_sync.fetch_or(4) & 4)
+	{
+		m_sync.notify_all();
+	}
 }
 
 u64 thread_base::get_native_id() const
@@ -5272,7 +5315,7 @@ void thread_ctrl::set_thread_affinity_mask(u64 mask)
 	thread_policy_set(mach_thread, THREAD_AFFINITY_POLICY, reinterpret_cast<thread_policy_t>(&policy), !mask ? 0 : 1);
 // NOTE: Android was excluded here upstream, which made every affinity request a
 // silent no-op -- Thread Scheduler Mode looked settable but did nothing. bionic
-// provides pthread_setaffinity_np, and RPCSX runs this path on Android without
+// provides pthread_setaffinity_np, and other Android ports run this path without
 // the carve-out. Failures are already logged rather than fatal.
 #elif (defined(__linux__) || defined(__DragonFly__) || defined(__FreeBSD__))
 	if (!mask)
@@ -5437,7 +5480,7 @@ usz map_workload(std::string_view thread_name, usz thread_count, usz count, std:
 		{
 			func(i);
 		}
-		return 1;
+		return thread_count;
 	}
 
 	atomic_t<u32> num_threads_succeeded {0}; // Check if any thread didn't finish. For example when hitting an exception.
@@ -5487,7 +5530,7 @@ usz map_workload(std::string_view thread_name, usz thread_count, std::function<v
 	if (thread_count <= 1)
 	{
 		func();
-		return 1;
+		return thread_count;
 	}
 
 	atomic_t<u32> num_threads_succeeded {0}; // Check if any thread didn't finish. For example when hitting an exception.
