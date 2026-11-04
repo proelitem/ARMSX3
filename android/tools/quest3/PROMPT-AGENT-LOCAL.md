@@ -9,7 +9,7 @@ Tu reprends deux dépôts GitHub préparés par un agent distant qui n'a pas pu 
 ## Dépôts
 
 - **ARMSX3** (émulateur PS3, fork de ARMSX2/ARMSX3) : `https://github.com/proelitem/armsx3`, branche `master`, commit `fc79582` ou plus récent. Dépôt amont `https://github.com/ARMSX2/ARMSX3` en remote `upstream`.
-- **Tremu** (lanceur VR, ex-WFGEmu) : `https://github.com/proelitem/tremu`, branche `main`, commit `79b0b77`. Mon clone local est dans `G:\Projets\WFVR\wgemu` avec du travail non commité (tuile PS3) : fais un `git pull` dessus, pas de clone neuf.
+- **Tremu** (lanceur VR, ex-WFGEmu) : `https://github.com/proelitem/tremu`, branche `main`, commit `e96d724`. Mon clone local est dans `G:\Projets\WFVR\wgemu` avec du travail non commité (tuile PS3) : fais un `git pull` dessus, pas de clone neuf.
 
 ## Lis d'abord, dans cet ordre
 
@@ -33,6 +33,7 @@ Tu reprends deux dépôts GitHub préparés par un agent distant qui n'a pas pu 
 ## Ce qui a été fait côté Tremu
 
 - Netplay protocole 4 : état de partie compressé (zlib, morceaux de 1400 octets), CRC de RAM par table et échantillonné. Les deux casques doivent avoir le nouvel APK.
+- Manettes USB/Bluetooth comme RetroPad, jusqu'à quatre joueurs (`src/gamepad.c`) : disposition standard Android, la première manette rejoint le joueur 1, les suivantes sont les joueurs 2 à 4 ; menu par Select + Start ou bouton guide. Limites de plate-forme dans le README (Wiimote, DualShock 3 Bluetooth, GunCon).
 - Entrée : la confirmation (splash, carrousel, menu) fait un front par source (A droit, gâchette droite, tir WonderFitter, gâchette d'un pistolet Bluetooth) au lieu d'un front sur leur OU : une source bloquée ne masque plus les autres. Un axe de manette externe ne compte comme pressé qu'après avoir été vu au repos ; tout est relâché au retour au premier plan. Le Java journalise le premier tir puis un sur cinquante, et avertit si `nativeShot` ne résout pas.
 
 ## Ordre de vérification sur le matériel
@@ -50,7 +51,8 @@ Pour chaque point : résultat, extrait de logcat pertinent, correction faite s'i
 9. **Remote play joueur 2** : second casque en viewer, visée envoyée (paquets AIM), survol reçu par le viewer, tir du joueur 2 dans Time Crisis 4 à deux GunCon 3.
 10. **Mémoire** : lancer memprobe, consigner les seuils ; vérifier que `MemoryWatch` déclenche la pression avant le kill.
 11. **Tremu, pistolet dans le carrousel** : WonderFitter connecté, le tir et le bouton A lancent un jeu depuis le carrousel et valident dans le menu ; en jeu, pas de tir continu. Dans le logcat (`Tremu-gun`) : `Gun ready`, puis `shot 1` au premier tir ; si un avertissement `shots do not reach the native side` apparaît, les noms JNI ne correspondent plus à la classe Java. La ligne « dernier signal » du menu dit quel contrôle externe arrive (un axe ou une touche bloqués y seraient visibles).
-12. **Tremu netplay** : d'abord Terminator 2 (régression), puis un jeu PS2 et un Dreamcast à deux casques : temps d'arrivée de l'invité (`state ... packed to ... in ... ms`), absence de saccade à la seconde, nombre de désynchronisations sur dix minutes.
+12. **Tremu, manettes USB/Bluetooth** (`src/gamepad.c`, nouveau) : brancher une manette Xbox ou DualShock 4, puis une deuxième. Logcat `Tremu-pad` : `device N is pad 1 (player 1)`. Carrousel : stick ou croix naviguent, bouton du bas valide, Select + Start ouvre le menu. Jeu à pad (Mega Drive, PS1...) : la première manette joue avec les Touch, la deuxième est le joueur 2. Vérifier qu'un axe gâchette au repos ne tire pas, et que les Touch ne sont pas eux-mêmes vus comme une manette (si une ligne `device ... is pad` apparaît sans manette branchée, exclure ce périphérique par son nom via JNI `InputDevice.getName`).
+13. **Tremu netplay** : d'abord Terminator 2 (régression), puis un jeu PS2 et un Dreamcast à deux casques : temps d'arrivée de l'invité (`state ... packed to ... in ... ms`), absence de saccade à la seconde, nombre de désynchronisations sur dix minutes.
 
 ## À la fin
 
