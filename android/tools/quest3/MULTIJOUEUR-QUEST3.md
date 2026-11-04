@@ -36,6 +36,24 @@ Dans Time Crisis 4, le pédalier de couverture est sur les boutons A/B du GunCon
 L1/R1 du pad : les grips des manettes Touch chez l'hôte, et les boutons du pad virtuel chez
 l'invité.
 
+## 2 bis. Quelle manette est le pistolet, et les accessoires
+
+- **Main** : le pistolet est la manette Touch dont la gâchette a été pressée en dernier,
+  la droite au départ. Un gaucher ou un stock qui tient la manette gauche n'ont rien à régler.
+- **Calibration** : bouton menu maintenu + gâchette en visant le centre de l'écran. La
+  correction est gardée par main et enregistrée dans `xr_lightgun_offsets.txt` à côté de la
+  configuration. Nécessaire pour un stock dont le canon n'est pas l'axe de visée de la
+  manette, utile pour quiconque tient l'arme de travers. Refaire la calibration remplace
+  l'ancienne.
+- **Pistolet physique (WonderFitter en mode VR, ou tout pistolet HID)** : s'il se présente
+  au casque comme un périphérique de pointage (souris, écran tactile ou stylet absolu),
+  l'activité immersive prend sa position sur sa fenêtre comme visée et son bouton principal
+  comme gâchette, quand le mode pistolet est actif. Chaque périphérique inconnu est décrit
+  une fois dans le journal (nom, sources, identifiants) : la première session avec le
+  pistolet dit comment il apparaît, et s'il faut un mappage particulier. Le WonderFitter est
+  un système autonome à caméra dont le mode VR n'est pas documenté publiquement ; cette prise
+  en charge est générique et à confirmer sur l'appareil.
+
 ## 3. Ce que la latence impose
 
 Le joueur 2 vise sur une image qui a traversé l'encodeur, le Wi-Fi et le décodeur : comptez

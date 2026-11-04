@@ -6,6 +6,7 @@
 #include "Emu/RSX/VK/VKHelpers.h"
 #include "Emu/system_config.h"
 #include "Emu/Io/pad_types.h"
+#include "Utilities/File.h"
 #include "Emu/RSX/VK/vkutils/device.h"
 #include "Emu/RSX/VK/vkutils/swapchain.h"
 #include "Emu/RSX/VK/vkutils/xr_hooks.h"
@@ -293,6 +294,53 @@ namespace armsx3::xr
 		//   menu held + B          PS (the core's home menu)
 		//   rumble                 both controllers, large motor amplitude
 
+		// Small quaternion kit for the lightgun ray: OpenXR gives poses as (x, y, z, w).
+		namespace quat
+		{
+			inline XrQuaternionf mul(const XrQuaternionf& a, const XrQuaternionf& b)
+			{
+				return {
+					a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+					a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+					a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+					a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z };
+			}
+
+			inline XrQuaternionf conj(const XrQuaternionf& q) { return { -q.x, -q.y, -q.z, q.w }; }
+
+			inline XrVector3f rotate(const XrQuaternionf& q, const XrVector3f& v)
+			{
+				// v' = q v q*, expanded.
+				const float tx = 2.f * (q.y * v.z - q.z * v.y);
+				const float ty = 2.f * (q.z * v.x - q.x * v.z);
+				const float tz = 2.f * (q.x * v.y - q.y * v.x);
+				return {
+					v.x + q.w * tx + (q.y * tz - q.z * ty),
+					v.y + q.w * ty + (q.z * tx - q.x * tz),
+					v.z + q.w * tz + (q.x * ty - q.y * tx) };
+			}
+
+			inline XrQuaternionf normalize(XrQuaternionf q)
+			{
+				const float n = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+				if (n <= 1e-6f) return { 0.f, 0.f, 0.f, 1.f };
+				return { q.x / n, q.y / n, q.z / n, q.w / n };
+			}
+
+			// The rotation that takes unit vector a onto unit vector b.
+			inline XrQuaternionf between(const XrVector3f& a, const XrVector3f& b)
+			{
+				const float d = a.x * b.x + a.y * b.y + a.z * b.z;
+				if (d < -0.9999f)
+				{
+					// Opposite: any axis perpendicular to a, half a turn.
+					return { 0.f, 1.f, 0.f, 0.f };
+				}
+				const XrVector3f c = { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x };
+				return normalize({ c.x, c.y, c.z, 1.f + d });
+			}
+		}
+
 		struct touch_input
 		{
 			enum hand : u32 { left = 0, right = 1 };
@@ -311,6 +359,50 @@ namespace armsx3::xr
 			XrSpace aim_space[2]{ XR_NULL_HANDLE, XR_NULL_HANDLE };
 			float last_aim_u = -1.f;
 			float last_aim_v = -1.f;
+
+			// Which controller is the gun: the one whose trigger was pulled last, right to begin
+			// with. A gun stock or a left-handed player need nothing set.
+			u32 aim_hand = right;
+			bool trigger_was_down[2]{ false, false };
+
+			// Per-hand aim correction, for a stock that holds the controller at an angle to the
+			// barrel: a rotation applied in the controller's own frame. Identity until calibrated
+			// (hold the menu button and pull the trigger while pointing at the centre of the
+			// screen), then saved beside the configuration and loaded with the session.
+			XrQuaternionf aim_offset[2]{ { 0.f, 0.f, 0.f, 1.f }, { 0.f, 0.f, 0.f, 1.f } };
+			bool calibrate_armed = false;
+			bool offsets_loaded = false;
+
+			static std::string offsets_path()
+			{
+				return fs::get_config_dir() + "xr_lightgun_offsets.txt";
+			}
+
+			void load_offsets()
+			{
+				if (offsets_loaded) return;
+				offsets_loaded = true;
+
+				fs::file f(offsets_path(), fs::read);
+				if (!f) return;
+				const std::string text = f.to_string();
+				float v[8]{};
+				if (std::sscanf(text.c_str(), "%f %f %f %f %f %f %f %f", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]) == 8)
+				{
+					aim_offset[left] = quat::normalize({ v[0], v[1], v[2], v[3] });
+					aim_offset[right] = quat::normalize({ v[4], v[5], v[6], v[7] });
+					xr_log.notice("Lightgun aim offsets loaded from %s", offsets_path());
+				}
+			}
+
+			void save_offsets() const
+			{
+				fs::file f(offsets_path(), fs::rewrite);
+				if (!f) return;
+				f.write(fmt::format("%f %f %f %f %f %f %f %f\n",
+					aim_offset[left].x, aim_offset[left].y, aim_offset[left].z, aim_offset[left].w,
+					aim_offset[right].x, aim_offset[right].y, aim_offset[right].z, aim_offset[right].w));
+			}
 
 			// One controller each.
 			XrAction button_a = XR_NULL_HANDLE;
@@ -643,17 +735,16 @@ namespace armsx3::xr
 				float height_m = 0.f;
 			};
 
-			// Where the right controller's aim ray meets the screen, as 0..1 from the top-left,
-			// or false when it does not (no tracking, pointing away, or past a generous margin).
-			bool aim_on_screen(XrTime now, const screen_geometry& screen, float& u, float& v) const
+			// The hand's aim pose in the screen's space, or false when it is not tracked.
+			bool locate_aim(u32 h, XrTime now, const screen_geometry& screen, XrPosef& pose) const
 			{
-				if (aim_space[right] == XR_NULL_HANDLE || screen.base_space == XR_NULL_HANDLE || screen.width_m <= 0.f || screen.height_m <= 0.f)
+				if (aim_space[h] == XR_NULL_HANDLE || screen.base_space == XR_NULL_HANDLE)
 				{
 					return false;
 				}
 
 				XrSpaceLocation location{ XR_TYPE_SPACE_LOCATION };
-				if (g_state.fn.xrLocateSpace(aim_space[right], screen.base_space, now, &location) != XR_SUCCESS)
+				if (g_state.fn.xrLocateSpace(aim_space[h], screen.base_space, now, &location) != XR_SUCCESS)
 				{
 					return false;
 				}
@@ -664,17 +755,61 @@ namespace armsx3::xr
 					return false;
 				}
 
-				// The aim pose's forward is -Z. Rotate (0, 0, -1) by the orientation quaternion.
-				const XrQuaternionf& q = location.pose.orientation;
-				const float dx = -(2.f * (q.x * q.z + q.w * q.y));
-				const float dy = -(2.f * (q.y * q.z - q.w * q.x));
-				const float dz = -(1.f - 2.f * (q.x * q.x + q.y * q.y));
+				pose = location.pose;
+				return true;
+			}
+
+			// Hold the menu button and pull the trigger while the gun points at the centre of the
+			// screen: the correction that puts the ray there is kept for that hand. For a stock
+			// whose barrel is not the controller's aim axis, and for anyone who holds the thing
+			// at an angle. Done once; saved.
+			void calibrate(u32 h, XrTime now, const screen_geometry& screen)
+			{
+				XrPosef pose{};
+				if (!locate_aim(h, now, screen, pose) || screen.distance_m <= 0.f)
+				{
+					xr_log.warning("Lightgun calibration: the %s controller is not tracked right now", h == left ? "left" : "right");
+					return;
+				}
+
+				// Direction from the controller to the screen's centre, in the controller's frame.
+				const XrVector3f to_centre = { -pose.position.x, -pose.position.y, -screen.distance_m - pose.position.z };
+				const float n = std::sqrt(to_centre.x * to_centre.x + to_centre.y * to_centre.y + to_centre.z * to_centre.z);
+				if (n <= 1e-4f) return;
+				const XrVector3f d_world = { to_centre.x / n, to_centre.y / n, to_centre.z / n };
+				const XrVector3f d_local = quat::rotate(quat::conj(pose.orientation), d_world);
+
+				aim_offset[h] = quat::between({ 0.f, 0.f, -1.f }, d_local);
+				save_offsets();
+				xr_log.success("Lightgun calibrated for the %s controller (offset %.3f %.3f %.3f %.3f)",
+					h == left ? "left" : "right", aim_offset[h].x, aim_offset[h].y, aim_offset[h].z, aim_offset[h].w);
+			}
+
+			// Where the gun hand's aim ray meets the screen, as 0..1 from the top-left, or false
+			// when it does not (no tracking, pointing away, or past a generous margin).
+			bool aim_on_screen(XrTime now, const screen_geometry& screen, float& u, float& v) const
+			{
+				if (screen.width_m <= 0.f || screen.height_m <= 0.f)
+				{
+					return false;
+				}
+
+				XrPosef pose{};
+				if (!locate_aim(aim_hand, now, screen, pose))
+				{
+					return false;
+				}
+
+				// The aim pose's forward is -Z, after the hand's calibration offset.
+				const XrQuaternionf q = quat::mul(pose.orientation, aim_offset[aim_hand]);
+				const XrVector3f dir = quat::rotate(q, { 0.f, 0.f, -1.f });
+				const float dx = dir.x, dy = dir.y, dz = dir.z;
 				if (dz >= -1e-4f)
 				{
 					return false; // pointing away from the screen plane
 				}
 
-				const XrVector3f& p = location.pose.position;
+				const XrVector3f& p = pose.position;
 				const float t = (-screen.distance_m - p.z) / dz;
 				if (t <= 0.f)
 				{
@@ -783,15 +918,50 @@ namespace armsx3::xr
 				}
 
 				const bool lightgun = g_state.lightgun.load(std::memory_order_relaxed);
+				if (lightgun) load_offsets();
+
+				const bool trigger_down[2] = { trigger_l > k_trigger_threshold, trigger_r > k_trigger_threshold };
 
 				if (x) digital2 |= CELL_PAD_CTRL_SQUARE;
 				if (y) digital2 |= CELL_PAD_CTRL_TRIANGLE;
 				if (grip_l > k_grip_threshold) digital2 |= CELL_PAD_CTRL_L1;
 				if (grip_r > k_grip_threshold) digital2 |= CELL_PAD_CTRL_R1;
-				if (trigger_l > k_trigger_threshold) digital2 |= CELL_PAD_CTRL_L2;
-				// Lightgun: the right trigger is the gun's trigger, which the GunCon 3 reads as
-				// Cross. Otherwise it is R2 as on a pad.
-				if (trigger_r > k_trigger_threshold) digital2 |= lightgun ? CELL_PAD_CTRL_CROSS : CELL_PAD_CTRL_R2;
+
+				if (!lightgun)
+				{
+					if (trigger_down[left]) digital2 |= CELL_PAD_CTRL_L2;
+					if (trigger_down[right]) digital2 |= CELL_PAD_CTRL_R2;
+				}
+				else
+				{
+					// The gun is whichever controller pulled its trigger last (a stock holds one of
+					// them; a left-handed player holds the other). Its trigger is Cross, the
+					// GunCon 3's trigger; the other hand's trigger keeps its pad meaning.
+					for (u32 h = 0; h < 2; ++h)
+					{
+						if (trigger_down[h] && !trigger_was_down[h])
+						{
+							if (shift)
+							{
+								// Menu held + trigger: calibrate this hand on the screen's centre
+								// instead of shooting.
+								menu_used_as_shift = true;
+								calibrate(h, now, screen);
+								calibrate_armed = true;
+							}
+							else if (aim_hand != h)
+							{
+								aim_hand = h;
+								xr_log.notice("Lightgun: the %s controller is the gun now", h == left ? "left" : "right");
+							}
+						}
+						trigger_was_down[h] = trigger_down[h];
+					}
+
+					if (!trigger_down[aim_hand]) calibrate_armed = false;
+					if (trigger_down[aim_hand] && !calibrate_armed) digital2 |= CELL_PAD_CTRL_CROSS;
+					if (trigger_down[aim_hand ^ 1u]) digital2 |= aim_hand == right ? CELL_PAD_CTRL_L2 : CELL_PAD_CTRL_R2;
+				}
 				if (now < start_pulse_until) digital1 |= CELL_PAD_CTRL_START;
 
 				if (lightgun)

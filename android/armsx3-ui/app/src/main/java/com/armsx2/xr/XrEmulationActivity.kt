@@ -126,9 +126,61 @@ class XrEmulationActivity : ComponentActivity() {
     }
 
     override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {
+        if (externalGun(ev)) return true
         val host = MainActivityRuntime.instance
         if (host != null && host !== (this as Any) && host.dispatchGenericMotionEvent(ev)) return true
         return super.dispatchGenericMotionEvent(ev)
+    }
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (externalGun(ev)) return true
+        return super.dispatchTouchEvent(ev)
+    }
+
+    // A physical lightgun paired to the headset (a Bluetooth/USB HID gun such as a WonderFitter
+    // in its VR mode) shows up as a pointer device: an absolute pointer (touchscreen/stylus
+    // source) or a mouse. Its position over this activity's window is the aim, its primary
+    // button the trigger. Only with the lightgun mode on, and never for the Touch controllers,
+    // which drive the gun inside the core. Every new device is described in the log once, so
+    // the first session with a real gun tells how it enumerates.
+    private val seenInputDevices = HashSet<Int>()
+    private var externalGunTrigger = false
+
+    private fun externalGun(ev: MotionEvent): Boolean {
+        if (!XrPresentation.lightgun(this)) return false
+        val device = ev.device ?: return false
+        if (device.isVirtual) return false
+        if (seenInputDevices.add(device.id)) {
+            Log.i(TAG, "input device ${device.id}: '${device.name}' sources=0x${Integer.toHexString(device.sources)} " +
+                "vendor=0x${Integer.toHexString(device.vendorId)} product=0x${Integer.toHexString(device.productId)} " +
+                "external=${device.isExternal}")
+        }
+        val pointer = ev.isFromSource(android.view.InputDevice.SOURCE_TOUCHSCREEN) ||
+            ev.isFromSource(android.view.InputDevice.SOURCE_STYLUS) ||
+            ev.isFromSource(android.view.InputDevice.SOURCE_MOUSE)
+        if (!pointer || !device.isExternal) return false
+
+        val w = window.decorView.width.toFloat()
+        val h = window.decorView.height.toFloat()
+        if (w <= 0f || h <= 0f) return false
+        val x = (ev.x / w).coerceIn(0f, 1f)
+        val y = (ev.y / h).coerceIn(0f, 1f)
+        runCatching { com.armsx3.core.ARMSX3.instance.mouseAim(0, x, y) }
+
+        val pressed = when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_BUTTON_PRESS -> true
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_BUTTON_RELEASE -> false
+            // A touch-type pointer only reports MOVE while it is down; a mouse reports it while
+            // any button is held, so there the primary button decides.
+            MotionEvent.ACTION_MOVE -> !ev.isFromSource(android.view.InputDevice.SOURCE_MOUSE) ||
+                (ev.buttonState and MotionEvent.BUTTON_PRIMARY) != 0
+            else -> (ev.buttonState and MotionEvent.BUTTON_PRIMARY) != 0
+        }
+        if (pressed != externalGunTrigger) {
+            externalGunTrigger = pressed
+            runCatching { com.armsx3.Rpcs3Bridge.setPadButton(0, KeyEvent.KEYCODE_BUTTON_A, 0, pressed) }
+        }
+        return true
     }
 
     companion object {
