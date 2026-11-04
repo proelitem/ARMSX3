@@ -40,6 +40,7 @@ LOG_CHANNEL(xr_log, "XR");
 extern "C" bool _armsx3_overlayPadData(int port, int digital1, int digital2, int leftStickX, int leftStickY, int rightStickX, int rightStickY);
 extern "C" bool _armsx3_overlayPadPressure(int port, const int* values, int count);
 extern "C" int _armsx3_getPadRumble(int port);
+extern "C" void _armsx3_mouseAim(int index, float x, float y);
 
 namespace armsx3::xr
 {
@@ -62,6 +63,8 @@ namespace armsx3::xr
 	X(xrEndSession) \
 	X(xrRequestExitSession) \
 	X(xrCreateReferenceSpace) \
+	X(xrCreateActionSpace) \
+	X(xrLocateSpace) \
 	X(xrDestroySpace) \
 	X(xrEnumerateSwapchainFormats) \
 	X(xrCreateSwapchain) \
@@ -160,6 +163,7 @@ namespace armsx3::xr
 			// it is recorded here so stop() can tell whether the renderer has let go.
 			std::atomic<bool> swapchain_alive{ false };
 			std::atomic<bool> active{ false };
+			std::atomic<bool> lightgun{ false };
 
 			vk::xr::hooks hooks{};
 		};
@@ -302,6 +306,12 @@ namespace armsx3::xr
 			XrAction trigger = XR_NULL_HANDLE;
 			XrAction squeeze = XR_NULL_HANDLE;
 			XrAction haptic = XR_NULL_HANDLE;
+			// Where the controller points (aim pose), one space per hand, for the lightgun.
+			XrAction aim_pose = XR_NULL_HANDLE;
+			XrSpace aim_space[2]{ XR_NULL_HANDLE, XR_NULL_HANDLE };
+			float last_aim_u = -1.f;
+			float last_aim_v = -1.f;
+
 			// One controller each.
 			XrAction button_a = XR_NULL_HANDLE;
 			XrAction button_b = XR_NULL_HANDLE;
@@ -385,6 +395,7 @@ namespace armsx3::xr
 				ok &= make_action(trigger, "trigger", "Trigger", XR_ACTION_TYPE_FLOAT_INPUT, true);
 				ok &= make_action(squeeze, "squeeze", "Grip", XR_ACTION_TYPE_FLOAT_INPUT, true);
 				ok &= make_action(haptic, "haptic", "Rumble", XR_ACTION_TYPE_VIBRATION_OUTPUT, true);
+				ok &= make_action(aim_pose, "aim_pose", "Aim", XR_ACTION_TYPE_POSE_INPUT, true);
 				ok &= make_action(button_a, "button_a", "A", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
 				ok &= make_action(button_b, "button_b", "B", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
 				ok &= make_action(button_x, "button_x", "X", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
@@ -409,6 +420,8 @@ namespace armsx3::xr
 					{ squeeze,          path("/user/hand/right/input/squeeze/value") },
 					{ haptic,           path("/user/hand/left/output/haptic") },
 					{ haptic,           path("/user/hand/right/output/haptic") },
+					{ aim_pose,         path("/user/hand/left/input/aim/pose") },
+					{ aim_pose,         path("/user/hand/right/input/aim/pose") },
 					{ button_x,         path("/user/hand/left/input/x/click") },
 					{ button_y,         path("/user/hand/left/input/y/click") },
 					{ button_menu,      path("/user/hand/left/input/menu/click") },
@@ -423,6 +436,21 @@ namespace armsx3::xr
 				if (!check(g_state.fn.xrSuggestInteractionProfileBindings(g_state.instance, &suggested), "xrSuggestInteractionProfileBindings"))
 				{
 					return false;
+				}
+
+				// Action spaces before the attach, as hello_xr does: a pose action is read through
+				// its space, located against the LOCAL space the screen hangs in.
+				for (u32 h = 0; h < 2; ++h)
+				{
+					XrActionSpaceCreateInfo space_info{ XR_TYPE_ACTION_SPACE_CREATE_INFO };
+					space_info.action = aim_pose;
+					space_info.subactionPath = hand_path[h];
+					space_info.poseInActionSpace.orientation = { 0.f, 0.f, 0.f, 1.f };
+					space_info.poseInActionSpace.position = { 0.f, 0.f, 0.f };
+					if (!check(g_state.fn.xrCreateActionSpace(session, &space_info, &aim_space[h]), "xrCreateActionSpace"))
+					{
+						aim_space[h] = XR_NULL_HANDLE;
+					}
 				}
 
 				XrSessionActionSetsAttachInfo attach_info{ XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO };
@@ -440,6 +468,15 @@ namespace armsx3::xr
 
 			void destroy()
 			{
+				for (XrSpace& space : aim_space)
+				{
+					if (space != XR_NULL_HANDLE)
+					{
+						g_state.fn.xrDestroySpace(space);
+						space = XR_NULL_HANDLE;
+					}
+				}
+
 				// Actions go with their set.
 				if (action_set != XR_NULL_HANDLE)
 				{
@@ -596,8 +633,73 @@ namespace armsx3::xr
 				haptic_active = true;
 			}
 
+			// The virtual screen as the pump places it: a quad centred on the LOCAL space's origin
+			// line, facing +Z, at z = -distance. Passed in because the swapchain owns the layout.
+			struct screen_geometry
+			{
+				XrSpace base_space = XR_NULL_HANDLE;
+				float distance_m = 0.f;
+				float width_m = 0.f;
+				float height_m = 0.f;
+			};
+
+			// Where the right controller's aim ray meets the screen, as 0..1 from the top-left,
+			// or false when it does not (no tracking, pointing away, or past a generous margin).
+			bool aim_on_screen(XrTime now, const screen_geometry& screen, float& u, float& v) const
+			{
+				if (aim_space[right] == XR_NULL_HANDLE || screen.base_space == XR_NULL_HANDLE || screen.width_m <= 0.f || screen.height_m <= 0.f)
+				{
+					return false;
+				}
+
+				XrSpaceLocation location{ XR_TYPE_SPACE_LOCATION };
+				if (g_state.fn.xrLocateSpace(aim_space[right], screen.base_space, now, &location) != XR_SUCCESS)
+				{
+					return false;
+				}
+
+				constexpr XrSpaceLocationFlags needed = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+				if ((location.locationFlags & needed) != needed)
+				{
+					return false;
+				}
+
+				// The aim pose's forward is -Z. Rotate (0, 0, -1) by the orientation quaternion.
+				const XrQuaternionf& q = location.pose.orientation;
+				const float dx = -(2.f * (q.x * q.z + q.w * q.y));
+				const float dy = -(2.f * (q.y * q.z - q.w * q.x));
+				const float dz = -(1.f - 2.f * (q.x * q.x + q.y * q.y));
+				if (dz >= -1e-4f)
+				{
+					return false; // pointing away from the screen plane
+				}
+
+				const XrVector3f& p = location.pose.position;
+				const float t = (-screen.distance_m - p.z) / dz;
+				if (t <= 0.f)
+				{
+					return false;
+				}
+
+				const float hit_x = p.x + dx * t;
+				const float hit_y = p.y + dy * t;
+				u = hit_x / screen.width_m + 0.5f;
+				v = 0.5f - hit_y / screen.height_m;
+
+				// A little past the edge still counts, clamped: a gun held at the frame should
+				// read as the frame, not jump back to where it last was.
+				constexpr float margin = 0.08f;
+				if (u < -margin || u > 1.f + margin || v < -margin || v > 1.f + margin)
+				{
+					return false;
+				}
+				u = std::clamp(u, 0.f, 1.f);
+				v = std::clamp(v, 0.f, 1.f);
+				return true;
+			}
+
 			// Once per frame, after xrBeginFrame. `now` is the frame's predicted display time.
-			void poll(XrTime now, XrTime period_ns)
+			void poll(XrTime now, XrTime period_ns, const screen_geometry& screen)
 			{
 				if (!attached)
 				{
@@ -680,13 +782,28 @@ namespace armsx3::xr
 					if (r3) digital1 |= CELL_PAD_CTRL_R3;
 				}
 
+				const bool lightgun = g_state.lightgun.load(std::memory_order_relaxed);
+
 				if (x) digital2 |= CELL_PAD_CTRL_SQUARE;
 				if (y) digital2 |= CELL_PAD_CTRL_TRIANGLE;
 				if (grip_l > k_grip_threshold) digital2 |= CELL_PAD_CTRL_L1;
 				if (grip_r > k_grip_threshold) digital2 |= CELL_PAD_CTRL_R1;
 				if (trigger_l > k_trigger_threshold) digital2 |= CELL_PAD_CTRL_L2;
-				if (trigger_r > k_trigger_threshold) digital2 |= CELL_PAD_CTRL_R2;
+				// Lightgun: the right trigger is the gun's trigger, which the GunCon 3 reads as
+				// Cross. Otherwise it is R2 as on a pad.
+				if (trigger_r > k_trigger_threshold) digital2 |= lightgun ? CELL_PAD_CTRL_CROSS : CELL_PAD_CTRL_R2;
 				if (now < start_pulse_until) digital1 |= CELL_PAD_CTRL_START;
+
+				if (lightgun)
+				{
+					float u = 0.f, v = 0.f;
+					if (aim_on_screen(now, screen, u, v) && (std::fabs(u - last_aim_u) > 0.0005f || std::fabs(v - last_aim_v) > 0.0005f))
+					{
+						last_aim_u = u;
+						last_aim_v = v;
+						_armsx3_mouseAim(0, u, v);
+					}
+				}
 
 				int lx = 128, ly = 128, rx = 128, ry = 128;
 				if (!shift)
@@ -1106,7 +1223,16 @@ namespace armsx3::xr
 						}
 						check(begun, "xrBeginFrame");
 
-						m_input.poll(frame_state.predictedDisplayTime, frame_state.predictedDisplayPeriod);
+						{
+							touch_input::screen_geometry screen{};
+							std::lock_guard lock(m_mutex);
+							screen.base_space = m_space;
+							screen.distance_m = g_state.screen.distance_m;
+							screen.width_m = g_state.screen.width_m;
+							const u32 eye_width = m_layer_stereo ? m_layer_width / 2 : m_layer_width;
+							screen.height_m = eye_width ? screen.width_m * static_cast<float>(m_layer_height) / static_cast<float>(eye_width) : 0.f;
+							m_input.poll(frame_state.predictedDisplayTime, frame_state.predictedDisplayPeriod, screen);
+						}
 
 						XrCompositionLayerQuad quads[2];
 						u32 layer_count = 0;
@@ -1844,6 +1970,19 @@ namespace armsx3::xr
 	bool active()
 	{
 		return g_state.active.load();
+	}
+
+	void set_lightgun(bool on)
+	{
+		if (g_state.lightgun.exchange(on) != on)
+		{
+			xr_log.notice("Lightgun mode %s", on ? "on: right controller aims, its trigger is the gun's" : "off");
+		}
+	}
+
+	bool lightgun()
+	{
+		return g_state.lightgun.load();
 	}
 
 	void recommended_extent(u32& width, u32& height, bool stereo_output)

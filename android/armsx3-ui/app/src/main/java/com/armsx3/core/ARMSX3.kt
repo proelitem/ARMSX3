@@ -149,6 +149,18 @@ class ARMSX3 {
     external fun memoryStatus(availMb: Long, totalMb: Long, thresholdMb: Long, low: Boolean)
     /** Ask the renderer to give memory back: 0 moderate, 1 severe. Applied at its next frame. */
     external fun memoryPressure(level: Int)
+
+    /**
+     * Lightguns. A PS3 lightgun is a pad whose USB identity is a GunCon 3 plus a mouse for the
+     * aim; the core's mouse is driven from here, one per pad port. Aim is 0..1 from the top-left.
+     * The gun's trigger is the pad's Cross on that port (Rpcs3Bridge.setPadButton).
+     */
+    external fun mouseAim(index: Int, x: Float, y: Float)
+    external fun mouseButton(index: Int, button: Int, down: Boolean)
+    /** Make pad `port` a GunCon 3, or a plain pad again. Live (the pads are rebuilt). */
+    external fun setPadLightgun(port: Int, on: Boolean)
+    /** Headset: the right controller's aim ray drives mouse 0 and its trigger is Cross. */
+    external fun xrSetLightgun(on: Boolean)
     external fun setRenderPosition(portraitTop: Boolean, topInset: Int)
     external fun setPadDeviceClasses(classes: IntArray)
 

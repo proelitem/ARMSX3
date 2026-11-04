@@ -75,6 +75,8 @@ internal object RemotePlayProtocol {
     private const val PACKET_AUDIO_OPUS: Byte = 5
     private const val PACKET_RUMBLE: Byte = 6
     private const val PACKET_WAITING: Byte = 7
+    private const val PACKET_AIM: Byte = 8
+    private const val AIM_PACKET_SIZE = 16
     private const val RUMBLE_PACKET_SIZE = 8
 
     // Why a session ended, in the second byte of a bye. Every bye before these carried 0 there.
@@ -143,6 +145,38 @@ internal object RemotePlayProtocol {
         out.put(pad.l2.toByte()).put(pad.r2.toByte()).put(ZERO)
         out.flip()
         return out
+    }
+
+    /**
+     * Player 2's lightgun aim: where their pointer is on the game picture, 0..1 from the
+     * top-left, and whether the trigger is held. Same channel and rules as the pad: unordered,
+     * never retransmitted, sent on change and as a heartbeat. The host feeds it to the mouse
+     * the emulated GunCon 3 of pad port 2 reads, and the trigger to that pad's Cross.
+     */
+    data class AimState(val x: Float = 0.5f, val y: Float = 0.5f, val trigger: Boolean = false)
+
+    fun encodeAim(seq: Int, aim: AimState): ByteBuffer {
+        val out = ByteBuffer.allocate(AIM_PACKET_SIZE).order(ByteOrder.LITTLE_ENDIAN)
+        out.put(PACKET_AIM)
+        out.putInt(seq)
+        out.putFloat(aim.x)
+        out.putFloat(aim.y)
+        out.put(if (aim.trigger) 1 else 0)
+        while (out.position() < AIM_PACKET_SIZE) out.put(ZERO)
+        out.flip()
+        return out
+    }
+
+    /** Returns the packet's sequence number and aim, or null for anything that is not an aim. */
+    fun decodeAim(data: ByteBuffer): Pair<Int, AimState>? {
+        val buf = data.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+        if (buf.remaining() < AIM_PACKET_SIZE || buf.get() != PACKET_AIM) return null
+        val seq = buf.int
+        val x = buf.float
+        val y = buf.float
+        val trigger = buf.get().toInt() != 0
+        if (x.isNaN() || y.isNaN()) return null
+        return seq to AimState(x.coerceIn(0f, 1f), y.coerceIn(0f, 1f), trigger)
     }
 
     /** Returns the packet's sequence number and pad, or null for anything that is not a pad. */

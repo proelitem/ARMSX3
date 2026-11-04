@@ -56,7 +56,10 @@ with one image per eye. The Touch controllers drive PS3 pad 1 through OpenXR act
 thumbsticks and A/B/X/Y as you would expect (Cross/Circle/Square/Triangle), triggers L2/R2,
 grips L1/R1, stick clicks L3/R3, a tap on the left menu button is Start, and holding it
 turns the left stick into the D-pad, A into Select and B into PS (the home menu). Game
-rumble reaches both controllers. The core side is compiled in by default
+rumble reaches both controllers. Lightgun games: with "Lightgun with the right controller"
+on, pad 1 is a GunCon 3 aimed by the right controller's ray on the virtual screen, and a
+friend joining over remote play gets a GunCon 3 on pad 2 aimed by their pointer
+(android/tools/quest3/MULTIJOUEUR-QUEST3.md). The core side is compiled in by default
 (`-DARMSX3_XR=OFF` to leave it out) and only needs the vendored headers in
 3rdparty/openxr; the loader comes from Maven with the app
 (org.khronos.openxr:openxr_loader_for_android). android/tools/quest3/ holds the driver

@@ -28,6 +28,7 @@
 #include "Emu/Io/KeyboardHandler.h"
 #include "Emu/Io/Null/NullKeyboardHandler.h"
 #include "Emu/Io/Null/NullMouseHandler.h"
+#include "android_mouse_handler.h"
 #include "Emu/Io/Null/NullPadHandler.h"
 #include "Emu/Io/Null/null_camera_handler.h"
 #include "Emu/Io/Null/null_music_handler.h"
@@ -2617,8 +2618,17 @@ static void setupCallbacks() {
           },
       .init_mouse_handler =
           [](auto...) {
-            ensure(g_fxo->init<MouseHandlerBase, NullMouseHandler>(
-                Emu.DeserialManager()));
+            // The app-driven mouse (android_mouse_handler.h) whenever a lightgun was asked
+            // for before this boot; the null handler otherwise, so games that look for a
+            // mouse keep seeing none. "raw" makes each emulated gun read its own mouse index.
+            if (g_android_mouse_wanted.load()) {
+              g_cfg.io.mouse.set(mouse_handler::raw);
+              ensure(g_fxo->init<MouseHandlerBase, android_mouse_handler>(
+                  Emu.DeserialManager()));
+            } else {
+              ensure(g_fxo->init<MouseHandlerBase, NullMouseHandler>(
+                  Emu.DeserialManager()));
+            }
           },
       .init_pad_handler =
           [](auto...) {
@@ -6768,6 +6778,85 @@ extern "C" void _armsx3_memoryPressure(int level) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Lightguns (android/tools/quest3/MULTIJOUEUR-QUEST3.md)
+//
+// A PS3 lightgun game (Time Crisis 4 wants two GunCon 3s) is a pad whose USB identity says
+// "GunCon 3" plus a mouse for the aim. The pad part already exists in the core; the mouse part
+// is android_mouse_handler.h. Both are driven from the app: the touch layer on a phone, the
+// Touch controller's ray on the virtual screen in a headset, player 2 over remote play.
+// ---------------------------------------------------------------------------
+
+// Read by init_mouse_handler at boot: set before the game starts by whoever wants a gun.
+std::atomic<bool> g_android_mouse_wanted{false};
+
+static android_mouse_handler *android_mouse() {
+  if (!g_android_mouse_wanted.load() || Emu.IsStopped()) {
+    return nullptr;
+  }
+  auto *base = g_fxo->try_get<MouseHandlerBase>();
+  return base ? dynamic_cast<android_mouse_handler *>(base) : nullptr;
+}
+
+// Aim of mouse `index` (= pad port = GunCon3 controller index), normalised 0..1, top-left origin.
+extern "C" void _armsx3_mouseAim(int index, float x, float y) {
+  if (index < 0 || index >= MAX_MICE) {
+    return;
+  }
+  if (auto *mouse = android_mouse()) {
+    mouse->aim(static_cast<u32>(index), x, y);
+  }
+}
+
+// Mouse button `button` (0 = left ... 7) of mouse `index`. Lightgun triggers go through the PAD
+// (Cross is the GunCon 3's default trigger binding); this is for games that read cellMouse.
+extern "C" void _armsx3_mouseButton(int index, int button, bool down) {
+  if (index < 0 || index >= MAX_MICE || button < 0 || button > 7) {
+    return;
+  }
+  if (auto *mouse = android_mouse()) {
+    mouse->Button(static_cast<u32>(index), static_cast<u8>(1u << button), down);
+  }
+}
+
+// Make pad `port` a GunCon 3 (or a plain pad again): the USB identity the pad thread turns into
+// the emulated device, plus the fake class the product table pairs with it. Same reasoning as
+// _armsx3_setPadDeviceClasses about saving and resetting. Also arms the mouse handler for the
+// next boot, since a gun with nothing to aim it is no gun.
+extern "C" void _armsx3_setPadLightgun(int port, bool on) {
+  if (port < 0 || static_cast<usz>(port) >= g_cfg_input.player.size()) {
+    return;
+  }
+
+  cfg_player *player_config = g_cfg_input.player[port];
+  if (!player_config) {
+    return;
+  }
+
+  if (on) {
+    g_android_mouse_wanted = true;
+  }
+
+  const u32 vendor = on ? input::vendor_id::namco : 0;
+  const u32 product = on ? input::product_id::guncon_3 : 0;
+  const u32 class_type = on ? CELL_PAD_FAKE_TYPE_GUNCON3 : CELL_PAD_PCLASS_TYPE_STANDARD;
+
+  cfg_pad &cfg = player_config->config;
+  if (cfg.vendor_id.get() == vendor && cfg.product_id.get() == product &&
+      cfg.device_class_type.get() == class_type) {
+    return;
+  }
+
+  cfg.vendor_id.set(vendor);
+  cfg.product_id.set(product);
+  cfg.device_class_type.set(class_type);
+
+  armsx3_android.warning("pad %d: %s", port, on ? "GunCon 3 (aimed by the app's mouse)" : "standard pad");
+
+  g_cfg_input.save("", g_cfg_input_configs.default_config);
+  pad::reset(Emu.GetTitleID());
+}
+
 extern "C" void _armsx3_setThermals(float cpu, float gpu, float battery, bool show) {
   rsx::overlays::thermals::g_cpu = cpu;
   rsx::overlays::thermals::g_gpu = gpu;
@@ -8648,6 +8737,19 @@ extern "C" bool _armsx3_xrStart(JNIEnv *env, jobject activity, float screenDista
 extern "C" void _armsx3_xrStop() {
 #ifdef ARMSX3_XR
   armsx3::xr::stop();
+#endif
+}
+
+// Headset lightgun mode: the right Touch controller's aim ray on the virtual screen drives
+// mouse 0, and its trigger is Cross (the GunCon 3's trigger). Callable at any time.
+extern "C" void _armsx3_xrSetLightgun(bool on) {
+#ifdef ARMSX3_XR
+  if (on) {
+    g_android_mouse_wanted = true;
+  }
+  armsx3::xr::set_lightgun(on);
+#else
+  (void)on;
 #endif
 }
 

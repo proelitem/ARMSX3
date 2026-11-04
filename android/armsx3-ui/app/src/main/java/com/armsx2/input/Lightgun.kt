@@ -51,7 +51,7 @@ object Lightgun {
         val newPort = p.coerceIn(0, 1)
         // Detach the old port first, or enabling Port 2 would leave a gun on Port 1 as well.
         if (newPort != port.value && enabled.value) {
-            runCatching { NativeApp.usbSetDeviceType(port.value, "None") }
+            runCatching { com.armsx3.core.ARMSX3.instance.setPadLightgun(port.value, false) }
         }
         port.value = newPort
         MainActivityRuntime.prefs.edit().putInt(KEY_PORT, newPort).apply()
@@ -59,9 +59,9 @@ object Lightgun {
     }
 
     private fun push() {
-        runCatching {
-            NativeApp.usbSetDeviceType(port.value, if (enabled.value) "guncon2" else "None")
-        }
+        // The PS3's lightgun is a GunCon 3: a pad with that USB identity, aimed by the core's
+        // mouse of the same index (android_mouse_handler.h). Live: the pads are rebuilt.
+        runCatching { com.armsx3.core.ARMSX3.instance.setPadLightgun(port.value, enabled.value) }
     }
 
     /** Re-assert at boot — the ini is authoritative, but this covers a first run with no ini yet. */
@@ -98,9 +98,10 @@ object Lightgun {
      * Passed straight through: `InputManager::UpdatePointerAbsolutePosition` wants window pixels,
      * and our SurfaceView spans the window, so touch coordinates already are those.
      */
-    fun aim(x: Float, y: Float) {
-        if (!enabled.value) return
-        runCatching { NativeApp.usbLightgunAim(x, y) }
+    fun aim(x: Float, y: Float, widthPx: Float, heightPx: Float) {
+        if (!enabled.value || widthPx <= 0f || heightPx <= 0f) return
+        // The core's mouse takes 0..1 from the top-left; the emulated GunCon 3 reads it.
+        runCatching { com.armsx3.core.ARMSX3.instance.mouseAim(port.value, x / widthPx, y / heightPx) }
     }
 
     /**
@@ -114,24 +115,33 @@ object Lightgun {
         if (!enabled.value) return
         if (down == triggerDown) return
         triggerDown = down
+        // The GunCon 3 has no off-screen shot: the PS3 games reload with a button or the pedal
+        // (Time Crisis 4 puts cover on the gun's A/B buttons). The edge margin only keeps a press
+        // at the very frame from firing. The trigger is the pad's Cross on this port.
         val margin = minOf(widthPx, heightPx) * EDGE_RELOAD_FRAC
         val offscreen = x <= margin || y <= margin || x >= widthPx - margin || y >= heightPx - margin
-        val bind = if (offscreen) NativeApp.GUNCON_SHOOT_OFFSCREEN else NativeApp.GUNCON_TRIGGER
-        runCatching { NativeApp.usbLightgunButton(port.value, bind, down) }
-        // Release BOTH on lift: a drag that starts on-screen and ends in the reload margin would
-        // otherwise leave the on-screen trigger stuck down.
-        if (!down) {
-            runCatching {
-                NativeApp.usbLightgunButton(port.value, NativeApp.GUNCON_TRIGGER, false)
-                NativeApp.usbLightgunButton(port.value, NativeApp.GUNCON_SHOOT_OFFSCREEN, false)
-            }
-        }
+        if (offscreen && down) return
+        runCatching { com.armsx3.Rpcs3Bridge.setPadButton(port.value, android.view.KeyEvent.KEYCODE_BUTTON_A, 0, down) }
     }
 
     /** Press/release one of the gun's own buttons (A / B / C / Start / Select / Recalibrate). */
     fun button(bind: Int, down: Boolean) {
         if (!enabled.value) return
-        runCatching { NativeApp.usbLightgunButton(port.value, bind, down) }
+        // As the pad buttons the GunCon 3 config reads them from (Emu/Io/guncon3_config.h
+        // defaults: A1 = L1, B1 = R1, C1 = Select, C2 = Start).
+        val keycode = when (bind) {
+            NativeApp.GUNCON_A -> android.view.KeyEvent.KEYCODE_BUTTON_L1
+            NativeApp.GUNCON_B -> android.view.KeyEvent.KEYCODE_BUTTON_R1
+            NativeApp.GUNCON_C -> android.view.KeyEvent.KEYCODE_BUTTON_SELECT
+            NativeApp.GUNCON_START -> android.view.KeyEvent.KEYCODE_BUTTON_START
+            NativeApp.GUNCON_SELECT -> android.view.KeyEvent.KEYCODE_BUTTON_SELECT
+            NativeApp.GUNCON_DPAD_UP -> android.view.KeyEvent.KEYCODE_DPAD_UP
+            NativeApp.GUNCON_DPAD_DOWN -> android.view.KeyEvent.KEYCODE_DPAD_DOWN
+            NativeApp.GUNCON_DPAD_LEFT -> android.view.KeyEvent.KEYCODE_DPAD_LEFT
+            NativeApp.GUNCON_DPAD_RIGHT -> android.view.KeyEvent.KEYCODE_DPAD_RIGHT
+            else -> return // recalibrate: nothing to calibrate on an emulated gun
+        }
+        runCatching { com.armsx3.Rpcs3Bridge.setPadButton(port.value, keycode, 0, down) }
     }
 
     /** Buttons offered on screen, as (binding, label). Mirrors NetherSX2's gun overlay. */

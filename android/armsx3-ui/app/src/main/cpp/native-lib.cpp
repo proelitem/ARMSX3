@@ -82,6 +82,11 @@ struct CoreApi {
   // Optional: system memory telemetry and pressure (a core without them just does not trim).
   void (*memoryStatus)(long availMb, long totalMb, long thresholdMb, bool low);
   void (*memoryPressure)(int level);
+  // Optional: lightguns (the app-driven mouse, the GunCon 3 pad identity, the headset's aim).
+  void (*mouseAim)(int index, float x, float y);
+  void (*mouseButton)(int index, int button, bool down);
+  void (*setPadLightgun)(int port, bool on);
+  void (*xrSetLightgun)(bool on);
   void (*setRenderPosition)(bool portraitTop, int topInset);
   void (*setPadDeviceClasses)(const int *classes, int count);
   bool (*usbDeviceEvent)(int fd, int vendorId, int productId, int event);
@@ -283,6 +288,10 @@ struct CoreLibrary : CoreApi {
     // Optional: system memory telemetry and pressure (a core without them just does not trim).
     result.memoryStatus = reinterpret_cast<decltype(memoryStatus)>(dlsym(handle, "_armsx3_memoryStatus"));
     result.memoryPressure = reinterpret_cast<decltype(memoryPressure)>(dlsym(handle, "_armsx3_memoryPressure"));
+    result.mouseAim = reinterpret_cast<decltype(mouseAim)>(dlsym(handle, "_armsx3_mouseAim"));
+    result.mouseButton = reinterpret_cast<decltype(mouseButton)>(dlsym(handle, "_armsx3_mouseButton"));
+    result.setPadLightgun = reinterpret_cast<decltype(setPadLightgun)>(dlsym(handle, "_armsx3_setPadLightgun"));
+    result.xrSetLightgun = reinterpret_cast<decltype(xrSetLightgun)>(dlsym(handle, "_armsx3_xrSetLightgun"));
     // Optional: a core built before this simply centres the image, as it always did.
     result.setRenderPosition = reinterpret_cast<decltype(setRenderPosition)>(dlsym(handle, "_armsx3_setRenderPosition"));
     // Optional: a core without it reports every port as a standard pad, as it always did.
@@ -992,6 +1001,31 @@ extern "C" JNIEXPORT void JNICALL Java_com_armsx3_core_ARMSX3_memoryStatus(
 
   coreLib.memoryStatus(static_cast<long>(availMb), static_cast<long>(totalMb),
                         static_cast<long>(thresholdMb), low == JNI_TRUE);
+}
+
+// Lightguns. The mouse is the aim source of the emulated GunCon 3 (one mouse per pad port).
+extern "C" JNIEXPORT void JNICALL Java_com_armsx3_core_ARMSX3_mouseAim(JNIEnv *, jobject, jint index, jfloat x, jfloat y) {
+  if (coreLib.mouseAim != nullptr) {
+    coreLib.mouseAim(index, x, y);
+  }
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_armsx3_core_ARMSX3_mouseButton(JNIEnv *, jobject, jint index, jint button, jboolean down) {
+  if (coreLib.mouseButton != nullptr) {
+    coreLib.mouseButton(index, button, down == JNI_TRUE);
+  }
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_armsx3_core_ARMSX3_setPadLightgun(JNIEnv *, jobject, jint port, jboolean on) {
+  if (coreLib.setPadLightgun != nullptr) {
+    coreLib.setPadLightgun(port, on == JNI_TRUE);
+  }
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_armsx3_core_ARMSX3_xrSetLightgun(JNIEnv *, jobject, jboolean on) {
+  if (coreLib.xrSetLightgun != nullptr) {
+    coreLib.xrSetLightgun(on == JNI_TRUE);
+  }
 }
 
 extern "C" JNIEXPORT void JNICALL Java_com_armsx3_core_ARMSX3_memoryPressure(JNIEnv *, jobject, jint level) {

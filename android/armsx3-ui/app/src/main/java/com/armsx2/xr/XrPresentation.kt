@@ -18,6 +18,7 @@ object XrPresentation {
     private const val TAG = "XrPresentation"
     private const val PREFS = "ARMSX2"
     private const val KEY_ENABLED = "xr.virtualScreen"
+    private const val KEY_LIGHTGUN = "xr.lightgun"
 
     /** Screen placement, metres. 2.4 m wide at 2 m is a large television at couch distance. */
     const val SCREEN_DISTANCE_M = 2.0f
@@ -36,6 +37,16 @@ object XrPresentation {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_ENABLED, on).apply()
     }
 
+    /** Lightgun games in the headset: the right controller aims at the virtual screen and
+     *  its trigger shoots; pad 1 is a GunCon 3 for the boot. Off by default: on a plain game
+     *  it would steal the right trigger (R2) for Cross. */
+    fun lightgun(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_LIGHTGUN, false)
+
+    fun setLightgun(context: Context, on: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_LIGHTGUN, on).apply()
+    }
+
     /** Whether a launch from [host] should go through XrEmulationActivity. */
     fun shouldRoute(host: Context?): Boolean = host != null && enabled(host)
 
@@ -49,6 +60,13 @@ object XrPresentation {
             false
         }
         Log.i(TAG, "xrStart -> $ok")
+        if (ok) {
+            // Before the game boots (start() runs ahead of the launch): the mouse handler is
+            // chosen at boot from this, and the GunCon identity is read when the pads are built.
+            val gun = lightgun(activity)
+            runCatching { ARMSX3.instance.xrSetLightgun(gun) }
+            if (gun) runCatching { ARMSX3.instance.setPadLightgun(0, true) }
+        }
         return ok
     }
 

@@ -286,6 +286,8 @@
  "backend.gpuDriver.description": "Remplacez le pilote système Vulkan par Mesa Turnip ou un autre pilote Adreno, ou sur Mali par un pack PanVK communautaire conçu pour votre appareil. Turnip est recommandé pour les appareils Adreno-6XX sur des pilotes OEM obsolètes.",
  "backend.gpuDriver.label": "Pilote GPU",
  "backend.xr.virtualScreen.label": "Écran virtuel (OpenXR)",
+ "backend.xr.lightgun.description": "Pour les jeux de tir au pistolet (Time Crisis 4...) : la manette droite vise l'écran virtuel et sa gâchette tire. Le pad 1 devient un GunCon 3 au démarrage. Un ami qui rejoint en remote play vise de la même façon depuis son casque.",
+ "backend.xr.lightgun.label": "Pistolet avec la manette droite",
  "backend.xr.virtualScreen.description": "Affiche le jeu sur un grand écran devant vous via le compositeur du casque, au lieu du panneau plat. Avec la 3D stéréoscopique activée, les jeux à sortie 3D native affichent une image par œil.",
  "backend.graphicsApi.label": "API graphique",
  "backend.renderer.auto": "Automatique",

@@ -51,7 +51,7 @@ fun LightgunLayer(widthPx: Float, heightPx: Float) {
                                 // A widget above us already owns this finger (gun buttons, pause).
                                 if (ch.isConsumed || aiming != null) continue
                                 aiming = ch.id
-                                Lightgun.aim(ch.position.x, ch.position.y)
+                                Lightgun.aim(ch.position.x, ch.position.y, widthPx, heightPx)
                                 // Aim BEFORE the trigger, in that order: the core samples the
                                 // pointer when the trigger goes down, so firing first would shoot
                                 // at wherever the previous shot landed.
@@ -61,7 +61,7 @@ fun LightgunLayer(widthPx: Float, heightPx: Float) {
                             }
                             if (ch.id != aiming) continue
                             if (ch.pressed) {
-                                Lightgun.aim(ch.position.x, ch.position.y)
+                                Lightgun.aim(ch.position.x, ch.position.y, widthPx, heightPx)
                                 ch.consume()
                             } else {
                                 Lightgun.trigger(false, ch.position.x, ch.position.y, widthPx, heightPx)

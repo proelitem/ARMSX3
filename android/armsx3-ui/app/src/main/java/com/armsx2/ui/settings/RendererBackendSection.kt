@@ -85,6 +85,18 @@ fun RendererBackendSection(state: MutableState<Settings>) {
                 com.armsx2.xr.XrPresentation.setEnabled(context, on)
             },
         )
+        var xrLightgun by androidx.compose.runtime.remember {
+            androidx.compose.runtime.mutableStateOf(com.armsx2.xr.XrPresentation.lightgun(context))
+        }
+        com.armsx2.ui.common.SettingSwitchRow(
+            title = str("backend.xr.lightgun.label"),
+            description = str("backend.xr.lightgun.description"),
+            checked = xrLightgun,
+            onCheckedChange = { on ->
+                xrLightgun = on
+                com.armsx2.xr.XrPresentation.setLightgun(context, on)
+            },
+        )
     }
 
     if (settings.renderer == "vulkan") {

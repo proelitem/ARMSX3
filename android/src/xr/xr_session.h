@@ -54,6 +54,12 @@ namespace armsx3::xr
 	// True between a successful start() and stop(): the renderer is presenting to OpenXR.
 	bool active();
 
+	// Lightgun mode: the right controller's aim ray, where it meets the virtual screen, drives
+	// the app's mouse 0 (the GunCon 3 of pad 1 reads it), and the right trigger becomes Cross,
+	// the GunCon's trigger. On or off at any time.
+	void set_lightgun(bool on);
+	bool lightgun();
+
 	// The extent the quad swapchain is created at. What GSFrameBase::client_width/height
 	// report while active(), so the present framebuffer and the layer agree.
 	//

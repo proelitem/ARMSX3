@@ -106,6 +106,8 @@ private const val TOUCH_HIDE_MS = 15_000L
  * packet sent takes its turn on the Wi-Fi channel the video needs.
  */
 private const val ANALOG_SEND_MS = 8L
+/** Aim packets while the pointer only moves: 60 a second is plenty for a 60 fps game. */
+private const val AIM_SEND_MS = 16L
 
 /** How a viewer reaches its host. */
 internal sealed interface ViewerMode {
@@ -517,6 +519,40 @@ class RemotePlayViewerActivity : ComponentActivity() {
 
             override fun surfaceDestroyed(holder: SurfaceHolder) = Unit
         })
+        // Lightgun aim: where the pointer is on the picture. A finger on a phone; in a headset
+        // the controller's pointer, which Horizon OS delivers as hover moves while it is not
+        // pressed and as touches while the trigger is held. Mapped through the letterbox the
+        // renderer's SCALE_ASPECT_FIT leaves, so 0..1 is the game picture, not the view.
+        val aimListener = { v: View, event: MotionEvent ->
+            val aspect = videoAspect.value
+            val vw = v.width.toFloat()
+            val vh = v.height.toFloat()
+            if (aspect == null || vw <= 0f || vh <= 0f) {
+                false
+            } else {
+                val pw: Float
+                val ph: Float
+                if (vw / vh > aspect) { ph = vh; pw = vh * aspect } else { pw = vw; ph = vw / aspect }
+                val x0 = (vw - pw) / 2f
+                val y0 = (vh - ph) / 2f
+                val x = ((event.x - x0) / pw)
+                val y = ((event.y - y0) / ph)
+                val inside = x in 0f..1f && y in 0f..1f
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_HOVER_MOVE, MotionEvent.ACTION_HOVER_ENTER ->
+                        if (inside) session?.sendAim(x, y, trigger = false)
+                    MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE ->
+                        session?.sendAim(x.coerceIn(0f, 1f), y.coerceIn(0f, 1f), trigger = true)
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_HOVER_EXIT ->
+                        session?.sendAim(x.coerceIn(0f, 1f), y.coerceIn(0f, 1f), trigger = false)
+                    else -> {}
+                }
+                // Touches are not claimed: the tap-to-show-controls logic above still sees them.
+                false
+            }
+        }
+        view.setOnHoverListener(aimListener)
+        view.setOnTouchListener { v, event -> aimListener(v, event) }
         renderer = view
         videoView.value = view
         session?.showOn(view)
@@ -1142,6 +1178,25 @@ internal class ViewerSession(
     private val sendLater = Runnable {
         padLater = false
         sendNow()
+    }
+
+    private var aim = RemotePlayProtocol.AimState()
+    private var aimSentAt = 0L
+
+    /** Lightgun aim over the input channel: at most every [AIM_SEND_MS] while it only moves,
+     *  at once when the trigger changes. */
+    fun sendAim(x: Float, y: Float, trigger: Boolean) {
+        val next = RemotePlayProtocol.AimState(x, y, trigger)
+        val now = SystemClock.uptimeMillis()
+        if (next.trigger == aim.trigger && now - aimSentAt < AIM_SEND_MS) {
+            aim = next
+            return
+        }
+        aim = next
+        val channel = inputChannel ?: return
+        if (channel.state() != DataChannel.State.OPEN) return
+        aimSentAt = now
+        channel.send(DataChannel.Buffer(RemotePlayProtocol.encodeAim(seq++, aim), true))
     }
 
     fun sendPad(state: RemotePlayProtocol.PadState) {

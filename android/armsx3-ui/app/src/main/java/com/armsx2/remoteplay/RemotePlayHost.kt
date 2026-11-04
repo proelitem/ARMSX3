@@ -411,6 +411,14 @@ private class HostSession(
 
     // Input thread.
     private var appliedPad = RemotePlayProtocol.PadState()
+    // Player 2's lightgun: whether the host runs a lightgun game (its own gun switch, on the
+    // panel or in the headset), the aim last applied and its packet order.
+    private val lightgun: Boolean =
+        com.armsx2.input.Lightgun.enabled.value ||
+            runCatching { com.armsx2.xr.XrPresentation.lightgun(com.armsx2.Pasx2Application.appContext) }.getOrDefault(false)
+    private var appliedAim = RemotePlayProtocol.AimState()
+    private var hasAimSeq = false
+    private var lastAimSeq = 0
     private var lastPadSeq = 0
     private var hasPadSeq = false
     private var lastPadAt = 0L
@@ -698,6 +706,8 @@ private class HostSession(
             return
         }
         streaming = true
+        // A lightgun game: the friend's pad is a GunCon 3 too, aimed by their pointer (applyAim).
+        if (lightgun) runCatching { com.armsx3.core.ARMSX3.instance.setPadLightgun(PLAYER_2_PORT, true) }
 
         // The frame rate and the resolution never change; a tight network only softens the picture.
         // Left to adapt, WebRTC lowered the resolution whenever the picture got busy (a scene
@@ -856,6 +866,16 @@ private class HostSession(
             main.post { finish(null) }
             return
         }
+        RemotePlayProtocol.decodeAim(data)?.let { (seq, aim) ->
+            input.post {
+                if (ended || !streaming || !lightgun) return@post
+                if (hasAimSeq && seq - lastAimSeq <= 0) return@post
+                hasAimSeq = true
+                lastAimSeq = seq
+                applyAim(aim)
+            }
+            return
+        }
         val (seq, pad) = RemotePlayProtocol.decodePad(data) ?: return
         input.post {
             if (ended || !streaming) return@post
@@ -866,6 +886,18 @@ private class HostSession(
             lastPadAt = SystemClock.uptimeMillis()
             applyPad(pad)
         }
+    }
+
+    /** Player 2's aim into the mouse its GunCon 3 reads, its trigger into that pad's Cross. */
+    private fun applyAim(aim: RemotePlayProtocol.AimState) {
+        val old = appliedAim
+        if (aim.x != old.x || aim.y != old.y) {
+            runCatching { com.armsx3.core.ARMSX3.instance.mouseAim(PLAYER_2_PORT, aim.x, aim.y) }
+        }
+        if (aim.trigger != old.trigger) {
+            Rpcs3Bridge.setPadButton(PLAYER_2_PORT, KeyEvent.KEYCODE_BUTTON_A, 0, aim.trigger)
+        }
+        appliedAim = aim
     }
 
     private fun applyPad(pad: RemotePlayProtocol.PadState) {

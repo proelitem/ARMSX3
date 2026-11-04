@@ -826,6 +826,8 @@ val EN: Map<String, String> = mapOf(
     "backend.glDriver.description" to "Choose how the OpenGL renderer runs. ANGLE translates OpenGL ES to Vulkan with a bundled driver, which helps on non-Adreno GPUs (Mali / Xclipse / PowerVR) whose native OpenGL driver is weak or buggy. Restart the game to apply.",
     "backend.gpuDriver.description" to "Replace the system Vulkan driver with Mesa Turnip or another Adreno driver, or on Mali with a community PanVK pack built for your device. Turnip is recommended for Adreno-6XX devices on stale OEM drivers.",
     "backend.gpuDriver.label" to "GPU Driver",
+    "backend.xr.lightgun.label" to "Lightgun with the right controller",
+    "backend.xr.lightgun.description" to "For lightgun games (Time Crisis 4...): the right controller aims at the virtual screen and its trigger shoots. Pad 1 becomes a GunCon 3 for the boot. A friend joining over remote play aims the same way from their headset.",
     "backend.xr.virtualScreen.label" to "Virtual screen (OpenXR)",
     "backend.xr.virtualScreen.description" to "Show the game on a large screen in front of you through the headset's compositor, instead of the flat panel. With Stereoscopic 3D on, games with native 3D output show one image per eye.",
     "backend.graphicsApi.label" to "Graphics API",
