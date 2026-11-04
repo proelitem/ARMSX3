@@ -734,6 +734,13 @@ namespace armsx3::xr
 			// handle and the layer description. m_xr_mutex serialises the short OpenXR calls that
 			// touch the swapchain or the frame (acquire/release on one side, begin/end frame on the
 			// other); it is never held across xrWaitFrame or xrWaitSwapchainImage, which block.
+			//
+			// The VkQueue: XR_KHR_vulkan_enable lets the runtime use the queue named in the graphics
+			// binding inside xrBeginFrame, xrEndFrame, xrAcquireSwapchainImage and
+			// xrReleaseSwapchainImage, and nowhere else, and makes the application responsible for
+			// synchronising that queue. The renderer and its offloader submit on it under
+			// vk::acquire_global_submit_lock(), so those four calls take the same lock (inside
+			// m_xr_mutex, which is also the order present() uses, so the two cannot deadlock).
 
 			XrSession m_session = XR_NULL_HANDLE;
 			XrSpace m_space = XR_NULL_HANDLE;
@@ -899,7 +906,9 @@ namespace armsx3::xr
 					if (m_image_acquired)
 					{
 						XrSwapchainImageReleaseInfo release_info{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+						vk::acquire_global_submit_lock();
 						g_state.fn.xrReleaseSwapchainImage(m_swapchain, &release_info);
+						vk::release_global_submit_lock();
 						m_image_acquired = false;
 						m_image_waited = false;
 					}
@@ -1088,7 +1097,9 @@ namespace armsx3::xr
 						std::lock_guard xr_lock(m_xr_mutex);
 
 						XrFrameBeginInfo begin_info{ XR_TYPE_FRAME_BEGIN_INFO };
+						vk::acquire_global_submit_lock();
 						const XrResult begun = g_state.fn.xrBeginFrame(m_session, &begin_info);
+						vk::release_global_submit_lock();
 						if (begun == XR_ERROR_SESSION_NOT_RUNNING)
 						{
 							continue;
@@ -1119,7 +1130,9 @@ namespace armsx3::xr
 						end_info.layerCount = layer_count;
 						end_info.layers = layer_count ? layers : nullptr;
 
+						vk::acquire_global_submit_lock();
 						const XrResult ended = g_state.fn.xrEndFrame(m_session, &end_info);
+						vk::release_global_submit_lock();
 						if (ended != XR_ERROR_SESSION_NOT_RUNNING)
 						{
 							check(ended, "xrEndFrame");
@@ -1402,7 +1415,9 @@ namespace armsx3::xr
 
 					XrSwapchainImageAcquireInfo acquire_info{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
 					u32 index = 0;
+					vk::acquire_global_submit_lock();
 					const XrResult acquired = g_state.fn.xrAcquireSwapchainImage(m_swapchain, &acquire_info, &index);
+					vk::release_global_submit_lock();
 					if (acquired == XR_ERROR_CALL_ORDER_INVALID)
 					{
 						// Every image is out (acquired and not released), which the renderer's
@@ -1482,7 +1497,10 @@ namespace armsx3::xr
 
 				std::lock_guard xr_lock(m_xr_mutex);
 				XrSwapchainImageReleaseInfo release_info{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
-				const bool released = check(g_state.fn.xrReleaseSwapchainImage(m_swapchain, &release_info), "xrReleaseSwapchainImage");
+				vk::acquire_global_submit_lock();
+				const XrResult release_result = g_state.fn.xrReleaseSwapchainImage(m_swapchain, &release_info);
+				vk::release_global_submit_lock();
+				const bool released = check(release_result, "xrReleaseSwapchainImage");
 				m_image_acquired = false;
 				m_image_waited = false;
 
