@@ -106,3 +106,57 @@ changent pas d'une phase à l'autre.
   sous RPCS3 est à tester sur le casque.
 
 Sources : [support deux GunCon 3 sur PS3](https://consumerist.com/2007/12/05/namco-bandai-wont-sell-accessory-separately), [forum arcade, limite 30 fps](https://forum.arcadecontrols.com/index.php/topic,163489.180/wap2.html).
+
+## 6. Pourquoi le lockstep de Tremu décroche sur Sega et PS2 (audit du 4 novembre 2026)
+
+Lu dans `src/netplay.c`, `src/core.c` et `src/main.c` de Tremu. Le modèle : lockstep
+déterministe en étoile autour de l'hôte. Chaque casque fait tourner le même cœur et la même
+ROM ; seuls les pistolets voyagent (11 octets par joueur). Un nouveau venu reçoit l'état de
+sauvegarde libretro de l'hôte par UDP (morceaux de 1 Ko, 4 par pas de 1 ms), la partie est
+figée pour tout le monde pendant le transfert. Toutes les 60 images, chaque casque calcule
+un CRC de la RAM système (`retro_get_memory_data`) ; une différence déclenche un nouveau
+transfert d'état vers l'invité (au plus trois par minute). Le délai d'entrée de l'invité est
+fixé une fois, à l'arrivée, à partir d'un seul aller-retour (2 à 8 images) ; l'hôte attend
+l'entrée de chaque invité avant de calculer une image, sans rollback.
+
+Ce modèle est exactement celui qui convient à Terminator 2 sur FBNeo : cœur déterministe,
+état de quelques centaines de Ko, image calculée en une fraction de 16 ms, donc du jeu pour
+absorber la gigue du Wi-Fi. Tout ce qui suit se dégrade avec la taille de l'état et la charge
+CPU, ce qui décrit Dreamcast/Naomi, Saturn et PS2 :
+
+1. **Le CRC de la RAM** (`wg_core_ram_crc`) est calculé bit à bit, sans table, sur toute la
+   RAM système, sur le fil de l'émulateur, une fois par seconde. 64 Ko pour la Mega Drive :
+   rien. 16 Mo (Dreamcast), 32 Mo (PS2) : 130 à 260 millions d'itérations, soit de l'ordre de
+   100 à 300 ms de gel chaque seconde sur le XR2 Gen 2, et pendant ce gel les paquets d'entrée
+   ne partent plus, donc l'autre casque cale aussi. C'est la saccade périodique « une fois
+   par seconde » que l'on observe. Correction simple : la table de `netplay_file_crc`
+   (déjà dans le fichier) et un échantillonnage (un octet sur N pour plafonner à ~1 Mo).
+2. **Le transfert d'état** n'est pas compressé et avance de 4 Ko par ms au mieux : un état
+   LRPS2 de 50 à 80 Mo prend 15 à 25 s, pour un délai d'abandon de 30 s (`transfer timed
+   out`). À la moindre perte (le Wi-Fi), le rattrapage des morceaux manquants dépasse le
+   délai : l'invité échoue à rejoindre, ou la resynchronisation échoue. Flycast est dans la
+   même zone (quelques dizaines de Mo), Saturn aussi. Corrections : compresser (zlib est dans
+   le NDK, les états se compressent 3 à 5 fois), régler le débit et le délai d'abandon sur la
+   taille, et ne pas figer les autres joueurs pendant un transfert qui dure plus de quelques
+   secondes (faire rejoindre à un point d'arrêt plutôt qu'en cours de partie).
+3. **Le déterminisme** : FBNeo, Genesis Plus GX, FCEUmm, Snes9x sont déterministes par
+   construction (RetroArch y fait du netplay). LRPS2 (GS et VU1 sur leurs propres fils,
+   relectures GS dépendantes du moment) et Flycast (rendu threadé, recompilateur, états de
+   sauvegarde fragiles) ne le sont pas ; RetroArch ne propose pas de netplay pour eux. En
+   lockstep, toute divergence est une désynchronisation : CRC différent, resynchronisation,
+   donc un transfert du point 2 avec gel général, jusqu'à trois fois par minute. Sur PS2
+   c'est l'expérience « ça marche un moment puis ça se fige ».
+4. **Pas de marge CPU** : avec un délai de 2 images (33 ms), l'hôte attend l'entrée de
+   l'invité pour chaque image. Un cœur qui remplit déjà ses 16 ms (PS2, Dreamcast sur
+   Quest 3) n'a aucune marge pour la gigue Wi-Fi (pics de 50 à 100 ms courants) : micro-arrêts
+   permanents, que le casque en retard impose à l'autre. Le délai n'est jamais réévalué après
+   l'arrivée. FBNeo laisse 10 ms de marge par image, ce qui suffit.
+
+**Recommandation** : garder le lockstep pour les cœurs légers et déterministes (Arcade FBNeo,
+Mega Drive, NES, SNES, PS1 à vérifier), après les corrections 1 et 2. Pour PS2, Dreamcast,
+Naomi, Saturn (et PS3 dans ARMSX3), passer au modèle de ce document : un casque émule, encode
+avec MediaCodec et diffuse l'image, l'autre renvoie son pistolet (section 2). Pas de
+déterminisme requis, pas de transfert d'état, un seul CPU chargé, et le joueur 2 paie 40 à
+80 ms de latence au lieu d'imposer ses gels à l'hôte. Le protocole de visée d'ARMSX3
+(`RemotePlayProtocol.kt`, paquet AIM) peut servir tel quel à Tremu, ce qui permettrait à un
+invité Tremu de rejoindre un hôte ARMSX3 et inversement.
