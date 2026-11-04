@@ -1077,7 +1077,7 @@ open class MainActivityRuntime : ComponentActivity() {
         fun resumeXrLaunch(): Boolean {
             val (uri, info, external) = pendingXrLaunch ?: return false
             pendingXrLaunch = null
-            // `external` rides along: it is what sends the app back to the frontend (WFGEmu,
+            // `external` rides along: it is what sends the app back to the frontend (Tremu,
             // ES-DE...) when the game ends, and the first version dropped it here.
             launchGame(uri, info, external = external, bypassXr = true)
             return true
