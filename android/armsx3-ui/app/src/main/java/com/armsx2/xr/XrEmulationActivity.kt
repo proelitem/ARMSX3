@@ -9,6 +9,7 @@ import android.view.MotionEvent
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.addCallback
 import androidx.lifecycle.lifecycleScope
 import com.armsx2.EmuState
 import com.armsx2.runtime.MainActivityRuntime
@@ -116,13 +117,13 @@ class XrEmulationActivity : ComponentActivity() {
     // they act on process-wide state, so an event is handed to them as if Main had received it.
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         val host = MainActivityRuntime.instance
-        if (host != null && host !== this && host.dispatchKeyEvent(event)) return true
+        if (host != null && host !== (this as Any) && host.dispatchKeyEvent(event)) return true
         return super.dispatchKeyEvent(event)
     }
 
     override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {
         val host = MainActivityRuntime.instance
-        if (host != null && host !== this && host.dispatchGenericMotionEvent(ev)) return true
+        if (host != null && host !== (this as Any) && host.dispatchGenericMotionEvent(ev)) return true
         return super.dispatchGenericMotionEvent(ev)
     }
 
