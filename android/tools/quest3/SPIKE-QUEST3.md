@@ -92,7 +92,7 @@ l'écart et avoir un plan C.
 `rpcs3/Emu/RSX/VK/vkutils/device.cpp` logue désormais, à la création du device et sur
 Android seulement, la présence des extensions dont un backend OpenXR aura besoin, et conclut
 par une ligne `AHardwareBuffer swapchain import is AVAILABLE / NOT AVAILABLE`. Le core doit
-être recompilé (voir README, cible `rpcsx-android`) et la `libarmsx3-core.so` recopiée dans
+être recompilé (voir README, cible `armsx3-core`) et la `libarmsx3-core.so` recopiée dans
 l'app avant de construire l'APK. Sans ce patch, les essais répondent à A et B mais pas à C.
 
 Si la recompilation n'est pas possible tout de suite : faire les essais A et B avec l'APK
