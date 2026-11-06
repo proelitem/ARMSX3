@@ -29,6 +29,8 @@
 #include "Emu/Io/Null/NullKeyboardHandler.h"
 #include "Emu/Io/Null/NullMouseHandler.h"
 #include "android_mouse_handler.h"
+// Defined with the lightgun bridge further down; init_mouse_handler reads it at boot.
+extern std::atomic<bool> g_android_mouse_wanted;
 #include "Emu/Io/Null/NullPadHandler.h"
 #include "Emu/Io/Null/null_camera_handler.h"
 #include "Emu/Io/Null/null_music_handler.h"
