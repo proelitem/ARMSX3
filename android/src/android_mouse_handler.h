@@ -18,9 +18,16 @@ class android_mouse_handler final : public MouseHandlerBase
 	using MouseHandlerBase::MouseHandlerBase;
 
 public:
+	// Every caller (cellMouse, cellGem, GunCon 3, Top Shot, USIO...) already holds `mutex` here,
+	// and it is not recursive: locking it again froze the game in cellGemInit. GunCon 3 and
+	// cellGem call this on every poll, so, as basic_mouse_handler does, only the first call sets
+	// the mice up; later ones must not put the aim back in the centre.
 	void Init(const u32 max_connect) override
 	{
-		std::lock_guard lock(mutex);
+		if (m_info.max_connect > 0)
+		{
+			return;
+		}
 
 		m_info = {};
 		m_info.max_connect = std::min<u32>(max_connect, MAX_MICE);
