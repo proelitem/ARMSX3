@@ -42,6 +42,7 @@ extern "C" bool _armsx3_overlayPadData(int port, int digital1, int digital2, int
 extern "C" bool _armsx3_overlayPadPressure(int port, const int* values, int count);
 extern "C" int _armsx3_getPadRumble(int port);
 extern "C" void _armsx3_mouseAim(int index, float x, float y);
+extern "C" void _armsx3_mouseButton(int index, int button, bool down);
 
 namespace armsx3::xr
 {
@@ -371,6 +372,8 @@ namespace armsx3::xr
 			u32 aim_hand = right;
 			bool trigger_was_down[2]{ false, false };
 			bool gun_trigger_was_down = false;
+			// Buttons last sent to mouse 0, as cellMouse button bits (see the Move part below).
+			u8 mouse_buttons_sent = 0;
 
 			// Per-hand aim correction, for a stock that holds the controller at an angle to the
 			// barrel: a rotation applied in the controller's own frame. Identity until calibrated
@@ -928,6 +931,7 @@ namespace armsx3::xr
 				if (lightgun) load_offsets();
 
 				const bool trigger_down[2] = { trigger_l > k_trigger_threshold, trigger_r > k_trigger_threshold };
+				bool gun_shot = false;
 
 				if (x) digital2 |= CELL_PAD_CTRL_SQUARE;
 				if (y) digital2 |= CELL_PAD_CTRL_TRIANGLE;
@@ -983,12 +987,33 @@ namespace armsx3::xr
 					const bool shooting = trigger_down[aim_hand] || gun_trigger_down;
 					if (!shooting) calibrate_armed = false;
 					if (shooting && !calibrate_armed) digital2 |= CELL_PAD_CTRL_CROSS;
+					gun_shot = shooting && !calibrate_armed;
 					if (trigger_down[aim_hand ^ 1u]) digital2 |= aim_hand == right ? CELL_PAD_CTRL_L2 : CELL_PAD_CTRL_R2;
 				}
 				if (now < start_pulse_until) digital1 |= CELL_PAD_CTRL_START;
 
 				if (lightgun)
 				{
+					// The same controls as mouse 0's buttons, for PS Move games (Time Crisis: Razing
+					// Storm) with the Move handler on "Mouse": its default mapping (gem_mouse.yml)
+					// reads button 1 as T, 2 Move, 3 Square, 4 Circle, 5 Cross, 6 Start, 7 Select,
+					// 8 Triangle. The GunCon 3 reads only the pad, so the two never meet.
+					u8 buttons = 0;
+					if (gun_shot) buttons |= 1u << 0;
+					if (!shift && a) buttons |= 1u << 1;
+					if (x) buttons |= 1u << 2;
+					if (!shift && b) buttons |= 1u << 3;
+					if (trigger_down[aim_hand ^ 1u]) buttons |= 1u << 4;
+					if (digital1 & CELL_PAD_CTRL_START) buttons |= 1u << 5;
+					if (digital1 & CELL_PAD_CTRL_SELECT) buttons |= 1u << 6;
+					if (y) buttons |= 1u << 7;
+					for (int bit = 0; bit < 8; ++bit)
+					{
+						const u8 mask = static_cast<u8>(1u << bit);
+						if ((buttons ^ mouse_buttons_sent) & mask) _armsx3_mouseButton(0, bit, (buttons & mask) != 0);
+					}
+					mouse_buttons_sent = buttons;
+
 					float u = 0.f, v = 0.f;
 					if (aim_on_screen(now, screen, u, v) && (std::fabs(u - last_aim_u) > 0.0005f || std::fabs(v - last_aim_v) > 0.0005f))
 					{
