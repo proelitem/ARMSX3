@@ -10,6 +10,7 @@
 #include "VKGSRender.h"
 #include "VKFrameGen.h"
 #include "Emu/RSX/rsx_profiler.h"
+#include "vk_vspec.h"
 #include "vkutils/gpu_timer.h"
 #include "VKHelpers.h"
 #include "VKRenderPass.h"
@@ -485,6 +486,7 @@ VKGSRender::VKGSRender(rsx::context* ctx, rsx::display_output* output) noexcept 
 
 	// Read with the same setting init() reads to pick the present mode. See m_swapchain_framegen.
 	m_swapchain_framegen = g_cfg.video.frame_generation != frame_generation_mode::off;
+	m_swapchain_prerotation = !g_cfg.video.disable_swapchain_prerotation;
 
 	if (!m_swapchain->init(m_swapchain_dims.width, m_swapchain_dims.height))
 	{
@@ -505,6 +507,16 @@ VKGSRender::VKGSRender(rsx::context* ctx, rsx::display_output* output) noexcept 
 	m_current_command_buffer->begin();
 	vk::get_gpu_timer().begin(*m_current_command_buffer, vk::gpu_timer::region::frame);
 
+	// Early submit: read once per renderer, so each boot uses its own game's value.
+	// A threshold below 256 would break the render pass every few draws.
+	if (const u32 threshold = g_cfg.video.vk.early_submit_draw_threshold.get())
+	{
+		m_early_submit_threshold = std::max(threshold, 256u);
+		rsx_log.notice("VK: early submit after %u draws", m_early_submit_threshold);
+	}
+
+	m_early_submit_check_at = m_early_submit_threshold ? m_early_submit_threshold : umax;
+
 	// Create secondary command_buffer for parallel operations
 	m_secondary_command_buffer_pool.create((*m_device), m_device->get_graphics_queue_family());
 	m_secondary_cb_list.create(m_secondary_command_buffer_pool, vk::command_buffer::access_type_hint::all);
@@ -518,9 +530,18 @@ VKGSRender::VKGSRender(rsx::context* ctx, rsx::display_output* output) noexcept 
 		m_occlusion_query_manager->set_control_flags(VK_QUERY_CONTROL_PRECISE_BIT, 0);
 	}
 
+	// ARMSX3: vertex fetch specialization, decided once per boot from this boot's configuration,
+	// before any vertex program exists (vk_vspec.h). It fetches attributes straight from the
+	// attribute ring through vertex input bindings, so only then does the ring need that usage.
+	const bool vspec_on = vk::vspec::activate(g_cfg.video.vk.vertex_fetch_specialization.get(), *m_device,
+		vk::get_heap_compatible_buffer_types());
+	const VkBufferUsageFlags attrib_ring_usage = vspec_on
+		? (VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)
+		: VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT;
+
 	// VRAM allocation
 	// This first set is bound persistently, so grow notifications are enabled.
-	m_attrib_ring_info.create(VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT, VK_ATTRIB_RING_BUFFER_SIZE_M * 0x100000, vk::heap_pool_default, "attrib buffer", 0x400000, VK_TRUE);
+	m_attrib_ring_info.create(attrib_ring_usage, VK_ATTRIB_RING_BUFFER_SIZE_M * 0x100000, vk::heap_pool_default, "attrib buffer", 0x400000, VK_TRUE);
 	m_fragment_env_ring_info.create(VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_UBO_RING_BUFFER_SIZE_M * 0x100000, vk::heap_pool_low_latency, "fragment env buffer", 0x10000, VK_TRUE);
 	m_vertex_env_ring_info.create(VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_UBO_RING_BUFFER_SIZE_M * 0x100000, vk::heap_pool_default, "vertex env buffer", 0x10000, VK_TRUE);
 	m_fragment_texture_params_ring_info.create(VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_UBO_RING_BUFFER_SIZE_M * 0x100000, vk::heap_pool_low_latency, "fragment texture params buffer", 0x10000, VK_TRUE);
@@ -960,6 +981,7 @@ VKGSRender::~VKGSRender()
 	vk::destroy_pipe_compiler();        // Ensure no pending shaders being compiled
 	spirv::finalize_compiler_context(); // Shut down the glslang compiler
 	m_prog_buffer->clear();             // Delete shader objects
+	vk::vspec::deactivate();            // The next boot decides again
 	m_shader_interpreter.destroy();
 
 	m_persistent_attribute_storage.reset();
@@ -991,6 +1013,11 @@ VKGSRender::~VKGSRender()
 	m_frame_context_storage.clear();
 
 	m_overlay_recording_img.reset();
+	if (m_prerotation_frame)
+	{
+		vk::remove_framebuffers_with_image(m_prerotation_frame->value);
+		m_prerotation_frame.reset();
+	}
 	remote_capture_release(true);
 	m_stencil_mirror_sampler.reset();
 
@@ -1220,6 +1247,13 @@ void VKGSRender::on_unmap_memory_range(const utils::address_range32& range)
 
 void VKGSRender::on_semaphore_acquire_wait()
 {
+	// The RSX is waiting on the guest, so this is as good a moment as the idle loop to put a frame
+	// held for frame generation on screen (VKPresent.cpp, present_after_generated).
+	if (m_present_after_generated)
+	{
+		present_after_generated(false);
+	}
+
 	if (m_flush_requests.pending() ||
 		RSX(m_ctx)->display_ctrl().has_flip_request(rsx::thread::flip_request::emu_requested) ||
 		(m_queue_status & flush_queue_state::deadlock))
@@ -2073,6 +2107,32 @@ bool VKGSRender::on_local_task(rsx::FIFO::state state)
 	}
 	else if (!m_ctx->in_begin_end && state != rsx::FIFO::state::lock_wait)
 	{
+		// Early submit. A long command buffer is otherwise handed to the GPU only at the next
+		// flush point, and the GPU can sit idle until then. Once enough draws are recorded and the
+		// GPU has finished the previous submit, submit what we have. While the GPU is still busy,
+		// ask again only after another eighth of the threshold rather than after every draw.
+		// Off (threshold 0), this is never taken. Contributed by k1r4ct (PR #233).
+		if (m_early_submit_threshold && m_draws_since_submit >= m_early_submit_check_at && !vk::is_uninterruptible())
+		{
+			if (m_primary_cb_list.previous()->poke())
+			{
+				// The buffer submitted below gives its ring memory back once it completes, but the vertex
+				// cache keeps its ranges until the frame ends. Drop them so no later draw reads a reused range.
+				if (const auto resources = res())
+				{
+					resources->vertex_cache->purge();
+				}
+
+				// close_and_submit_command_buffer resets the count and the next check
+				flush_command_queue();
+			}
+			else
+			{
+				// The threshold is at least 256 here, so this is at least 32 draws
+				m_early_submit_check_at = m_draws_since_submit + m_early_submit_threshold / 8;
+			}
+		}
+
 		if (m_ctx->graphics_state & rsx::pipeline_state::framebuffer_reads_dirty)
 		{
 			//This will re-engage locks and break the texture cache if another thread is waiting in access violation handler!
@@ -2083,6 +2143,13 @@ bool VKGSRender::on_local_task(rsx::FIFO::state state)
 			}
 			m_ctx->graphics_state.clear(rsx::pipeline_state::framebuffer_reads_dirty);
 		}
+	}
+
+	// Once per 64 FIFO commands while the RSX is busy. Not while it waits on a lock another thread
+	// holds: the present takes the queue's submit lock.
+	if (m_present_after_generated && state != rsx::FIFO::state::lock_wait)
+	{
+		present_after_generated(false);
 	}
 
 	return true;
@@ -2217,6 +2284,27 @@ bool VKGSRender::load_program()
 			fragment_program,
 			m_pipeline_properties,
 			allow_async, true);
+
+		if (vk::vspec::active())
+		{
+			// ARMSX3: prefer the pipeline specialized on this program's last attribute layout
+			// (vk_vspec.h). Until it is built, and for draws with another layout, the generic one
+			// draws. The cache miss flag, and with it the hint below, is the generic lookup's.
+			m_generic_program = nullptr;
+			m_bound_vtx_spec = {};
+
+			if (m_program && m_vertex_prog && m_fragment_prog &&
+				m_vertex_prog->vspec_inputs && m_vertex_prog->has_observed_vtx_spec)
+			{
+				if (const auto specialized = m_prog_buffer->get_specialized_pipeline(
+					*m_vertex_prog, *m_fragment_prog, m_pipeline_properties, m_vertex_prog->observed_vtx_spec))
+				{
+					m_generic_program = m_program;
+					m_program = specialized;
+					m_bound_vtx_spec = m_vertex_prog->observed_vtx_spec;
+				}
+			}
+		}
 
 		vk::leave_uninterruptible();
 
@@ -2632,6 +2720,95 @@ void VKGSRender::update_vertex_env(u32 id, const vk::vertex_upload_info& vertex_
 			blend_config);
 	}
 
+	if (vk::vspec::active())
+	{
+		// ARMSX3: vertex fetch specialization (vk_vspec.h), for programs built for it. Interpreted
+		// draws take the code below unchanged: the shader interpreter fetches every attribute
+		// itself, knows nothing of the index rebase and has no push constants at offset 32.
+		m_vin_native_mask = 0;
+		m_vin_vertex_offset = 0;
+		m_draw_use_generic = false;
+		m_vspec_draw = m_vertex_prog && m_vertex_prog->vspec_inputs && !is_current_program_interpreted();
+
+		if (m_vspec_draw)
+		{
+			// Built on the stack, because it is read back below
+			s32 attrib_local[32] = {};
+			RSX(m_ctx)->draw_processor()->fill_vertex_layout_state(
+				m_vertex_layout,
+				m_ctx->program.vp_metadata,
+				vertex_info.first_vertex,
+				vertex_info.allocated_vertex_count,
+				attrib_local,
+				vertex_info.persistent_window_offset,
+				vertex_info.volatile_window_offset);
+
+			const u16 referenced = m_ctx->program.vp_metadata.referenced_inputs_mask;
+
+			// Native fetch through vertex input bindings, for the attributes that allow it and on
+			// single draws only
+			if (const auto& clause = REGS(m_ctx)->current_draw_clause;
+				clause.is_single_draw() && !clause.is_trivial_instanced_draw &&
+				(vertex_info.index_info || vertex_info.vertex_index_base == 0))
+			{
+				for (u32 i = 0; i < 16; ++i)
+				{
+					if (!(referenced & (1u << i)))
+					{
+						continue;
+					}
+
+					const u32 x = static_cast<u32>(attrib_local[i * 2]);
+					const u32 y = static_cast<u32>(attrib_local[i * 2 + 1]);
+					const bool is_volatile = (y >> 30) & 1;
+					const auto& view = is_volatile ? m_volatile_attribute_storage : m_persistent_attribute_storage;
+					if (!view || !vk::vspec::native_capable(x, y, view->info.offset))
+					{
+						continue;
+					}
+
+					m_vin_offsets[i] = view->info.offset + (y & 0x1FFFFFFF);
+					m_vin_native_mask |= (1u << i);
+				}
+
+				if (m_vin_native_mask && vertex_info.index_info)
+				{
+					// Vertex input indexes from the binding offset, so rebase the indices on the GPU
+					// and tell the shader-side fetches that the base is already applied.
+					m_vin_vertex_offset = -static_cast<s32>(vertex_info.vertex_index_base);
+					dst->vertex_base_index = 0;
+					dst->vertex_index_offset = vertex_info.vertex_index_offset + vertex_info.vertex_index_base;
+				}
+			}
+
+			std::memcpy(dst->attrib_data, attrib_local, sizeof(attrib_local));
+
+			// The layout this program's next pipeline gets specialized on. A specialized shader
+			// trusts its specialization, so a draw whose layout differs uses the generic variant.
+			const std::array<u32, 16> observed = vk::vspec::from_layout(attrib_local, referenced, m_vin_native_mask);
+			m_vertex_prog->observed_vtx_spec = observed;
+			m_vertex_prog->has_observed_vtx_spec = vk::vspec::any(observed);
+			m_draw_use_generic = vk::vspec::any(m_bound_vtx_spec) && m_bound_vtx_spec != observed;
+
+			// The per-draw offsets the vertex shader reads from push constants (VKVertexProgram.cpp)
+			const u32 push_block[] =
+			{
+				vs_constant_id_offset,
+				vertex_context_offset,
+				fs_constant_id_offset,
+				fs_context_offset,
+				fs_texture_base_index,
+				fs_stipple_pattern_offset
+			};
+			static_assert(sizeof(push_block) == vk::vspec::push_constant_size);
+			vkCmdPushConstants(*m_current_command_buffer, m_program->layout(), VK_SHADER_STAGE_VERTEX_BIT,
+				vk::vspec::push_constant_offset, sizeof(push_block), push_block);
+
+			m_vertex_layout_ring_info.unmap();
+			return;
+		}
+	}
+
 	// Now actually fill in the data
 	RSX(m_ctx)->draw_processor()->fill_vertex_layout_state(
 		m_vertex_layout,
@@ -2679,6 +2856,10 @@ void VKGSRender::patch_transform_constants(rsx::context* /*ctx*/, u32 index, u32
 
 void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore wait_semaphore, VkSemaphore signal_semaphore, VkPipelineStageFlags pipeline_stage_flags)
 {
+	// Every submit of m_current_command_buffer passes here: early submit counts from zero again
+	m_draws_since_submit = 0;
+	m_early_submit_check_at = m_early_submit_threshold ? m_early_submit_threshold : umax;
+
 	RSX_PROF_SCOPE(submit);
 
 	ensure(!m_queue_status.test_and_set(flush_queue_state::flushing));

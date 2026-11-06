@@ -16,6 +16,7 @@ import java.nio.FloatBuffer
 import java.util.concurrent.locks.LockSupport
 import kotlin.math.PI
 import kotlin.math.cos
+import kotlin.math.exp
 import kotlin.math.floor
 import kotlin.math.sin
 
@@ -56,6 +57,9 @@ class XmbGlView(context: Context) : TextureView(context), TextureView.SurfaceTex
      */
     @Volatile var mood: String? = null
 
+    /** Moving the controller moves XMB mode's sparkles, as on the console. */
+    private val sparkleMotion = com.armsx2.ui.xmb.XmbSparkleMotion(context) { display?.rotation ?: android.view.Surface.ROTATION_0 }
+
     init {
         surfaceTextureListener = this
         // Non-opaque so that if EGL/GLES3 init ever fails and nothing renders, the layer behind
@@ -65,7 +69,7 @@ class XmbGlView(context: Context) : TextureView(context), TextureView.SurfaceTex
     }
 
     override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
-        thread = RenderThread(st, w, h, context.applicationContext, drive = { drive?.invoke() ?: 0f }, mood = mood) { ok -> post { onGlStatus?.invoke(ok) } }.also {
+        thread = RenderThread(st, w, h, context.applicationContext, drive = { drive?.invoke() ?: 0f }, mood = mood, motion = sparkleMotion) { ok -> post { onGlStatus?.invoke(ok) } }.also {
             it.paused = windowVisibility != VISIBLE
             it.start()
         }
@@ -100,6 +104,7 @@ class XmbGlView(context: Context) : TextureView(context), TextureView.SurfaceTex
         private val appContext: Context,
         private val drive: () -> Float,
         private val mood: String?,
+        private val motion: com.armsx2.ui.xmb.XmbSparkleMotion,
         private val onStatus: (Boolean) -> Unit,
     ) : Thread("xmb-gl") {
         @Volatile private var running = true
@@ -114,8 +119,8 @@ class XmbGlView(context: Context) : TextureView(context), TextureView.SurfaceTex
         private var bgProg = 0
         private var waveProg = 0
         private var bgVao = 0
-        private var sparkProg = 0
-        private var sparkVao = 0
+        /** XMB mode's sparkles, the console's particle field (XmbParticles). */
+        private var particles: XmbParticles? = null
         private var gridVao = 0
         private var gridIndexCount = 0
         private var splineTex = 0
@@ -124,6 +129,17 @@ class XmbGlView(context: Context) : TextureView(context), TextureView.SurfaceTex
             ByteBuffer.allocateDirect(STEX_W * STEX_H * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
         private val cp = FloatArray(28)
         private var startNanos = 0L
+
+        // The wind on the sparkles from moving the controller, in clip-space units a second across,
+        // and how scattered a hard shake has left them. Only the controller's motion: the console's
+        // sparkles take no notice of the D-pad or the sticks (user, against the real XMB, 11-04).
+        private var sparkVelocity = 0f
+        private var sparkScatter = 0f
+        private var sparkLastNanos = 0L
+
+        // The firmware's iridescent swirl for the sparkles' colours: white until it is read.
+        private var iridTex = 0
+        private var iridLoaded = false
 
         /** XMB mode's wave, as the console's firmware makes it; made the first time XMB mode shows. */
         private var firmwareWave: XmbFirmwareWave? = null
@@ -145,7 +161,8 @@ class XmbGlView(context: Context) : TextureView(context), TextureView.SurfaceTex
                 if (paused) {
                     // Woken by the setter or by finish(). park() may also return early, which
                     // only means another pass over this check. The clock moves with the pause, so
-                    // the wave comes back where it stopped.
+                    // the wave comes back where it stopped. No sensors while nothing is shown.
+                    motion.want(false)
                     val parkedAt = System.nanoTime()
                     LockSupport.park(this)
                     startNanos += System.nanoTime() - parkedAt
@@ -164,11 +181,15 @@ class XmbGlView(context: Context) : TextureView(context), TextureView.SurfaceTex
                 val leftMs = FRAME_TARGET_MS - (System.nanoTime() - frameStart) / 1_000_000L
                 if (leftMs > 1) runCatching { sleep(leftMs) }
             }
+            motion.want(false)
             teardown()
         }
 
         // ---- rendering ----
         private fun drawFrame(timeSec: Float) {
+            // The sensors behind the sparkles run only while XMB mode's wave is up.
+            motion.want(com.armsx2.ui.theme.LibraryBackgroundColorPreferences.xmbModeGl)
+
             // The library's wave; XMB mode draws the console's (below) and has no use for it.
             if (!com.armsx2.ui.theme.LibraryBackgroundColorPreferences.xmbModeGl || firmwareWaveFailed) {
                 fillSpline(timeSec)
@@ -237,7 +258,7 @@ class XmbGlView(context: Context) : TextureView(context), TextureView.SurfaceTex
                     val push = drive()
                     wave.drive = push
                     wave.draw(timeSec, width, height, com.armsx2.ui.xmb.XmbOriginalColors.bootWave * (1f + push * 0.35f))
-                    drawSparks(timeSec)
+                    drawParticles()
                     return
                 }
             }
@@ -288,21 +309,66 @@ class XmbGlView(context: Context) : TextureView(context), TextureView.SurfaceTex
             GLES30.glDrawElements(GLES30.GL_TRIANGLE_STRIP, gridIndexCount, GLES30.GL_UNSIGNED_SHORT, 0)
             GLES30.glBindVertexArray(0)
 
-            // XMB mode: the console's sparkles, specks of light drifting and twinkling about the wave.
-            if (com.armsx2.ui.theme.LibraryBackgroundColorPreferences.xmbModeGl) drawSparks(timeSec)
         }
 
-        private fun drawSparks(timeSec: Float) {
-            GLES30.glEnable(GLES30.GL_BLEND)
-            GLES30.glBlendFuncSeparate(GLES30.GL_SRC_ALPHA, GLES30.GL_ONE, GLES30.GL_ZERO, GLES30.GL_ONE)
-            GLES30.glUseProgram(sparkProg)
-            GLES30.glUniform1f(GLES30.glGetUniformLocation(sparkProg, "uTime"), timeSec)
-            GLES30.glUniform1f(GLES30.glGetUniformLocation(sparkProg, "uSize"), height / 360f)
-            GLES30.glUniform1f(GLES30.glGetUniformLocation(sparkProg, "uLevel"), com.armsx2.ui.xmb.XmbOriginalColors.bootWave)
-            GLES30.glBindVertexArray(sparkVao)
-            GLES30.glDrawArrays(GLES30.GL_POINTS, 0, SPARKS)
-            GLES30.glBindVertexArray(0)
-            GLES30.glBlendFunc(GLES30.GL_SRC_ALPHA, GLES30.GL_ONE_MINUS_SRC_ALPHA)
+        /**
+         * The console's sparkles (XmbParticles): born on the wave's surface as it is this frame, moved
+         * on, and drawn over it. Kept out of XMB mode's boot, as the console keeps them out of its own:
+         * they come in with the icons.
+         */
+        private fun drawParticles() {
+            val dt = stepSparkMotion()
+            val wave = firmwareWave ?: return
+            val p = particles ?: return
+            // The wave's projection (XmbWaveModel.update), which the particles' camera shares.
+            val aspect = width.toFloat() / height.coerceAtLeast(1)
+            val sx = WAVE_SY / maxOf(aspect, 16f / 9f)
+            val sy = sx * aspect
+            p.setWave(wave.controlPoints, sx, sy)
+            // The wind, from clip-space units a second into world ones at the field's middle depth.
+            p.step(dt, sparkVelocity * FIELD_DEPTH / sx, 0f, sparkScatter)
+            val level = com.armsx2.ui.xmb.XmbOriginalColors.bootWave * com.armsx2.ui.xmb.XmbOriginalColors.bootSparkles
+            p.draw(sx, sy, level, iridescentTexture(), if (iridLoaded) 1f else 0f)
+        }
+
+        /**
+         * The wind on the sparkle field from the controller's motion (XmbSparkleMotion's push, in g):
+         * the push speeds it up, friction slows it, so a swing carries the sparkles the way the pad
+         * went and a tip keeps them drifting downhill. A hard shake scatters them, fading out.
+         */
+        private fun stepSparkMotion(): Float {
+            val now = System.nanoTime()
+            val dt = if (sparkLastNanos == 0L) 0f else ((now - sparkLastNanos) / 1e9f).coerceIn(0f, 0.1f)
+            sparkLastNanos = now
+            sparkVelocity = ((sparkVelocity + motion.push * SPARK_PUSH * dt) * exp(-SPARK_FRICTION * dt))
+                .coerceIn(-SPARK_MAX_SPEED, SPARK_MAX_SPEED)
+            sparkScatter = maxOf(sparkScatter * exp(-SPARK_SCATTER_FADE * dt), motion.shake)
+            return dt
+        }
+
+        /** The iridescent swirl, uploaded once the firmware has been read (white until then). */
+        private fun iridescentTexture(): Int {
+            if (iridTex == 0) {
+                val t = IntArray(1)
+                GLES30.glGenTextures(1, t, 0)
+                iridTex = t[0]
+                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, iridTex)
+                GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
+                GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+                GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+                GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+                val white = ByteBuffer.allocateDirect(4).put(byteArrayOf(-1, -1, -1, -1)).also { it.position(0) }
+                GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA, 1, 1, 0, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, white)
+            }
+            if (!iridLoaded) {
+                com.armsx2.ui.xmb.XmbWaveFirmware.iridescent?.let { px ->
+                    GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, iridTex)
+                    val buf = ByteBuffer.allocateDirect(px.size).put(px).also { it.position(0) }
+                    GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA, 128, 128, 0, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, buf)
+                    iridLoaded = true
+                }
+            }
+            return iridTex
         }
 
         /** Port of linkev writeDisplacementTexture: 28 control points per row from band + legacy
@@ -347,8 +413,10 @@ class XmbGlView(context: Context) : TextureView(context), TextureView.SurfaceTex
             bgProg = link(BG_VS, BG_FS)
             waveProg = link(WAVE_VS, WAVE_FS)
             bgVao = makeFullscreenQuad()
-            sparkProg = link(SPARK_VS, SPARK_FS)
-            sparkVao = makeSparks()
+            // The sparkles failing to come up must not take the wave down with them.
+            particles = runCatching { XmbParticles().also { it.init() } }
+                .onFailure { Log.w(TAG, "XMB sparkles init failed", it) }
+                .getOrNull()
             makeGrid(100)
             makeSplineTexture()
         }
@@ -387,30 +455,6 @@ class XmbGlView(context: Context) : TextureView(context), TextureView.SurfaceTex
             val loc = GLES30.glGetAttribLocation(bgProg, "aPos")
             GLES30.glEnableVertexAttribArray(loc)
             GLES30.glVertexAttribPointer(loc, 2, GLES30.GL_FLOAT, false, 0, 0)
-            GLES30.glBindVertexArray(0)
-            return vao[0]
-        }
-
-        /** Each speck: where it starts (x, y in clip space, gathered about the wave), its drift, a phase. */
-        private fun makeSparks(): Int {
-            val rnd = java.util.Random(0x5EEDL)
-            val data = FloatArray(SPARKS * 4)
-            for (i in 0 until SPARKS) {
-                data[i * 4] = rnd.nextFloat() * 2.4f - 1.2f
-                // About the wave, which XMB mode draws lower (see the wave's uXmb).
-                data[i * 4 + 1] = (rnd.nextGaussian().toFloat() * 0.32f - 0.15f).coerceIn(-0.9f, 0.8f)
-                data[i * 4 + 2] = 0.006f + rnd.nextFloat() * 0.018f
-                data[i * 4 + 3] = rnd.nextFloat()
-            }
-            val vao = IntArray(1); GLES30.glGenVertexArrays(1, vao, 0); GLES30.glBindVertexArray(vao[0])
-            val buf = IntArray(1); GLES30.glGenBuffers(1, buf, 0)
-            GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, buf[0])
-            val fb = ByteBuffer.allocateDirect(data.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
-            fb.put(data).position(0)
-            GLES30.glBufferData(GLES30.GL_ARRAY_BUFFER, data.size * 4, fb, GLES30.GL_STATIC_DRAW)
-            val loc = GLES30.glGetAttribLocation(sparkProg, "aSpark")
-            GLES30.glEnableVertexAttribArray(loc)
-            GLES30.glVertexAttribPointer(loc, 4, GLES30.GL_FLOAT, false, 0, 0)
             GLES30.glBindVertexArray(0)
             return vao[0]
         }
@@ -573,33 +617,21 @@ void main() {
   gl_Position = vec4(aPos, 0.0, 1.0);
 }"""
 
-        private const val SPARKS = 56
+        // The sparkles' wind from moving the controller (XmbSparkleMotion): slow, as on the console. A
+        // firm swing drifts the field a few hundredths of the screen a second, a 15 degree tip about
+        // as much, never faster than a tenth of the screen a second, and it glides to a stop over a
+        // couple of seconds. (User 11-04: five times this was "far too fast" against the real XMB.)
+        private const val SPARK_PUSH = 1.2f
+        private const val SPARK_FRICTION = 0.8f
+        private const val SPARK_MAX_SPEED = 0.2f
+        private const val SPARK_SCATTER_FADE = 2.5f
 
+        /** XmbWaveModel's projection height (its SY), which the particles' camera shares. */
+        private const val WAVE_SY = 2.0057f
 
-        private const val SPARK_VS = """#version 300 es
-precision highp float;
-in vec4 aSpark;
-uniform float uTime;
-uniform float uSize;
-out float vAlpha;
-void main() {
-  float x = mod(aSpark.x - uTime * aSpark.z + 1.2, 2.4) - 1.2;
-  float y = aSpark.y + 0.025 * sin(uTime * 0.5 + aSpark.w * 6.2832);
-  gl_Position = vec4(x, y, 0.0, 1.0);
-  float tw = 0.5 + 0.5 * sin(uTime * (0.7 + aSpark.w * 1.6) + aSpark.w * 40.0);
-  vAlpha = tw * tw * tw;
-  gl_PointSize = uSize * (1.0 + fract(aSpark.w * 7.31) * 1.6);
-}"""
+        /** The sparkle field's middle distance from the camera (the RSX capture's median clip w). */
+        private const val FIELD_DEPTH = 8.6f
 
-        private const val SPARK_FS = """#version 300 es
-precision mediump float;
-in float vAlpha;
-out vec4 oColor;
-uniform float uLevel;
-void main() {
-  float a = smoothstep(0.5, 0.0, length(gl_PointCoord - vec2(0.5)));
-  oColor = vec4(1.0, 1.0, 1.0, a * a * vAlpha * 0.8 * uLevel);
-}"""
 
         private const val BG_FS = """#version 300 es
 precision highp float;

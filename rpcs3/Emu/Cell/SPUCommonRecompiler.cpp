@@ -3079,12 +3079,12 @@ std::vector<u32> spu_thread::discover_functions(u32 base_addr, std::span<const u
 
 		const u32 func = op_branch_targets(addr, op)[0];
 
-		if (func == umax || addr + 4 == func || func == addr || std::count(addrs.begin(), addrs.end(), func))
+		if (func == umax || addr + 4 == func || func == addr || std::ranges::contains(addrs, func))
 		{
 			continue;
 		}
 
-		if (std::count(calls.begin(), calls.end(), func))
+		if (std::ranges::contains(calls, func))
 		{
 			// Cannot call another call instruction (link is overwritten)
 			continue;
@@ -3115,7 +3115,7 @@ std::vector<u32> spu_thread::discover_functions(u32 base_addr, std::span<const u
 
 			const u32 target = op_branch_targets(next, op)[0];
 
-			if (target == umax || addr + 4 == target || target == addr || std::count(addrs.begin(), addrs.end(), target))
+			if (target == umax || addr + 4 == target || target == addr || std::ranges::contains(addrs, target))
 			{
 				break;
 			}
@@ -3183,7 +3183,7 @@ std::vector<u32> spu_thread::discover_functions(u32 base_addr, std::span<const u
 
 			addr = SPU_LS_SIZE + 4; // Terminate the next condition, no further checks needed
 
-			if (std::count(addrs.begin(), addrs.end(), func))
+			if (std::ranges::contains(addrs, func))
 			{
 				break;
 			}
@@ -3234,7 +3234,7 @@ std::vector<u32> spu_thread::discover_functions(u32 base_addr, std::span<const u
 				continue;
 			}
 
-			if (std::count(addrs.begin(), addrs.end(), func))
+			if (std::ranges::contains(addrs, func))
 			{
 				break;
 			}
@@ -9561,25 +9561,20 @@ spu_program spu_recompiler_base::analyse(const be_t<u32>* ls, u32 entry_point, s
 				// match and simply keeps the old path. The sibling pattern at 0x17ff8 was also
 				// refused and is deliberately NOT listed: it has not been disassembled, and the
 				// safety condition here is a property of the code, not of the function's name.
-				// NOTE: PUTLLC16's success notify is aimed at the wrong address.
-				//
-				// PUTLLC16's success path notifies on the RESERVATION COUNTER word
-				// (SPULLVMRecompiler.cpp:1464 passes rptr, built from reserv_base_addr =
-				// vm::g_reservations), but every reservation waiter in this tree parks on
-				// g_resrv_waiters_count[...].wait_flag instead. atomic_wait_engine hashes the address,
-				// so that notify and those waits never meet: a PUTLLC16 commit advances the counter and
-				// changes the line while no parked SPU or PPU is woken, and they recover only via their
-				// 50-200us poll timeouts.
+				// PUTLLC16's success notify used to miss every waiter: it woke waiters on the
+				// RESERVATION COUNTER word, while every reservation waiter in this tree parks on
+				// g_resrv_waiters_count[...].wait_flag, so a PUTLLC16 commit changed the line and
+				// woke no one, and waiters recovered only on their 50-200us poll timeouts. Both
+				// success paths in SPULLVMRecompiler.cpp now call vm::reservation_notifier_notify
+				// with the version they replaced, the same wake do_putllc gives.
 				//
 				// Upstream never trips this because its whitelist holds only a "disabled_"-prefixed
 				// placeholder, so PUTLLC16 is never installed. Admitting this hash made the path LIVE,
 				// and the gate is a hash of guest bytes -- so every title shipping the same cellSync
 				// build inherits it, not just the one it was verified against.
 				//
-				// KEPT: withdrawing it was measured against Soul Calibur V's hang and changed nothing,
-				// and Sonic '06 measured faster WITH it -- waiters still recover on their 50-200us poll
-				// timeouts, so the missed wake costs latency rather than correctness. The notify target
-				// is still wrong and should be fixed at the source rather than by dropping this entry.
+				// KEPT through the missed wake: withdrawing it was measured against Soul Calibur V's
+				// hang and changed nothing, and Sonic '06 measured faster WITH it.
 				"WA0WuYLrZXrcc6Jyw5EMgYRV2bwo"sv,
 			};
 

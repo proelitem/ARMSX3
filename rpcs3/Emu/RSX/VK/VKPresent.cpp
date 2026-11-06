@@ -30,6 +30,8 @@
 #include "Emu/RSX/NV47/HW/context_accessors.define.h"
 
 extern atomic_t<bool> g_user_asked_for_screenshot;
+extern atomic_t<bool> g_flush_pipeline_cache_requested;
+extern atomic_t<u64> g_pipeline_cache_flush_generation;
 extern atomic_t<recording_mode> g_recording_mode;
 // android/src/remote_play.cpp
 extern atomic_t<u32> g_remote_play_max_size;
@@ -80,6 +82,11 @@ bool VKGSRender::reinitialize_swapchain()
 	{
 		return false;
 	}
+
+	// A frame still held for frame generation goes to the swapchain it was acquired from while that
+	// swapchain still exists; the lost-surface path below destroys it first thing. present() skips
+	// it when the swapchain is already unusable.
+	present_after_generated(true);
 
 	if (m_surface_lost)
 	{
@@ -192,6 +199,14 @@ bool VKGSRender::reinitialize_swapchain()
 		vk::remove_framebuffers_with_image(m_swapchain->get_image(i));
 	}
 
+	// The upright frame of a turned swapchain is shaped for that swapchain (see flip()); the next
+	// turned flip makes one for the new one. The queues are idle, so it can go now.
+	if (m_prerotation_frame)
+	{
+		vk::remove_framebuffers_with_image(m_prerotation_frame->value);
+		m_prerotation_frame.reset();
+	}
+
 	// Reset frame context storage
 	for (auto& ctx : m_frame_context_storage)
 	{
@@ -208,8 +223,13 @@ bool VKGSRender::reinitialize_swapchain()
 	m_deferred_present_frame = nullptr;
 	m_framegen_blit_cb_count = 0;
 
+	// Presented at the top of this function; cleared again so nothing can point into freed contexts.
+	m_present_after_generated = nullptr;
+	m_held_generated_count = 0;
+
 	// Read with the same setting init() reads to pick the present mode. See m_swapchain_framegen.
 	m_swapchain_framegen = g_cfg.video.frame_generation != frame_generation_mode::off;
+	m_swapchain_prerotation = !g_cfg.video.disable_swapchain_prerotation;
 
 	// Rebuild swapchain. Old swapchain destruction is handled by the init_swapchain call
 	if (!m_swapchain->init(m_swapchain_dims.width, m_swapchain_dims.height))
@@ -303,9 +323,17 @@ bool VKGSRender::reinitialize_swapchain()
 // Best-effort throughout. A generated frame is an extra, so every failure path here simply
 // returns and lets the real frame present normally -- dropping an interpolated frame is invisible,
 // while stalling or presenting a torn one is not.
-vk::command_buffer_chunk* VKGSRender::present_generated_frame(VkImage src)
+vk::command_buffer_chunk* VKGSRender::present_generated_frame(VkImage src, bool hold_present)
 {
 	if (src == VK_NULL_HANDLE || swapchain_unavailable || m_swapchain->is_headless())
+	{
+		return nullptr;
+	}
+
+	// A turned swapchain takes only frames captured from its own turned images (flip(), the turn).
+	// A frame generated at game resolution would be blitted in unturned: drop it. That can only be
+	// one left over from before the swapchain turned.
+	if (m_swapchain->get_pre_rotation() && vk::frame_gen::generated_at_game_resolution())
 	{
 		return nullptr;
 	}
@@ -486,8 +514,12 @@ vk::command_buffer_chunk* VKGSRender::present_generated_frame(VkImage src)
 		VkImageBlit region = {};
 		region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
 		region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-		region.srcOffsets[1] = { s32(m_swapchain_dims.width), s32(m_swapchain_dims.height), 1 };
-		region.dstOffsets[1] = { s32(m_swapchain_dims.width), s32(m_swapchain_dims.height), 1 };
+		// A turned swapchain's images, and the frames captured from them, have the window's axes swapped.
+		const bool turned = m_swapchain->get_pre_rotation() != 0;
+		const s32 copy_w = s32(turned ? m_swapchain->get_image_width() : m_swapchain_dims.width);
+		const s32 copy_h = s32(turned ? m_swapchain->get_image_height() : m_swapchain_dims.height);
+		region.srcOffsets[1] = { copy_w, copy_h, 1 };
+		region.dstOffsets[1] = { copy_w, copy_h, 1 };
 
 		vkCmdBlitImage(*cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 			// NEAREST: source and destination are the same size, so linear filtering buys nothing and
@@ -546,11 +578,114 @@ vk::command_buffer_chunk* VKGSRender::present_generated_frame(VkImage src)
 	// acquired image.
 	cmd->flush();
 
+	if (hold_present && m_held_generated_count < std::size(m_held_generated_presents))
+	{
+		// Goes out from present_after_generated, in order, ahead of the real frame it leads into.
+		m_held_generated_presents[m_held_generated_count++] = { present_sem, image };
+		return cmd;
+	}
+
 	m_swapchain->present(present_sem, image);
 	return cmd;
 }
 
-void VKGSRender::present(vk::frame_context_t *ctx)
+void VKGSRender::present_after_generated(bool wait)
+{
+	vk::frame_context_t* const ctx = m_present_after_generated;
+
+	if (!ctx)
+	{
+		return;
+	}
+
+	const u64 now = get_system_time();
+
+	if (wait)
+	{
+		for (u32 i = 0; i < ctx->framegen_cb_count; ++i)
+		{
+			// A buffer the ring has reset since was waited for by that reset.
+			if (ctx->framegen_cbs[i]->reset_id == m_present_after_generated_ids[i])
+			{
+				ctx->framegen_cbs[i]->wait(FRAME_PRESENT_TIMEOUT);
+			}
+		}
+
+		m_held_presents_forced++;
+		m_held_presents_forced_us += get_system_time() - now;
+	}
+	else
+	{
+		// Polled from the RSX thread's idle and wait loops, which can come round every few
+		// microseconds; one fence query per 100us is plenty for a present. Never from inside a
+		// flush, which is the one state the local task refuses to run in either.
+		if (now - m_present_after_generated_poll < 100 || (m_queue_status & flush_queue_state::flushing))
+		{
+			return;
+		}
+
+		m_present_after_generated_poll = now;
+
+		for (u32 i = 0; i < ctx->framegen_cb_count; ++i)
+		{
+			if (ctx->framegen_cbs[i]->reset_id == m_present_after_generated_ids[i] &&
+				!ctx->framegen_cbs[i]->poke())
+			{
+				return;
+			}
+		}
+
+		m_held_presents_polled++;
+	}
+
+	m_present_after_generated = nullptr;
+
+	// Same order the unheld path presents in: the generated frames, then the real frame they lead
+	// into. The blits behind all of them are finished, so none of these presents waits.
+	if (m_held_generated_count)
+	{
+		if (!swapchain_unavailable)
+		{
+			vk::acquire_global_submit_lock();
+
+			for (u32 i = 0; i < m_held_generated_count; ++i)
+			{
+				m_swapchain->present(m_held_generated_presents[i].semaphore, m_held_generated_presents[i].image);
+			}
+
+			vk::release_global_submit_lock();
+		}
+
+		m_held_generated_count = 0;
+	}
+
+	present(ctx, true);
+
+	if (!m_held_presents_window)
+	{
+		m_held_presents_window = now;
+	}
+	else if (now - m_held_presents_window >= 10'000'000)
+	{
+		rsx_log.notice("Frame generation: %u real frames went out as soon as their generated frames finished, %u at the next flip (%.1f ms waited there), in the last %.0f s.",
+			m_held_presents_polled, m_held_presents_forced, m_held_presents_forced_us / 1000.,
+			(now - m_held_presents_window) / 1'000'000.);
+
+		m_held_presents_window = now;
+		m_held_presents_polled = m_held_presents_forced = 0;
+		m_held_presents_forced_us = 0;
+	}
+}
+
+void VKGSRender::on_fifo_idle()
+{
+	if (m_present_after_generated)
+	{
+		present_after_generated(false);
+	}
+}
+
+void VKGSRender::present(vk::frame_context_t *ctx, bool lock_queue)
 {
 	// Both of these are torn down by frame_context_cleanup, and frame generation's deferred
 	// present is the one caller that can hold a context across the throttle that reclaims them.
@@ -568,7 +703,15 @@ void VKGSRender::present(vk::frame_context_t *ctx)
 
 	if (!swapchain_unavailable)
 	{
-		switch (VkResult error = m_swapchain->present(ctx->present_wait_semaphore, ctx->present_image))
+		// A present frame generation held back goes out mid-frame, while the offloader may be
+		// submitting the next frame's work to this same queue, so it takes the lock the queue's
+		// other users take. Only after the flush above: that can wait on the offloader, and the
+		// offloader on this lock.
+		if (lock_queue) vk::acquire_global_submit_lock();
+		const VkResult present_result = m_swapchain->present(ctx->present_wait_semaphore, ctx->present_image);
+		if (lock_queue) vk::release_global_submit_lock();
+
+		switch (VkResult error = present_result)
 		{
 		case VK_SUCCESS:
 			m_suboptimal_present_count = 0;
@@ -594,6 +737,19 @@ void VKGSRender::present(vk::frame_context_t *ctx)
 			// be far worse than the problem. So act on it only once it has persisted, and only once
 			// per surface size -- a rebuild that does not clear the condition must not be retried
 			// forever.
+			// Turning the device from one landscape to the other keeps the size, so nothing else
+			// rebuilds for it, and a swapchain pre-rotated for the old turn leaves the compositor
+			// turning every frame again. Rebuild for the new turn at once. Asked only while
+			// pre-rotation is allowed; a turn it does not apply (270, see swapchain.cpp) was what the
+			// surface asked for at build time too, so it does not read as a change.
+			if (m_swapchain_prerotation && m_swapchain->surface_rotation_changed())
+			{
+				rsx_log.notice("Swapchain: the surface turned; rebuilding the swapchain for its new rotation.");
+				m_suboptimal_present_count = 0;
+				should_reinitialize_swapchain = true;
+				break;
+			}
+
 			if (++m_suboptimal_present_count > 8 && m_suboptimal_handled_at != m_swapchain_dims.width)
 			{
 				m_suboptimal_handled_at = m_swapchain_dims.width;
@@ -915,9 +1071,45 @@ void VKGSRender::queue_swap_request()
 	// reclaims what they drew their overlays from.
 	m_current_frame->framegen_cb_count = 0;
 
+	// Hold every present of this flip after the first generated one, real frame included, until
+	// the GPU has finished the generated frames.
+	//
+	// Android lets a producer have two buffers queued and makes the third queueBuffer wait for the
+	// one before it to finish rendering ("Throttling EGL Production" in BufferQueueProducer, which
+	// the Vulkan swapchain connects through as well). A generated frame and the real frame it leads
+	// into are queued back to back, and the generated one is only finished once this frame's whole
+	// GPU frame and the interpolation behind it are. So the real frame's present sat in that wait,
+	// on the RSX thread, every frame: profiled on the Odin 3 in Web of Shadows it was 40% of the
+	// RSX thread's time, and with the RSX parked the game could not feed it the next frame. That
+	// is the wait removed further down ("The CPU wait that used to be here is GONE"), back through
+	// the window system instead of through our own fence.
+	//
+	// Held, the RSX thread goes straight on with the next frame, and the presents go out from its
+	// idle and wait loops the moment the blits are done (present_after_generated). Nothing reaches
+	// the screen later than before: the display could not show the frame before the GPU finished
+	// it anyway. ARMSX3_FG_PRESENT_WAIT=1 presents straight away, as before.
+	static const bool s_hold_presents = []
+	{
+		const char* env = std::getenv("ARMSX3_FG_PRESENT_WAIT");
+		const bool hold = !(env && env[0] == '1');
+		rsx_log.notice("Frame generation: %s", hold
+			? "the real frame is presented once its generated frames finish on the GPU, without the RSX thread waiting for them."
+			: "the real frame is presented straight away and the RSX thread waits for the GPU (ARMSX3_FG_PRESENT_WAIT=1).");
+		return hold;
+	}();
+
+	const bool hold_presents = s_hold_presents && !m_framegen_pipelined;
+
+	// The previous flip's held frames go out ahead of this flip's. present_frame has done this
+	// already; repeated so the order cannot depend on it.
+	present_after_generated(true);
+
 	for (u32 i = 0; i < generated; ++i)
 	{
-		auto* cb = present_generated_frame(vk::frame_gen::generated_image(i));
+		// The first one that goes out queues behind the previous real frame, which is long finished,
+		// so it is presented now. Every later one queues behind a frame of this flip.
+		auto* cb = present_generated_frame(vk::frame_gen::generated_image(i),
+			hold_presents && m_current_frame->framegen_cb_count > 0);
 
 		if (cb) { s_fg_shown++; } else { s_fg_dropped++; }
 
@@ -987,8 +1179,25 @@ void VKGSRender::queue_swap_request()
 			m_deferred_present_frame = nullptr;
 		}
 
-		// Set up a present request for this frame as well
-		present(m_current_frame);
+		if (hold_presents && m_current_frame->framegen_cb_count)
+		{
+			// Held: see above the generated presents. Kept in its context, which nothing reclaims
+			// without presenting it first (frame_context_cleanup), and the next flip presents it
+			// before anything of its own at the latest.
+			m_present_after_generated = m_current_frame;
+
+			for (u32 i = 0; i < m_current_frame->framegen_cb_count; ++i)
+			{
+				m_present_after_generated_ids[i] = m_current_frame->framegen_cbs[i]->reset_id;
+			}
+
+			m_present_after_generated_poll = 0;
+		}
+		else
+		{
+			// Set up a present request for this frame as well
+			present(m_current_frame);
+		}
 	}
 
 	// Grab next cb in line and make it usable
@@ -1024,6 +1233,14 @@ void VKGSRender::queue_swap_request()
 void VKGSRender::frame_context_cleanup(vk::frame_context_t *ctx)
 {
 	ensure(ctx->swap_command_buffer);
+
+	// A frame still held for frame generation goes out before anything of it is reclaimed. Here
+	// rather than at the callers because every reclaim path comes through here, including the one
+	// the pipelined attempt above never found: check_present_status, from a hard sync mid-frame.
+	if (ctx == m_present_after_generated) [[unlikely]]
+	{
+		present_after_generated(true);
+	}
 
 	if (rsx::prof::enabled()) [[unlikely]] rsx::prof::g_frame_cleanups++;
 
@@ -1251,6 +1468,19 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
 		return false;
 	}
 
+	// The previous frame, if frame generation is still holding it, goes out before this one starts.
+	// Normally its blits finished long ago and it went out from the idle loop; waiting here means
+	// the GPU is a whole frame behind, which is the wait the game should feel.
+	present_after_generated(true);
+
+	// Serviced before the swapchain checks below, so it also runs while the surface is gone
+	// (the app was just sent to the background and the frame will not be presented).
+	if (g_flush_pipeline_cache_requested.exchange(false)) [[unlikely]]
+	{
+		m_device->flush_pipeline_cache();
+		g_pipeline_cache_flush_generation++;
+	}
+
 	if (!info.emu_flip)
 	{
 		// Native UI flips are requested from the local task. Submit outstanding work first.
@@ -1368,6 +1598,12 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
 	// presented right after each generated one replaced it, and measured on the Odin 3 only 51 of
 	// 60 refreshes showed a new frame. Rebuild on a change, as for VSync.
 	if (m_swapchain_framegen != (g_cfg.video.frame_generation != frame_generation_mode::off))
+	{
+		swapchain_unavailable = true;
+	}
+
+	// Pre-rotation is decided when the swapchain is built too (swapchain.cpp): rebuild on a change.
+	if (m_swapchain_prerotation != !g_cfg.video.disable_swapchain_prerotation)
 	{
 		swapchain_unavailable = true;
 	}
@@ -1700,6 +1936,49 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
 	VkImageLayout target_layout = m_swapchain->is_headless()
 		? present_layout
 		: VK_IMAGE_LAYOUT_UNDEFINED;
+
+	// Pre-rotation (swapchain_WSI::init). A turned swapchain's images are the window turned on its
+	// side. Everything below assembles the frame exactly as it always has, in the window's own
+	// shape, but into m_prerotation_frame; the frame is turned into the swapchain image as the last
+	// pass before the present. So no writer below (clear, blit, upscalers, calibration, overlays,
+	// frame dump) changes at all. Frame generation is the one thing that moves: see the turn.
+	const u32 pre_rotation = m_swapchain->is_headless() ? 0u : m_swapchain->get_pre_rotation();
+	const VkImage swapchain_image = target_image;
+
+	if (pre_rotation)
+	{
+		// The size every framebuffer and region below is cut to.
+		const u32 frame_w = m_swapchain_dims.width;
+		const u32 frame_h = m_swapchain_dims.height;
+		const VkFormat frame_format = m_swapchain->get_surface_format();
+
+		if (m_prerotation_frame &&
+			(m_prerotation_frame->width() != frame_w || m_prerotation_frame->height() != frame_h || m_prerotation_frame->format() != frame_format))
+		{
+			vk::remove_framebuffers_with_image(m_prerotation_frame->value);
+			vk::get_resource_manager()->dispose(m_prerotation_frame);
+		}
+
+		if (!m_prerotation_frame)
+		{
+			m_prerotation_frame = std::make_unique<vk::viewable_image>(*m_device, m_device->get_memory_mapping().device_local, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+				VK_IMAGE_TYPE_2D, frame_format, frame_w, frame_h, 1, 1, 1, VK_SAMPLE_COUNT_1_BIT,
+				VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_TILING_OPTIMAL,
+				VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+				0, VMM_ALLOCATION_POOL_SYSTEM);
+		}
+
+		target_image = m_prerotation_frame->value;
+
+		// The last flip's turn read this image (fragment shader) and its frame dump may have copied
+		// it (transfer). The first write below starts from UNDEFINED, which waits for nothing, so
+		// order it after those reads here.
+		vk::insert_global_memory_barrier(*m_current_command_buffer,
+			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+			VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+			VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+	}
 
 	VkRenderPass single_target_pass = VK_NULL_HANDLE;
 	vk::framebuffer_holder* direct_fbo = nullptr;
@@ -2143,7 +2422,7 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
 	// less by the ratio of the two (720p on a 1080p screen: 2.25x fewer pixels to generate). Every
 	// other output mode renders through passes a generated frame would need a run of its own of,
 	// so those keep capturing the finished screen.
-	const bool framegen_plain_output = image_to_flip && !avconfig.stereo_enabled &&
+	const bool framegen_plain_output = image_to_flip && !pre_rotation && !avconfig.stereo_enabled &&
 		g_cfg.video.full_rgb_range_output.get() && rsx::fcmp(avconfig.gamma, 1.f) &&
 		(m_output_scaling == output_scaling_mode::bilinear || m_output_scaling == output_scaling_mode::nearest);
 
@@ -2156,7 +2435,7 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
 			m_framegen_filter = (m_output_scaling == output_scaling_mode::nearest) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
 		}
 	}
-	else if (image_to_flip)
+	else if (image_to_flip && !pre_rotation)
 	{
 		vk::frame_gen::capture_presented_frame(*m_current_command_buffer, *m_device,
 			// present_layout, NOT target_layout.
@@ -2224,6 +2503,54 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
 		}
 
 		dump_cb = m_current_command_buffer;
+	}
+
+	if (pre_rotation)
+	{
+		// The turn: the assembled frame into the swapchain image, turned to the panel.
+		vk::change_image_layout(*m_current_command_buffer, target_image, target_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, subresource_range);
+		m_prerotation_frame->current_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+		// Acquired images are undefined, and the turn writes every pixel of this one.
+		vk::change_image_layout(*m_current_command_buffer, swapchain_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, subresource_range);
+
+		const auto turn_key = vk::get_renderpass_key(m_swapchain->get_surface_format());
+		const VkRenderPass turn_pass = vk::get_renderpass(*m_device, turn_key);
+		ensure(turn_pass != VK_NULL_HANDLE);
+
+		auto* turn_fbo = vk::get_framebuffer(*m_device, m_swapchain->get_image_width(), m_swapchain->get_image_height(), VK_FALSE,
+			turn_pass, m_swapchain->get_surface_format(), swapchain_image);
+		turn_fbo->add_ref();
+
+		switch (pre_rotation)
+		{
+		case 1:
+			vk::get_overlay_pass<vk::present_rotation_pass_90>()->run(*m_current_command_buffer, turn_fbo, m_prerotation_frame.get(), turn_pass);
+			break;
+		case 2:
+			vk::get_overlay_pass<vk::present_rotation_pass_180>()->run(*m_current_command_buffer, turn_fbo, m_prerotation_frame.get(), turn_pass);
+			break;
+		default:
+			vk::get_overlay_pass<vk::present_rotation_pass_270>()->run(*m_current_command_buffer, turn_fbo, m_prerotation_frame.get(), turn_pass);
+			break;
+		}
+
+		turn_fbo->release();
+
+		target_image = swapchain_image;
+		target_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+		// Frame generation captures the TURNED image: it interpolates turned frames, and
+		// present_generated_frame copies them straight into the swapchain, which then needs no
+		// turning of its own. Its plain path draws into the swapchain unturned, so it is off while
+		// the swapchain is turned (framegen_plain_output). present_layout for the reason given at
+		// the unturned capture above.
+		if (image_to_flip)
+		{
+			vk::frame_gen::capture_presented_frame(*m_current_command_buffer, *m_device,
+				swapchain_image, present_layout, m_swapchain->get_image_width(), m_swapchain->get_image_height(),
+				buffer_width, buffer_height);
+		}
 	}
 
 	if (target_layout != present_layout)

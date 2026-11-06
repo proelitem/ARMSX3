@@ -67,6 +67,14 @@ private:
 	const VKVertexProgram *m_vertex_prog = nullptr;
 	vk::glsl::program *m_program = nullptr;
 	vk::glsl::program *m_prev_program = nullptr;
+	// ARMSX3: vertex fetch specialization (vk_vspec.h), all unused while it is off
+	vk::glsl::program *m_generic_program = nullptr;     // Generic variant of a specialized m_program
+	std::array<u32, 16> m_bound_vtx_spec{};             // Specialization of m_program, all zero = generic
+	bool m_vspec_draw = false;                          // This draw uses a program built for specialization
+	bool m_draw_use_generic = false;                    // This draw's layout differs from m_bound_vtx_spec
+	u32 m_vin_native_mask = 0;                          // Locations this draw fetches through vertex input bindings
+	s32 m_vin_vertex_offset = 0;                        // Index rebase of this draw (vertexOffset)
+	VkDeviceSize m_vin_offsets[16]{};                   // Binding offsets of those locations in the attribute ring
 	vk::pipeline_props m_pipeline_properties;           // Decoded pipeline properties cached
 	u32 m_pipeline_properties_ctrl = 0;                 // Fragment program control bits that m_pipeline_properties was decoded with
 
@@ -126,6 +134,11 @@ private:
 	vk::command_pool m_command_buffer_pool;
 	vk::command_buffer_chain<VK_MAX_ASYNC_CB_COUNT> m_primary_cb_list;
 	vk::command_buffer_chunk* m_current_command_buffer = nullptr;
+
+	// Early submit ("Early Submit Draw Threshold"), see on_local_task
+	u32 m_early_submit_threshold = 0;     // 0 = off, else >= 256
+	u32 m_draws_since_submit = 0;         // Draws recorded into the open primary command buffer
+	u32 m_early_submit_check_at = umax;   // Draw count at which to ask the GPU next; umax when off
 
 	std::unique_ptr<vk::buffer> m_host_object_data;
 	vk::framebuffer_holder* m_draw_fbo = nullptr;
@@ -231,6 +244,28 @@ private:
 	vk::command_buffer_chunk* m_framegen_blit_cb[3] = {};
 	u32 m_framegen_blit_cb_count = 0;
 
+	// The real frame that frame generation has not presented yet, held until its generated frames are
+	// finished on the GPU (see queue_swap_request), and the generated frames held in front of it.
+	// Null / zero when nothing is held, which is every frame with frame generation off.
+	vk::frame_context_t* m_present_after_generated = nullptr;
+	u64 m_present_after_generated_ids[3] = {};
+
+	struct held_generated_present
+	{
+		VkSemaphore semaphore = VK_NULL_HANDLE;
+		u32 image = umax;
+	};
+
+	held_generated_present m_held_generated_presents[3] = {};
+	u32 m_held_generated_count = 0;
+	u64 m_present_after_generated_poll = 0;
+
+	// How the held frames went out: on a poll, or forced at the next flip and how long that waited.
+	u32 m_held_presents_polled = 0;
+	u32 m_held_presents_forced = 0;
+	u64 m_held_presents_forced_us = 0;
+	u64 m_held_presents_window = 0;
+
 	// How the real frame reached the screen, for generated frames captured at the game's
 	// resolution (vk::frame_gen::capture_game_frame): they are scaled into the same area with the
 	// same filter, then get the overlays drawn on them just as the real frame did.
@@ -241,6 +276,10 @@ private:
 	// (swapchain.cpp forces FIFO while it is on), so a change has to rebuild the swapchain, the same
 	// as a VSync change does.
 	bool m_swapchain_framegen = false;
+
+	// Whether pre-rotation was allowed (not switched off in Fixes) when the swapchain was built.
+	// swapchain.cpp reads the setting there, so a change rebuilds it, as above.
+	bool m_swapchain_prerotation = true;
 
 	VkViewport m_viewport {};
 	VkRect2D m_scissor {};
@@ -271,6 +310,11 @@ private:
 	std::vector<vk::image*> m_fbo_images;
 
 	std::unique_ptr<vk::image> m_overlay_recording_img;
+
+	// Pre-rotation (swapchain_WSI::init): with a turned swapchain, flip() assembles the frame in
+	// this upright image, exactly as it would in an unturned swapchain image, and turns it into the
+	// swapchain image as its last pass. Window-sized; null while the swapchain is not turned.
+	std::unique_ptr<vk::viewable_image> m_prerotation_frame;
 
 	// ARMSX3 remote play (android/src/remote_play.cpp, Emu/RSX/remote_capture.h). Each captured frame is
 	// drawn on the GPU into a slot and marked done by a GPU-written sequence number; the app's video
@@ -379,8 +423,9 @@ private:
 	void queue_swap_request();
 	void frame_context_cleanup(vk::frame_context_t *ctx);
 	void advance_queued_frames();
-	void present(vk::frame_context_t *ctx);
-	vk::command_buffer_chunk* present_generated_frame(VkImage src);
+	void present(vk::frame_context_t *ctx, bool lock_queue = false);
+	vk::command_buffer_chunk* present_generated_frame(VkImage src, bool hold_present = false);
+	void present_after_generated(bool wait);
 	bool reinitialize_swapchain();
 
 	vk::viewable_image* get_present_source(vk::present_surface_info* info, const rsx::avconf& avconfig);
@@ -492,4 +537,5 @@ protected:
 	void on_invalidate_memory_range(rsx::context* ctx, const utils::address_range32 &range, rsx::invalidation_cause cause) override;
 	void on_unmap_memory_range(const utils::address_range32& range) override;
 	void on_semaphore_acquire_wait() override;
+	void on_fifo_idle() override;
 };

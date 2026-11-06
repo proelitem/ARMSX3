@@ -29,6 +29,9 @@ import kotlin.math.max
 internal class XmbFirmwareWave(context: Context, private val mood: XmbWaveFirmware.Mood? = null) {
     private val model = XmbWaveModel(loadState(context), mood?.line ?: XmbWaveFirmware.line)
     private val ctrl = FloatArray(XmbWaveModel.N * 4)
+
+    /** The wave's 19x19 control points in clip space (x, y, z, w) as the last [draw] left them. */
+    val controlPoints: FloatArray get() = ctrl
     private val ctrlBuf: FloatBuffer = ByteBuffer.allocateDirect(ctrl.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
 
     private var lineProg = 0

@@ -161,6 +161,12 @@ struct cfg_root : cfg::node
 		cfg::_int<0, 4000> display_aspect_permille{ this, "Display Aspect Override", 0, true };
 		cfg::_bool force_high_precision_z_buffer{ this, "Force High Precision Z buffer" };
 		cfg::_bool strict_rendering_mode{ this, "Strict Rendering Mode" };
+		// ARMSX3: on a screen mounted sideways to the picture (a phone held in landscape, the Odin 3
+		// and most handhelds, whose panels are portrait), the Vulkan swapchain is created already
+		// turned (preTransform = the surface's currentTransform) and the frame is turned into it as
+		// the last pass, so the compositor does not have to turn every frame on the GPU. On hands the
+		// turning back to the compositor, as before. Dynamic: the swapchain is rebuilt on a change.
+		cfg::_bool disable_swapchain_prerotation{ this, "Disable Swap Chain Pre-Rotation", false, true };
 		cfg::_enum<framebuffer_aliasing_bias> fb_aliasing_bias{ this, "Framebuffer Aliasing Heuristic Bias", framebuffer_aliasing_bias::_auto, true };
 		cfg::_bool disable_zcull_queries{ this, "Disable ZCull Occlusion Queries", false, true };
 		cfg::_bool disable_video_output{ this, "Disable Video Output", false, true };
@@ -267,8 +273,15 @@ struct cfg_root : cfg::node
 			cfg::string adapter{ this, "Adapter", "", true };
 			cfg::_enum<vk_exclusive_fs_mode> exclusive_fullscreen_mode{ this, "Exclusive Fullscreen Mode", vk_exclusive_fs_mode::unspecified};
 			cfg::_bool asynchronous_texture_streaming{ this, "Asynchronous Texture Streaming", false };
+			// ARMSX3: Vulkan only, read once per boot (Emu/RSX/VK/vk_vspec.h). Off by default; the config
+			// database turns it on per title.
+			cfg::_bool vertex_fetch_specialization{ this, "Vertex Fetch Specialization", false };
 			cfg::_enum<vk_gpu_scheduler_mode> asynchronous_scheduler{ this, "Asynchronous Queue Scheduler", vk_gpu_scheduler_mode::safe };
 			cfg::uint<256, 65536> vram_allocation_limit{ this, "VRAM allocation limit (MB)", 65536, false };
+			// ARMSX3: 0 = off. Once this many draws are recorded in the open primary command buffer
+			// and the GPU has finished the previous submit, submit it early instead of leaving the GPU
+			// idle until the next flush point. Values 1-255 count as 256. Read when the renderer starts.
+			cfg::uint<0, 65535> early_submit_draw_threshold{ this, "Early Submit Draw Threshold", 0 };
 #ifdef __ANDROID__
 			// ARMSX3: left on. Android has no Re-BAR; the name only fits desktop cards. RPCS3 counts any
 			// device-local, host-visible, coherent memory type as "BAR", and on a phone that is plain

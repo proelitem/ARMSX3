@@ -366,6 +366,35 @@ struct LogListener : logs::listener {
 // GSFrameBase::take_screenshot.
 extern atomic_t<bool> g_user_asked_for_screenshot;
 
+// Owned by RSXThread.cpp. Setting it makes the next present write the Vulkan driver pipeline
+// cache to disk; the generation counts completed writes.
+extern atomic_t<bool> g_flush_pipeline_cache_requested;
+extern atomic_t<u64> g_pipeline_cache_flush_generation;
+
+// Set while _armsx3_pause() is on its way into a pause, which the cache write below can stretch
+// to over half a second, so the surface-loss worker does not take that pause for its own.
+static std::atomic<bool> g_app_pause_in_flight;
+
+// The driver pipeline cache is otherwise only written when the renderer is destroyed, which a
+// process killed while in the background (swiped away from recents, reclaimed for memory) never
+// reaches: every pipeline compiled in that session then has to be compiled again next time,
+// which is stutter. Ask the running renderer to write it at its next flip, before pausing, and
+// wait a bounded time for it. Not serviced in time, the request stays armed for the next flip.
+// Vulkan only: no other renderer services the request. Contributed by k1r4ct (PR #220).
+static void flush_pipeline_cache_before_pause(int max_wait_ms) {
+  if (!Emu.IsRunning() || g_cfg.video.renderer != video_renderer::vulkan) {
+    return;
+  }
+
+  const u64 before = g_pipeline_cache_flush_generation;
+  g_flush_pipeline_cache_requested = true;
+
+  for (int waited = 0; waited < max_wait_ms && g_pipeline_cache_flush_generation == before;
+       waited += 5) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+}
+
 static constexpr u32 kThumbMaxEdge = 320;
 
 // How long a save waits for the renderer to hand over a frame for the slot preview. Two
@@ -943,6 +972,10 @@ static std::pair<std::string, std::u32string> g_strings[] = {
     MAKE_STRING(RSX_OVERLAYS_TROPHY_PLATINUM,
                 "You have earned a platinum trophy.\n%0"),
     MAKE_STRING(RSX_OVERLAYS_COMPILING_SHADERS, "Compiling shaders"),
+    MAKE_STRING(RSX_OVERLAYS_COMPILING_SHADERS_TITLE, "Shader Compilation"),
+    MAKE_STRING(RSX_OVERLAYS_COMPILING_SHADERS_VULKAN, "Building base variant %0..."),
+    MAKE_STRING(RSX_OVERLAYS_COMPILING_SHADERS_OPENGL_BUILD, "Building variant %0..."),
+    MAKE_STRING(RSX_OVERLAYS_COMPILING_SHADERS_OPENGL_LINK, "Linking variant %0..."),
     MAKE_STRING(RSX_OVERLAYS_COMPILING_PPU_MODULES, "Compiling PPU Modules"),
     MAKE_STRING(RSX_OVERLAYS_COMPILING_SPU_CODE, "Compiling SPU Code"),
     MAKE_STRING(RSX_OVERLAYS_MSG_DIALOG_YES, "Yes"),
@@ -1232,6 +1265,7 @@ static std::pair<std::string, std::u32string> g_strings[] = {
     MAKE_STRING(HOME_MENU_SETTINGS_AUDIO_TIME_STRETCHING_THRESHOLD,
                 "Time Stretching Threshold"),
     MAKE_STRING(HOME_MENU_SETTINGS_VIDEO, "Video"),
+    MAKE_STRING(HOME_MENU_SETTINGS_VIDEO_RENDERER, "Graphics Renderer"),
     MAKE_STRING(HOME_MENU_SETTINGS_VIDEO_VSYNC, "VSync"),
     MAKE_STRING(HOME_MENU_SETTINGS_VIDEO_FRAME_LIMIT, "Frame Limit"),
     MAKE_STRING(HOME_MENU_SETTINGS_VIDEO_ANISOTROPIC_OVERRIDE,
@@ -1433,6 +1467,21 @@ static std::pair<std::string, std::u32string> g_strings[] = {
     MAKE_STRING(SAVESTATE_FAILED_DUE_TO_MISSING_SPU_SETTING,
                 "SaveState failed: turn on Allow save states in the Performance "
                 "settings, then try again."),
+    // Upstream's home menu and Big Picture Mode strings. Neither screen is reached on Android today,
+    // but an id left out of this table reads as an empty string wherever it does turn up.
+    MAKE_STRING(HOME_MENU_SETTINGS_SYSTEM_START_BIG_PICTURE_MODE, "Open Big Picture Mode On Boot"),
+    MAKE_STRING(HOME_MENU_TROPHY_SYNC_TROPHIES, "Sync trophies"),
+    MAKE_STRING(HOME_MENU_TROPHY_SYNCING_TROPHIES, "Syncing..."),
+    MAKE_STRING(HOME_MENU_TROPHY_SYNC_SUCCESS, "Synced!"),
+    MAKE_STRING(HOME_MENU_TROPHY_SYNC_FAILED, "Sync failed"),
+    MAKE_STRING(BIG_PICTURE_MODE_TITLE, "Big Picture Mode"),
+    MAKE_STRING(BIG_PICTURE_MENU_GAMES, "Games"),
+    MAKE_STRING(BIG_PICTURE_MENU_EXIT, "Exit Big Picture Mode"),
+    MAKE_STRING(BIG_PICTURE_NO_GAMES_FOUND, "No games found.\nAdd games to ARMSX3's library first."),
+    MAKE_STRING(BIG_PICTURE_LOADING, "Loading games..."),
+    MAKE_STRING(BIG_PICTURE_GAME_DETAILS_START, "Start"),
+    MAKE_STRING(BIG_PICTURE_HINT_BACK, "Back"),
+    MAKE_STRING(BIG_PICTURE_HINT_SELECT, "Select"),
 };
 
 #undef MAKE_STRING
@@ -1443,7 +1492,7 @@ static std::pair<std::string, std::u32string> g_strings[] = {
 static_assert(
     std::size(g_strings) ==
         std::size_t(
-            localized_string_id::SAVESTATE_FAILED_DUE_TO_MISSING_SPU_SETTING) +
+            localized_string_id::BIG_PICTURE_HINT_SELECT) +
             1,
     "localized_string_id grew: add the new string(s) to g_strings and move "
     "this to the new last id");
@@ -4652,6 +4701,10 @@ static void play_watch_on_prx_loaded(std::string_view vpath) {
   }
 }
 
+// Slot saves' history copies, defined with the save slots below.
+static void armsx3_drop_slot_history_copies(std::string_view only_title);
+static void armsx3_drop_old_slot_history_copies_once();
+
 extern "C" bool _armsx3_initialize(std::string_view rootDir,
                                   std::string_view user) {
   // The compile banner's "N of M" counts the modules a game loads (play_watch_on_prx_loaded).
@@ -4890,6 +4943,10 @@ extern "C" bool _armsx3_initialize(std::string_view rootDir,
   Emu.SetDefaultGraphicsAdapter("Default");
 
   Emu.Init();
+
+  // Slot saves' history copies (see armsx3_slot_history_note). No game can be loading yet.
+  armsx3_drop_slot_history_copies({});
+  armsx3_drop_old_slot_history_copies_once();
 
   g_cfg_input.player1.handler.set(pad_handler::virtual_pad);
   g_cfg_input.player1.device.from_string("Virtual");
@@ -5402,6 +5459,8 @@ extern "C" void _armsx3_pause() {
   // Waiting is the whole fix: the screenshot then happens on an ordinary flip of a running
   // emulator, which is the same path a save from a running game has always used safely, and
   // the pause does not start until it has landed.
+  g_app_pause_in_flight = true;
+
   if (Emu.IsRunning()) {
     const u64 before = g_thumb_generation;
     g_user_asked_for_screenshot = true;
@@ -5416,7 +5475,9 @@ extern "C" void _armsx3_pause() {
     g_user_asked_for_screenshot = false;
   }
 
+  flush_pipeline_cache_before_pause(500);
   Emu.Pause();
+  g_app_pause_in_flight = false;
 }
 
 // A screenshot: the frame at its own size, written for the app to turn into a PNG. A running
@@ -5605,6 +5666,164 @@ static std::string armsx3_slot_find(std::string_view title, unsigned int slot) {
   return {};
 }
 
+// The history copy a slot save leaves behind.
+//
+// A slot is a COPY of the state the core writes into its rolling history (below), and the core
+// then restarts from that history file, so it cannot go at once. Before this nothing removed it
+// afterwards: every slot save was stored twice, up to RPCS3's own history limit of four files /
+// 4 GB per title (a tester had 3.5 GB of such copies). Now the capture leaves a note next to the
+// slot naming the history file it copied, and that file is deleted the next time a slot is saved
+// for the title, or at the next start: by then nothing is still loading from it. No file is
+// compared and none but the named one is touched. Raised by k1r4ct (PR #223).
+static std::string armsx3_slot_history_note(std::string_view title,
+                                            unsigned int slot) {
+  return armsx3_slot_dir(title) + "slot" + std::to_string(slot) + ".history";
+}
+
+static void armsx3_drop_slot_history_copies(std::string_view only_title) {
+  const std::string root = fs::get_config_dir() + "/savestates/";
+
+  for (const auto& t : fs::dir(root)) {
+    if (!t.is_directory || t.name == "." || t.name == ".." ||
+        (!only_title.empty() && t.name != only_title)) {
+      continue;
+    }
+
+    const std::string sdir = root + t.name + "/armsx3_slots/";
+
+    for (const auto& e : fs::dir(sdir)) {
+      if (e.is_directory || !e.name.ends_with(".history")) {
+        continue;
+      }
+
+      std::string name;
+      if (fs::file note{sdir + e.name}) {
+        name = note.to_string();
+      }
+
+      // Only a bare file name of this title's own history: never anything else.
+      if (!name.empty() && name.find_first_of("/\\") == umax &&
+          name.starts_with(t.name + "_") && name.find(".SAVESTAT") != umax) {
+        const std::string path = root + t.name + "/" + name;
+
+        if (fs::is_file(path) && !fs::remove_file(path)) {
+          armsx3_android.warning("savestate history: cannot remove '%s' (%s)", path,
+                                fs::g_tls_error);
+          continue; // keep the note and try again next time
+        }
+
+        armsx3_android.notice("savestate history: removed '%s%s', a copy of a slot",
+                             t.name + "/", name);
+      }
+
+      fs::remove_file(sdir + e.name);
+    }
+  }
+}
+
+// Copies made before the notes above existed: removed once, in the background, if they are
+// byte for byte one of the title's slots. Only files older than this start are looked at, so a
+// save made meanwhile is never touched, and the pass stops (to finish next start) the moment a
+// game is booting or running.
+static bool armsx3_same_file(const std::string& a, const std::string& b, u64 size) {
+  fs::file fa(a), fb(b);
+
+  if (!fa || !fb || fa.size() != size || fb.size() != size) {
+    return false;
+  }
+
+  std::vector<u8> ba(1 << 20), bb(1 << 20);
+
+  for (u64 done = 0; done < size;) {
+    const u64 n = std::min<u64>(ba.size(), size - done);
+
+    if (fa.read(ba.data(), n) != n || fb.read(bb.data(), n) != n ||
+        std::memcmp(ba.data(), bb.data(), n) != 0) {
+      return false;
+    }
+
+    done += n;
+  }
+
+  return true;
+}
+
+static void armsx3_drop_old_slot_history_copies_once() {
+  const std::string root = fs::get_config_dir() + "/savestates/";
+  const std::string done_note = root + ".armsx3_slot_history_cleaned";
+
+  if (!fs::is_dir(root) || fs::is_file(done_note)) {
+    return;
+  }
+
+  const s64 started = std::time(nullptr);
+
+  std::thread([root, done_note, started] {
+    u64 freed = 0;
+    usz removed = 0;
+    bool finished = true;
+
+    for (const auto& t : fs::dir(root)) {
+      if (!t.is_directory || t.name == "." || t.name == "..") {
+        continue;
+      }
+
+      const std::string tdir = root + t.name + "/";
+      const std::string sdir = tdir + "armsx3_slots/";
+
+      if (!fs::is_dir(sdir)) {
+        continue; // never saved to a slot: RPCS3's history is all its own
+      }
+
+      std::vector<fs::dir_entry> slots;
+
+      for (const auto& e : fs::dir(sdir)) {
+        if (!e.is_directory && e.name.find(".SAVESTAT") != umax) {
+          slots.push_back(e);
+        }
+      }
+
+      for (const auto& h : fs::dir(tdir)) {
+        if (h.is_directory || !h.name.starts_with(t.name + "_") ||
+            h.name.find(".SAVESTAT") == umax || h.mtime >= started) {
+          continue;
+        }
+
+        const bool copy = std::any_of(slots.begin(), slots.end(), [&](const fs::dir_entry& s) {
+          return s.size == h.size && armsx3_same_file(tdir + h.name, sdir + s.name, h.size);
+        });
+
+        if (!copy) {
+          continue;
+        }
+
+        if (!Emu.IsStopped()) {
+          finished = false; // a game is starting: leave the rest for the next start
+          break;
+        }
+
+        if (fs::remove_file(tdir + h.name)) {
+          freed += h.size;
+          removed++;
+          armsx3_android.notice("savestate history: removed '%s%s', a copy of a slot", t.name + "/", h.name);
+        }
+      }
+
+      if (!finished) {
+        break;
+      }
+    }
+
+    if (removed) {
+      armsx3_android.success("savestate history: removed %u older copies of slots, %u MB", removed, freed >> 20);
+    }
+
+    if (finished) {
+      fs::file(done_note, fs::rewrite);
+    }
+  }).detach();
+}
+
 // Copy the state the core has just written into [slot]. Runs from
 // after_kill_callback, which is the first point the file is complete on disk.
 static void armsx3_slot_capture(unsigned int slot, const std::string& title,
@@ -5652,6 +5871,12 @@ static void armsx3_slot_capture(unsigned int slot, const std::string& title,
     return;
   }
 
+  // Name the history file this slot copied, so it can go once nothing loads from it any more.
+  // See armsx3_slot_history_note.
+  if (fs::file note{armsx3_slot_history_note(title, slot), fs::rewrite}) {
+    note.write(newest.substr(newest.find_last_of('/') + 1));
+  }
+
   // Best effort. A slot with no picture still loads, so a missing frame must not turn a
   // successful save into a failed one.
   if (!armsx3_write_thumbnail(dir + "slot" + std::to_string(slot) + ".thumb")) {
@@ -5689,6 +5914,10 @@ extern "C" bool _armsx3_saveStateToSlot(unsigned int slot) {
     armsx3_android.error("saveState: no title id, cannot address a slot");
     return false;
   }
+
+  // The history copies earlier slot saves left: the game running now was loaded from one of
+  // them long ago, so they can go before this save writes the next.
+  armsx3_drop_slot_history_copies(title);
 
   // Ask for a frame now, while there is still a renderer to draw one. It arrives at
   // take_screenshot and is written out by armsx3_slot_capture once the state is on disk.
@@ -6629,6 +6858,15 @@ extern "C" bool _armsx3_surfaceEvent(JNIEnv *env, jobject surface, jint event) {
       std::this_thread::sleep_for(std::chrono::milliseconds(250));
 
       if (g_native_window.load() != nullptr) {
+        return;
+      }
+
+      flush_pipeline_cache_before_pause(500);
+
+      // Checked again after that wait. The surface may have come back meanwhile, and its resume
+      // found no pause of ours to undo. Or the app is pausing on its own (it does when sent to
+      // the background): that pause is not ours, and it is coming anyway.
+      if (g_native_window.load() != nullptr || g_app_pause_in_flight) {
         return;
       }
 
@@ -8566,12 +8804,22 @@ extern "C" bool _armsx3_settingsSet(std::string_view path,
     decoded.assign(valueString);
   }
 
-  // Clocks scale is read on every guest clock read, against an offset taken at boot with the
-  // boot-time scale (initialize_timebased_time). Changed under a running game the clock jumps:
-  // lowered, it drops below that offset and wraps to ~2^64 (convert_to_timebased_time then fails
-  // its ensure); raised, it leaps ahead by most of the device's uptime. RPCS3 keeps it to the
-  // boot for that reason. The app remembers the edit and applies it before the next boot.
-  if (root == &g_cfg.core.clocks_scale && !Emu.IsStopped(true) && decoded != root->to_string()) {
+  // A setting RPCS3 reads only at boot (an entry with its dynamic flag off) waits for the next
+  // boot while a game runs. Desktop RPCS3 greys these out in-game, but a leaf's from_string()
+  // ignores the flag it is handed, so every in-game menu here used to write them live and the
+  // game went on half on the old value: code compiled before the change keeps it, code compiled
+  // after gets the new one (issue #228, crashes after changing options mid-game). Clocks scale
+  // shows how bad it gets: it is read on every guest clock read, against an offset taken at boot
+  // with the boot-time scale (initialize_timebased_time), so changed under a running game the
+  // clock jumps: lowered, it drops below that offset and wraps to ~2^64
+  // (convert_to_timebased_time then fails its ensure); raised, it leaps ahead by most of the
+  // device's uptime.
+  //
+  // The app has remembered the edit, and its launch push applies it before the next boot (Apply &
+  // Restart), the same as the libraries list above. An unchanged value goes through: the app
+  // re-pushes every remembered value on each settings change. The live-applied nodes below
+  // (overlays, the audio backend) are all dynamic, so they are unaffected.
+  if (!root->get_is_dynamic() && !Emu.IsStopped(true) && decoded != root->to_string()) {
     armsx3_android.notice("settingsSet: %s changes at the next boot, not under a running game", path);
     return false;
   }

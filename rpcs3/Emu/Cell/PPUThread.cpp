@@ -30,6 +30,7 @@
 #include "lv2/sys_overlay.h"
 #include "lv2/sys_process.h"
 #include "lv2/sys_spu.h"
+#include "lv2/sys_timer.h"
 
 #ifdef LLVM_AVAILABLE
 #ifdef _MSC_VER
@@ -3382,6 +3383,19 @@ ppu_thread::ppu_thread(utils::serial& ar)
 
 	const u32 status = ar.pop<u32>();
 
+	// A savestate can catch a thread inside sys_cond_wait or _sys_lwcond_queue_wait while it already
+	// sits in the run queue: its timeout expired just before the save, so it was woken but had not yet
+	// left the wait. Restore it like a sleeping thread: do not re-queue it, replay the wait, and do not
+	// start the scheduler before the replayed wait has slept.
+	// Only LLE callers stopped on the sc instruction are detected. HLE wrappers (sysPrxForUser
+	// sys_lwcond_wait, codec modules) also keep state in optional_savestate_state, but they sit on an
+	// HLE stub and the sc check leaves them alone.
+	// Contributed by k1r4ct (PR #219).
+	const bool replay_wait = (status == PPU_THREAD_STATUS_RUNNABLE || status == PPU_THREAD_STATUS_ONPROC) &&
+		!optional_savestate_state->data.empty() &&
+		(gpr[11] == 107 /* sys_cond_wait */ || gpr[11] == 113 /* _sys_lwcond_queue_wait */) &&
+		vm::check_addr(cia) && vm::read32(cia) == ppu_instructions::SC(0);
+
 	switch (status)
 	{
 	case PPU_THREAD_STATUS_IDLE:
@@ -3403,7 +3417,8 @@ ppu_thread::ppu_thread(utils::serial& ar)
 				std::map<u32, ppu_thread*> awake_ppus;
 			};
 
-			g_fxo->get<awake_pushed>().awake_ppus[order] = this;
+			// A replayed wait is not re-queued; its slot stays (as nullptr) so the saved orders remain contiguous
+			g_fxo->get<awake_pushed>().awake_ppus[order] = replay_wait ? nullptr : this;
 
 			if (!std::exchange(g_fxo->get<awake_pushed>().pushed, true))
 			{
@@ -3415,14 +3430,18 @@ ppu_thread::ppu_thread(utils::serial& ar)
 					{
 						ensure(prev + 1 == ppu.first);
 						prev = ppu.first;
-						lv2_obj::awake(ppu.second);
+
+						if (ppu.second)
+						{
+							lv2_obj::awake(ppu.second);
+						}
 					}
 
 					g_fxo->get<awake_pushed>().awake_ppus.clear();
 				});
 			}
 		}
-		else
+		else if (!replay_wait)
 		{
 			lv2_obj::awake(this);
 		}
@@ -3463,8 +3482,13 @@ ppu_thread::ppu_thread(utils::serial& ar)
 			});
 		}
 
-		if (status == PPU_THREAD_STATUS_SLEEP)
+		if (status == PPU_THREAD_STATUS_SLEEP || replay_wait)
 		{
+			if (replay_wait)
+			{
+				ppu_log.notice("Loading PPU Thread [0x%x]: saved %s inside a blocking wait, replaying the wait", id, ppu_thread_status{status});
+			}
+
 			cmd_list
 			({
 				{ppu_cmd::ptr_call, 0},
@@ -3858,6 +3882,198 @@ static void ppu_kz3_desc_clear(u64 ea)
 	if (n <= 20000)
 	{
 		ppu_log.error("KZ3 CLEAR ea=0x%08x t=%llu (#%u)", static_cast<u32>(ea), get_system_time(), n);
+	}
+}
+
+// Naughty Bear: Panic in Paradise (NPUB30828, NPEB01054; both trials share one executable).
+//
+// The game builds its graphics SPU's command stream from two PPU threads at once: main_thread and
+// "A2M Render Task Thread" run the same ~100 emitter functions, and each emitter loads the
+// stream's write pointer (0x010e9864), writes its command there and stores the pointer back, with
+// no lock. When two emitters overlap, one writes its command over the other's: in the dump that
+// pinned it, a lights command written from a stale pointer covered ten object draws and ran 8
+// bytes into the next one. The graphics SPU then dispatches garbage, overwrites its own code and
+// the game freezes (RPCS3 #18768, on PC too).
+//
+// The translator calls ppu_nb_stream_lock at each emitter's pointer load, ppu_nb_stream_unlock
+// at the store that publishes its last command, and both around the frame end's buffer swap, so
+// one emitter at a time owns the pointer. The sites come from a static pass over the executable
+// and each is checked against its instruction word before it is hooked (PPUTranslator.cpp); at
+// run time the load or store must also hit the pointer's address, or the call does nothing.
+static constexpr u32 s_nb_stream_ptr = 0x010e9864;
+static atomic_t<bool> s_nb_stream_lock_on{false};
+static atomic_t<u32> s_nb_stream_owner{0};
+static atomic_t<u32> s_nb_stream_owner_site{0};
+static thread_local u32 s_nb_stream_site = 0;
+static thread_local bool s_nb_stream_swap = false;
+static atomic_t<u64> s_nb_stream_waits{0};
+
+bool ppu_nb_stream_lock_part(u32 lo, u32 hi); // PPUTranslator.cpp
+
+bool ppu_nb_stream_lock_enabled()
+{
+	return s_nb_stream_lock_on.load();
+}
+
+void ppu_nb_stream_lock_reset(bool on)
+{
+	s_nb_stream_owner.release(0);
+	s_nb_stream_waits.release(0);
+	s_nb_stream_lock_on.release(on);
+
+	if (on)
+	{
+		ppu_log.notice("Naughty Bear: the graphics command stream's emitters take turns on its write pointer");
+	}
+}
+
+static void ppu_nb_stream_lock(ppu_thread& ppu, u64 site, u64 ea)
+{
+	if (static_cast<u32>(ea) != s_nb_stream_ptr)
+	{
+		// This path of the hooked load reads something else
+		return;
+	}
+
+	const u32 me = ppu.id;
+
+	if (s_nb_stream_owner.load() == me)
+	{
+		// Owning is on or off, never counted: an emitter that calls another emitter reloads the
+		// pointer afterwards (it must, or it would write over the callee's command), so the
+		// callee's release ends nothing the caller still needs, and the reload takes it again.
+		return;
+	}
+
+	u64 wait_start = 0;
+
+	for (u32 spins = 0;; spins++)
+	{
+		u32 old = 0;
+
+		if (s_nb_stream_owner.compare_exchange(old, me))
+		{
+			s_nb_stream_site = static_cast<u32>(site);
+			s_nb_stream_owner_site.release(static_cast<u32>(site));
+			break;
+		}
+
+		if (::is_stopped(ppu.state))
+		{
+			// Emulation is stopping: the thread exits at its next check, nothing more is drawn
+			return;
+		}
+
+		if (spins < 64)
+		{
+			utils::pause();
+			continue;
+		}
+
+		const u64 now = get_system_time();
+
+		if (Emu.IsPaused())
+		{
+			// The owner is paused too; wait out the pause without counting it
+			wait_start = now;
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			continue;
+		}
+
+		if (!wait_start)
+		{
+			wait_start = now;
+		}
+		else if (now - wait_start >= 200'000)
+		{
+			// An emitter owns the pointer for microseconds. This long means the owner left it
+			// behind without a release (it may now be waiting on this thread): take it over
+			// rather than freeze, and name the load the owner took it at.
+			if (s_nb_stream_owner.compare_exchange(old, me))
+			{
+				static atomic_t<u32> s_logged{0};
+
+				if (s_logged++ < 50)
+				{
+					ppu_log.error("Naughty Bear: took the command stream's write pointer from thread 0x%x after %u ms (it was taken at 0x%x)", old, (now - wait_start) / 1000, s_nb_stream_owner_site.load());
+				}
+
+				s_nb_stream_site = static_cast<u32>(site);
+				s_nb_stream_owner_site.release(static_cast<u32>(site));
+				break;
+			}
+
+			continue;
+		}
+
+		// Nap through LV2 rather than spin: the owner may have been preempted by the LV2
+		// scheduler, and a spinning thread would keep the slot it needs to finish.
+		sys_timer_usleep(ppu, 30);
+
+		if (ppu.test_stopped())
+		{
+			return;
+		}
+	}
+
+	if (wait_start) [[unlikely]]
+	{
+		if (const u64 n = ++s_nb_stream_waits; n == 1 || n % 10000 == 0)
+		{
+			ppu_log.notice("Naughty Bear: an emitter waited for another thread's command %u time(s)", n);
+		}
+	}
+}
+
+// The frame end's swap exchanges the two buffers' contexts and resets the new current one, which
+// can reallocate it through the game's allocator and so make syscalls: it keeps the pointer
+// through them (ppu_nb_stream_unlock_at_syscall), or an emitter could slip in mid-reset.
+static void ppu_nb_stream_lock_swap(ppu_thread& ppu, u64 site)
+{
+	ppu_nb_stream_lock(ppu, site, s_nb_stream_ptr);
+
+	if (s_nb_stream_owner.load() == ppu.id)
+	{
+		s_nb_stream_swap = true;
+	}
+}
+
+static void ppu_nb_stream_unlock(ppu_thread& ppu, u64 ea)
+{
+	if (static_cast<u32>(ea) != s_nb_stream_ptr || s_nb_stream_owner.load() != ppu.id)
+	{
+		return;
+	}
+
+	s_nb_stream_owner.release(0);
+}
+
+static void ppu_nb_stream_unlock_all(ppu_thread& ppu)
+{
+	if (s_nb_stream_owner.load() != ppu.id)
+	{
+		return;
+	}
+
+	s_nb_stream_swap = false;
+	s_nb_stream_owner.release(0);
+}
+
+// From ppu_execute_syscall: no emitter makes a syscall while it owns the pointer, so if this
+// thread still owns it outside the swap, the static pass missed a release. Let it go rather than
+// block the others, and name the load that took it.
+void ppu_nb_stream_unlock_at_syscall(ppu_thread& ppu)
+{
+	if (s_nb_stream_owner.load() == ppu.id && !s_nb_stream_swap) [[unlikely]]
+	{
+		static atomic_t<u32> s_logged{0};
+
+		if (s_logged++ < 50)
+		{
+			ppu_log.warning("Naughty Bear: the command stream's write pointer, taken at 0x%x, was still owned at a syscall (cia 0x%x)", s_nb_stream_site, ppu.cia);
+		}
+
+		ppu_nb_stream_unlock_all(ppu);
 	}
 }
 
@@ -5057,7 +5273,7 @@ extern void ppu_precompile(std::vector<std::string>& dir_queue, std::vector<ppu_
 							// Try to read from that address
 							if (const u128 klic_value = read_from_ptr_unsafe<u128>(klic_ptr))
 							{
-								if (!std::count_if(decrypt_klics.begin(), decrypt_klics.end(), FN(std::memcmp(&x, &klic_value, 16) == 0)))
+								if (std::ranges::none_of(decrypt_klics, FN(std::memcmp(&x, &klic_value, 16) == 0)))
 								{
 									decrypt_klics.emplace_back(klic_value);
 								}
@@ -5885,6 +6101,10 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 			{ "__error", reinterpret_cast<u64>(&ppu_error) },
 			{ "__check", reinterpret_cast<u64>(&ppu_check) },
 			{ "__kz3_desc_clear", reinterpret_cast<u64>(&ppu_kz3_desc_clear) },
+			{ "__nb_stream_lock", reinterpret_cast<u64>(&ppu_nb_stream_lock) },
+			{ "__nb_stream_lock_swap", reinterpret_cast<u64>(&ppu_nb_stream_lock_swap) },
+			{ "__nb_stream_unlock", reinterpret_cast<u64>(&ppu_nb_stream_unlock) },
+			{ "__nb_stream_unlock_all", reinterpret_cast<u64>(&ppu_nb_stream_unlock_all) },
 			{ "__trace", reinterpret_cast<u64>(&ppu_trace) },
 			{ "__syscall", reinterpret_cast<u64>(ppu_execute_syscall) },
 			{ "__get_tb", reinterpret_cast<u64>(get_timebased_time) },
@@ -6406,7 +6626,7 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 					continue;
 				}
 
-				if (std::count(part.excluded_funcs.begin(), part.excluded_funcs.end(), func.addr))
+				if (std::ranges::contains(part.excluded_funcs, func.addr))
 				{
 					continue;
 				}
@@ -6625,6 +6845,13 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 		if (cpu ? cpu->state.all_of(cpu_flag::exit) : Emu.IsStopped())
 		{
 			break;
+		}
+
+		// Naughty Bear: the parts that hold the command stream's emitters carry the write pointer
+		// lock (ppu_nb_stream_lock), so they get their own object name and recompile once.
+		if (!reloc && ppu_nb_stream_lock_enabled() && ppu_nb_stream_lock_part(part.local_bounds.first, part.local_bounds.second) && obj_name.ends_with(".obj"))
+		{
+			obj_name.insert(obj_name.size() - 4, "-nbsl2");
 		}
 
 		module_counter++;
@@ -7483,7 +7710,7 @@ static bool ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module
 	{
 		if (func.size)
 		{
-			if (std::count(module_part.excluded_funcs.begin(), module_part.excluded_funcs.end(), func.addr))
+			if (std::ranges::contains(module_part.excluded_funcs, func.addr))
 			{
 				continue;
 			}
@@ -7543,7 +7770,7 @@ static bool ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module
 
 			if (mod_func.size)
 			{
-				if (std::count(module_part.excluded_funcs.begin(), module_part.excluded_funcs.end(), mod_func.addr))
+				if (std::ranges::contains(module_part.excluded_funcs, mod_func.addr))
 				{
 					continue;
 				}

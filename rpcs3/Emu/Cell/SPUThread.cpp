@@ -321,6 +321,119 @@ static FORCE_INLINE bool rdata_fence()
 	return true;
 }
 
+#if defined(ARCH_ARM64)
+// A line another core is still writing, read with its second half landed and its first half not.
+//
+// The Cell and x86 both show another core's stores to one 128-byte line in the order they were
+// made, so a reader that sees a later part of the line written also sees the earlier parts. AArch64
+// promises no order between stores to two different cache lines, and its lines are 64 bytes, so
+// the two halves of a PS3 line can become visible in either order for a moment. A snapshot taken in
+// that moment matches memory as this core sees it, so the timestamp check and the second comparison
+// in GETLLAR both pass.
+//
+// Yakuza: Dead Souls froze on exactly that. Its command-patching SPURS task reads a ring of 32-byte
+// commands one 128-byte line at a time and takes a line as complete once its fourth entry is
+// non-zero. One GETLLAR caught a line with entries 2 and 3 written and entries 0 and 1 still zero.
+// The task moved past the line, then stopped at the first empty entry for good, and the jump in the
+// RSX command buffer that a later command would have released kept the GPU waiting, and the main
+// thread with it.
+//
+// A line whose bytes 32..63 are all zero while its second half holds data has that shape. Wait a
+// few microseconds, long enough for a store still in flight to land, and compare again. Lines this
+// SPU updates itself are left alone: an update that started from such a copy fails its PUTLLC and
+// retries anyway, and the SPURS control block, which every kernel updates constantly, often has
+// that shape.
+//
+// Only Yakuza: Dead Souls is known to need it, so only its five releases turn it on. The flag is
+// written whenever an SPU thread is created, before the game's SPU code runs, so GETLLAR reads one
+// bool, and the next game booted sets it again for itself.
+static atomic_t<bool> g_spu_getllar_settle{false};
+
+static bool spu_getllar_settle_title(std::string_view title)
+{
+	static constexpr std::string_view s_titles[] =
+	{
+		"BLUS30826"sv, "BLES01399"sv, "BLJM60316"sv, // disc
+		"NPUB31509"sv, "NPEB02034"sv, // PSN
+	};
+
+	return std::find(std::begin(s_titles), std::end(s_titles), title) != std::end(s_titles);
+}
+
+static thread_local u32 s_getllar_putllc_lines[4]{};
+static thread_local u32 s_getllar_putllc_next = 0;
+static thread_local u32 s_getllar_settled_addr = 0;
+static thread_local u32 s_getllar_settled_hash = 0;
+
+static FORCE_INLINE bool rdata_looks_half_landed(const spu_rdata_t& _data)
+{
+	const auto data = reinterpret_cast<const v128*>(_data);
+	return gv_testz(data[2] | data[3]) && !gv_testz((data[4] | data[5]) | (data[6] | data[7]));
+}
+
+static FORCE_INLINE bool rdata_updated_by_this_spu(u32 addr)
+{
+	return std::find(std::begin(s_getllar_putllc_lines), std::end(s_getllar_putllc_lines), addr) != std::end(s_getllar_putllc_lines);
+}
+
+static FORCE_INLINE void rdata_note_putllc_line(u32 addr)
+{
+	if (!rdata_updated_by_this_spu(addr))
+	{
+		s_getllar_putllc_lines[s_getllar_putllc_next++ % std::size(s_getllar_putllc_lines)] = addr;
+	}
+}
+
+static void rdata_settle_wait()
+{
+	u64 freq = 0;
+	asm volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+
+	// About 3 microseconds. A store waits for its cache line far less than that.
+	const u64 stop = utils::get_tsc() + std::max<u64>(freq / 333'333, 2);
+
+	while (utils::get_tsc() < stop)
+	{
+		utils::pause();
+	}
+}
+
+// The 3 microsecond wait above covered nearly every case, but Yakuza: Dead Souls still froze once
+// after an hour of play (tester log 62). gs_task, the task that reads the line, fetches its command
+// ring one 128-byte line at a time into LS 0x37780 and takes a line as complete once entry 3's first
+// word is non-zero. For that read the shape is exact: entry 3's first word set while an earlier
+// 32-byte entry is still all zero means the line is still being written, however long its first
+// half takes to land. That read is retried until the line is whole (up to 100 ms), instead of
+// trusting a fixed wait.
+static constexpr u32 c_gs_task_fetch_lsa = 0x37780;
+
+static FORCE_INLINE bool rdata_gs_line_in_flight(const spu_rdata_t& _data)
+{
+	u32 entry3 = 0;
+	std::memcpy(&entry3, _data + 96, sizeof(entry3));
+
+	if (!entry3)
+	{
+		// gs_task does not take the line yet
+		return false;
+	}
+
+	const auto data = reinterpret_cast<const v128*>(_data);
+	return gv_testz(data[0] | data[1]) || gv_testz(data[2] | data[3]) || gv_testz(data[4] | data[5]);
+}
+
+static thread_local bool s_gs_waiting = false;
+static thread_local u32 s_gs_wait_addr = 0;
+static thread_local u64 s_gs_wait_start = 0;
+
+static u64 rdata_tsc_to_ns(u64 ticks)
+{
+	u64 freq = 0;
+	asm volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+	return freq ? ticks * 1'000'000'000 / freq : 0;
+}
+#endif
+
 #if defined(ARCH_X64)
 static FORCE_INLINE void mov_rdata_avx(__m256i* dst, const __m256i* src)
 {
@@ -2142,6 +2255,10 @@ spu_thread::spu_thread(lv2_spu_group* group, u32 index, std::string_view name, u
 {
 	init_spu_decoder();
 
+#if defined(ARCH_ARM64)
+	g_spu_getllar_settle = spu_getllar_settle_title(Emu.GetTitleID());
+#endif
+
 	if (g_cfg.core.mfc_debug)
 	{
 		utils::memory_commit(vm::g_stat_addr + vm_offset(), SPU_LS_SIZE);
@@ -2205,6 +2322,10 @@ spu_thread::spu_thread(utils::serial& ar, lv2_spu_group* group)
 	, spu_tname(make_single<std::string>(ar.operator std::string()))
 {
 	init_spu_decoder();
+
+#if defined(ARCH_ARM64)
+	g_spu_getllar_settle = spu_getllar_settle_title(Emu.GetTitleID());
+#endif
 
 	if (g_cfg.core.mfc_debug)
 	{
@@ -2326,6 +2447,37 @@ void spu_thread::push_snr(u32 number, u32 value)
 	const u32 event_bit = SPU_EVENT_S1 >> (number & 1);
 	const bool bitor_bit = !!((snr_config >> number) & 1);
 
+	// Upstream gives the SPU time to react to a signal (Elad, d86d677f2 and 3a3ba6139): after a push
+	// to an SPU that was waiting it spin-yields until that SPU wakes, up to 500 us, and then waits 3 us
+	// more on every push. Cheap on a desktop, where a thread wakes in a few microseconds. Not on a
+	// phone, where a wake takes tens of microseconds and longer when the cores are clocked down or
+	// hot: Sonic '06 signals its SPUs about 2,900 times a second, and the main PPU thread spent that
+	// waiting, holding the game under 60 fps (Odin 3, 11-05).
+	//
+	// What the waiting protects against is the game's flicker, RPCS3 #4122: an overwrite-mode SNR
+	// written again while it still holds a value the SPU has not read, so the SPU job feeding the
+	// geometry loses its signal. That needs waiting only then. Before an overwrite-mode push into a
+	// register that is still full, the SPU gets the same 500 us to read it; a register that is already
+	// empty, the usual case, costs nothing. This is the in-code form of WaitForSPUsToEmptySNRs, Elad's
+	// own canary patch for the game, which canary_patches.yml bundles for the US dump; here it covers
+	// every dump and every game.
+	//
+	// ARMSX3_SNR_WAKE_WAIT=1 in driver_env.txt restores upstream's waits instead, for an A/B. Read on
+	// first use, during a game, after driver_env.txt has been applied.
+	static const bool s_wake_wait = []
+	{
+		const char* env = std::getenv("ARMSX3_SNR_WAKE_WAIT");
+		return env && *env == '1';
+	}();
+
+	if (!s_wake_wait && !bitor_bit && channel->get_count())
+	{
+		for (u64 time = get_system_time(), current = time; channel->get_count() && !is_stopped() && current - time < 500; current = get_system_time())
+		{
+			std::this_thread::yield();
+		}
+	}
+
 	// Lock event channel in case it needs event notification
 	ch_events.atomic_op([](ch_events_t& ev)
 	{
@@ -2333,15 +2485,15 @@ void spu_thread::push_snr(u32 number, u32 value)
 	});
 
 	// Check corresponding SNR register settings
-	const u32 old_spu_pc = this->pc; 
+	const u32 old_spu_pc = this->pc;
 	auto push_state = channel->push(value, bitor_bit);
 
 	if (push_state.old_count < push_state.count)
 	{
 		set_events(event_bit);
 
-		// Wait until the thread wakes up (SPU wakes up immediately on realhW)
-		if (push_state.notify)
+		// Wait until the thread wakes up (SPU wakes up immediately on realhW): see s_wake_wait
+		if (s_wake_wait && push_state.notify)
 		{
 			for (u64 time = get_system_time(), current = time; state & cpu_flag::wait && old_spu_pc == atomic_storage<u32>::load(this->pc) && current - time < 500; current = get_system_time())
 			{
@@ -2366,7 +2518,16 @@ void spu_thread::push_snr(u32 number, u32 value)
 
 	// Configueable SPU head start (compnesation)
 	// SPU wakes up immediately on realhW and is faster than PPU
-	thread_ctrl::wait_for_accurate(g_cfg.core.spu_mmio_delay_enabled ? +g_cfg.core.spu_mmio_delay : 3);
+	// Only where a game's settings ask for the MMIO delay (Blitz: The League II's database entry, for
+	// one), or with upstream's waits back on: see s_wake_wait.
+	if (g_cfg.core.spu_mmio_delay_enabled)
+	{
+		thread_ctrl::wait_for_accurate(+g_cfg.core.spu_mmio_delay);
+	}
+	else if (s_wake_wait)
+	{
+		thread_ctrl::wait_for_accurate(3);
+	}
 }
 
 void spu_thread::push_in_mbox(u32 value)
@@ -5437,6 +5598,122 @@ u32 spu_thread::get_mfc_completed() const
 	return ch_tag_mask & ~mfc_fence;
 }
 
+// How long an SPU busy-waits on an unchanged reservation line before it is made to sleep in the
+// OS instead (the "Don't be stubborn" check in the GETLLAR path).
+//
+// Upstream's limit is 400'000 timer ticks, written for x86, whose TSC runs near 3 GHz: about
+// 0.13 ms. perf_meter reads cntvct_el0 on ARM, and every device in our logs runs that counter far
+// slower: 19.2 MHz on every Snapdragon, 13 MHz on every MediaTek. Read raw, 400'000 ticks is 21 ms on
+// a Snapdragon and 31 ms on a Dimensity, so an SPU that chose to spin on an idle line kept a core
+// busy that long before it slept, and with SPURS handing out work every frame (16-33 ms) an idle SPU
+// on a phone could spin from one job to the next without ever sleeping. busy_wait() already
+// converts its cycle counts for this counter (util/asm.hpp); this limit was missed. Converted here
+// to the ~0.13 ms it means on x86.
+//
+// ARMSX3_GETLLAR_RAW_TICKS=1 in driver_env.txt keeps the raw 400'000, for an A/B. Read on first use,
+// which is during a game, after driver_env.txt has been applied.
+static u64 getllar_spin_limit_ticks()
+{
+	static const u64 s_ticks = []() -> u64
+	{
+		constexpr u64 x86_ticks = 400'000;
+		constexpr u64 x86_tsc_hz = 3'000'000'000;
+
+		const char* env = std::getenv("ARMSX3_GETLLAR_RAW_TICKS");
+
+		if (env && *env && *env != '0')
+		{
+			spu_log.notice("GETLLAR: an SPU spins at most the raw %u ticks before sleeping (ARMSX3_GETLLAR_RAW_TICKS)", x86_ticks);
+			return x86_ticks;
+		}
+
+#ifdef ARCH_ARM64
+		const u64 freq = utils::get_tsc_freq();
+
+		if (freq && freq < x86_tsc_hz)
+		{
+			const u64 ticks = std::max<u64>(x86_ticks * freq / x86_tsc_hz, 1);
+			spu_log.notice("GETLLAR: an SPU spins at most %u ticks (%u us at %u Hz) before sleeping", ticks, ticks * 1'000'000 / freq, freq);
+			return ticks;
+		}
+#endif
+
+		return x86_ticks;
+	}();
+
+	return s_ticks;
+}
+
+// How close together two GETLLARs of one unchanged line must come for the spin detection in the
+// GETLLAR path to call them a loop at all, rather than a poll between pieces of real work.
+//
+// Upstream's window is 5'000 timer ticks ("large time window is intentional"), the same x86 unit
+// as getllar_spin_limit_ticks: about 1.7 us on a 3 GHz TSC, but 260 us read on cntvct_el0 at
+// 19.2 MHz and 385 us at 13 MHz. That counted an SPU polling a line between hundreds of
+// microseconds of real work as spinning. While the spin limit was also read raw (21 ms) such a loop
+// was rarely made to sleep, so it hardly mattered; with the limit converted to 0.13 ms, it is
+// sent to sleep in the middle of its work, which costs the game that SPU's throughput. Converted
+// after testers on the 8 Elite saw some games run 5-10% slower with the converted limit while
+// others gained (Web of Shadows halved its CPU).
+//
+// Converted the same way, with a 5 us floor: one pass of a genuine spin is slower on a phone than on
+// a desktop, so the bare conversion would risk missing real spins, and work between polls runs to
+// tens of microseconds at least. ARMSX3_GETLLAR_RAW_TICKS=1 keeps the raw window too.
+static u64 getllar_loop_window_ticks()
+{
+	static const u64 s_ticks = []() -> u64
+	{
+		constexpr u64 x86_ticks = 5'000;
+		constexpr u64 x86_tsc_hz = 3'000'000'000;
+		constexpr u64 floor_us = 5;
+
+		const char* env = std::getenv("ARMSX3_GETLLAR_RAW_TICKS");
+
+		if (env && *env && *env != '0')
+		{
+			return x86_ticks;
+		}
+
+#ifdef ARCH_ARM64
+		const u64 freq = utils::get_tsc_freq();
+
+		if (freq && freq < x86_tsc_hz)
+		{
+			const u64 ticks = std::max<u64>({x86_ticks * freq / x86_tsc_hz, freq * floor_us / 1'000'000, 1});
+			spu_log.notice("GETLLAR: GETLLARs of one line count as a spin when they come within %u ticks (%u us at %u Hz)", ticks, ticks * 1'000'000 / freq, freq);
+			return ticks;
+		}
+#endif
+
+		return x86_ticks;
+	}();
+
+	return s_ticks;
+}
+
+// Counts the spins the limit above ends, for a line in the log every ten seconds or more.
+static atomic_t<u32> s_getllar_spins_ended{0};
+static atomic_t<u64> s_getllar_spins_report_us{0};
+
+static void note_getllar_spin_ended()
+{
+	s_getllar_spins_ended++;
+
+	const u64 now = get_system_time();
+	const u64 last = s_getllar_spins_report_us.load();
+
+	if (!last)
+	{
+		s_getllar_spins_report_us.compare_and_swap(0, now);
+		return;
+	}
+
+	if (now - last >= 10'000'000 && s_getllar_spins_report_us.compare_and_swap_test(last, now))
+	{
+		spu_log.notice("GETLLAR: %u spins on an unchanged line gave way to sleep in %.1f s", s_getllar_spins_ended.exchange(0), (now - last) / 1'000'000.);
+	}
+}
+
 u32 evaluate_spin_optimization(std::span<u8> stats, u64 evaluate_time, const cfg::uint<0, 100>& wait_percent, bool inclined_for_responsiveness = false)
 {
 	ensure(stats.size() >= 2 && stats.size() <= 16);
@@ -5661,8 +5938,9 @@ bool spu_thread::process_mfc_cmd()
 
 						if ([&]() -> bool
 						{
-							// Validation that it is indeed GETLLAR spinning (large time window is intentional)
-							if (last_getllar_addr != addr || last_getllar_gpr1 != gpr[1]._u32[3] || perf0.get() - last_gtsc >= 5'000 || (interrupts_enabled && ch_events.load().mask))
+							// Validation that it is indeed GETLLAR spinning (large time window is intentional,
+							// in this machine's timer ticks: see getllar_loop_window_ticks)
+							if (last_getllar_addr != addr || last_getllar_gpr1 != gpr[1]._u32[3] || perf0.get() - last_gtsc >= getllar_loop_window_ticks() || (interrupts_enabled && ch_events.load().mask))
 							{
 								// Seemingly not
 								getllar_busy_waiting_switch = umax;
@@ -5762,7 +6040,8 @@ bool spu_thread::process_mfc_cmd()
 								}
 							}
 							// Don't be stubborn, force operating sleep if too much time has passed
-							else if (getllar_busy_waiting_switch == 1 && perf0.get() > getllar_evaluate_time && perf0.get() - getllar_evaluate_time >= 400'000)
+							// (in this machine's timer ticks: see getllar_spin_limit_ticks)
+							else if (getllar_busy_waiting_switch == 1 && perf0.get() > getllar_evaluate_time && perf0.get() - getllar_evaluate_time >= getllar_spin_limit_ticks())
 							{
 								// Hidden value to force busy waiting
 								if (!g_cfg.core.spu_getllar_spin_optimization_disabled)
@@ -5770,6 +6049,7 @@ bool spu_thread::process_mfc_cmd()
 									spu_log.trace("SPU wait for 0x%x", addr);
 									getllar_wait_time[(addr % SPU_LS_SIZE) / 128].front() = 1;
 									getllar_busy_waiting_switch = 0;
+									note_getllar_spin_ended();
 								}
 							}
 
@@ -5935,6 +6215,44 @@ bool spu_thread::process_mfc_cmd()
 		u64 ntime = 0;
 		rsx::reservation_lock rsx_lock(addr, 128);
 
+#if defined(ARCH_ARM64)
+		// See rdata_gs_line_in_flight()
+		const bool gs_fetch = g_spu_getllar_settle.observe() && (ch_mfc_cmd.lsa & 0x3ff80) == c_gs_task_fetch_lsa && addr != spurs_addr;
+		bool gs_checked = false;
+
+		// True while gs_task's line is still being written and worth reading again
+		const auto gs_line_wait = [&]() -> bool
+		{
+			if (!rdata_gs_line_in_flight(rdata))
+			{
+				s_gs_waiting = false;
+				return false;
+			}
+
+			const u64 now = utils::get_tsc();
+
+			if (!s_gs_waiting || s_gs_wait_addr != addr)
+			{
+				s_gs_waiting = true;
+				s_gs_wait_addr = addr;
+				s_gs_wait_start = now;
+
+				// Nothing on the RSX side should wait on this line while its first half lands
+				rsx_lock.unlock();
+			}
+
+			if (rdata_tsc_to_ns(now - s_gs_wait_start) < 100'000'000 && !is_stopped())
+			{
+				return true;
+			}
+
+			s_gs_waiting = false;
+			spu_log.warning("GETLLAR: line 0x%x was still incomplete after %u ms; taken as it is (pc 0x%x)", addr, rdata_tsc_to_ns(now - s_gs_wait_start) / 1'000'000, pc);
+			return false;
+		};
+
+	getllar_reread:
+#endif
 		for (u64 i = 0; i != umax; [&]()
 		{
 			if (state & cpu_flag::pause)
@@ -5999,6 +6317,40 @@ bool spu_thread::process_mfc_cmd()
 				continue;
 			}
 
+#if defined(ARCH_ARM64)
+			if (gs_fetch)
+			{
+				// See rdata_gs_line_in_flight()
+				if (gs_line_wait())
+				{
+					continue;
+				}
+
+				gs_checked = true;
+			}
+			// See rdata_looks_half_landed()
+			else if (g_spu_getllar_settle.observe() && rdata_looks_half_landed(rdata) && addr != spurs_addr && !rdata_updated_by_this_spu(addr))
+			{
+				const u32 hash = compute_rdata_hash32(rdata);
+
+				// A line that kept this shape through one wait is taken as it is until it changes
+				if (s_getllar_settled_addr != addr || s_getllar_settled_hash != hash)
+				{
+					rdata_settle_wait();
+					atomic_fence_acquire();
+
+					if (vm::reservation_acquire(addr) != ntime || !cmp_rdata(rdata, data))
+					{
+						// It was still being written: read it again
+						continue;
+					}
+
+					s_getllar_settled_addr = addr;
+					s_getllar_settled_hash = hash;
+				}
+			}
+#endif
+
 			if (i >= 15 && g_cfg.core.perf_report) [[unlikely]]
 			{
 				perf_log.warning("GETLLAR: took too long: %u", i);
@@ -6006,6 +6358,14 @@ bool spu_thread::process_mfc_cmd()
 
 			break;
 		}
+
+#if defined(ARCH_ARM64)
+		// A read taken while every thread was suspended skips the checks in the loop
+		if (gs_fetch && !gs_checked && gs_line_wait())
+		{
+			goto getllar_reread;
+		}
+#endif
 
 		raddr = addr;
 		rtime = ntime;
@@ -6028,6 +6388,14 @@ bool spu_thread::process_mfc_cmd()
 
 	case MFC_PUTLLC_CMD:
 	{
+#if defined(ARCH_ARM64)
+		// See rdata_looks_half_landed()
+		if (g_spu_getllar_settle.observe())
+		{
+			rdata_note_putllc_line(ch_mfc_cmd.eal & -128);
+		}
+#endif
+
 		// Avoid logging useless commands if there is no reservation
 		const bool dump = g_cfg.core.mfc_debug && raddr;
 
