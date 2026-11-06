@@ -5893,6 +5893,16 @@ open class MainActivityRuntime : ComponentActivity() {
             super.onDestroy()
             return
         }
+        // A game handed to the headset activity outlives this panel. Horizon OS closes a panel
+        // opened from another immersive app (Tremu) the moment ours goes immersive, and shutting
+        // the core down then killed the game as it booted (RunPPU's IsStarting check). The XR
+        // activity ends the process itself when it leaves.
+        if (com.armsx2.xr.XrEmulationActivity.hostsGame) {
+            println("@@ANDROID_MAIN_DESTROYED@@ while the headset activity holds a game; core kept")
+            com.armsx2.xr.XrEmulationActivity.mainGone = true
+            super.onDestroy()
+            return
+        }
         // Real finish only — a configuration recreate must NOT tear the second-display panel
         // down (it would flicker away and rebuild on every rotation/density change).
         runCatching { com.armsx2.SecondScreen.release(applicationContext) }

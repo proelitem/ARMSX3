@@ -105,13 +105,30 @@ class XrEmulationActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        hostsGame = false
         // Destroyed by the system with the game still up (task swipe, OS). Stop the game; the
         // core's swapchain goes with it and the session can then be torn down.
-        if (!leaving && MainActivityRuntime.eState.value != EmuState.STOPPED) {
+        val gameUp = !leaving && MainActivityRuntime.eState.value != EmuState.STOPPED
+        if (gameUp) {
             MainActivityRuntime.closeGame()
         }
-        if (xrStarted) {
-            xrStarted = false
+        val stopXr = xrStarted
+        xrStarted = false
+        if (mainGone) {
+            // Nothing else is left to end the process: do what Main's onDestroy would have done,
+            // once the game has unwound (bounded, as a stuck core must not keep the app alive).
+            mainGone = false
+            Thread {
+                if (stopXr) XrPresentation.stop()
+                val deadline = System.currentTimeMillis() + 5_000
+                while ((MainActivityRuntime.eState.value != EmuState.STOPPED ||
+                        MainActivityRuntime.isVmStopInProgress()) &&
+                    System.currentTimeMillis() < deadline
+                ) Thread.sleep(50)
+                runCatching { com.armsx3.NativeApp.shutdown() }
+                android.os.Process.killProcess(android.os.Process.myPid())
+            }.start()
+        } else if (stopXr) {
             Thread { XrPresentation.stop() }.start()
         }
         super.onDestroy()
@@ -248,7 +265,17 @@ class XrEmulationActivity : ComponentActivity() {
         /** Horizon OS composes OpenXR layers only for an activity carrying this category. */
         private const val VR_CATEGORY = "com.oculus.intent.category.VR"
 
+        /** From the hand-over in [start] until this activity is gone: a game lives here. Main's
+         *  onDestroy reads it, see [mainGone]. */
+        @Volatile @JvmStatic var hostsGame = false
+
+        /** Main was destroyed while this activity held a game. Horizon OS closes a panel that
+         *  was opened from another immersive app (Tremu) as soon as ours goes immersive; Main
+         *  then leaves the core running, and this activity ends the process once it is done. */
+        @Volatile @JvmStatic var mainGone = false
+
         fun start(from: Context) {
+            hostsGame = true
             val intent = Intent(from, XrEmulationActivity::class.java)
                 .addCategory(VR_CATEGORY)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
