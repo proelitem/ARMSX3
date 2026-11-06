@@ -37,10 +37,22 @@ set(FFMPEG_PATH "${CMAKE_SOURCE_DIR}/build-ffmpeg/${FFMPEG_VERSION}-arm64-v8a-${
 # must exist before any target links them.
 if(NOT EXISTS "${FFMPEG_PATH}/lib/libavcodec.a")
     message(STATUS "ARMSX3: building ffmpeg ${FFMPEG_VERSION} for arm64-v8a")
-    execute_process(
-        COMMAND "${CMAKE_SOURCE_DIR}/android/build-ffmpeg.sh" "${ANDROID_NDK}" "${FFMPEG_PATH}"
-        RESULT_VARIABLE FFMPEG_BUILD_RESULT
-    )
+    if(CMAKE_HOST_WIN32)
+        # Windows cannot run a shell script by itself: hand it to an MSYS2 bash with make,
+        # diffutils and the mingw64 gcc that ffmpeg builds its own host tools with (pass
+        # -DARMSX3_MSYS2_BASH=<msys64>/usr/bin/bash.exe when MSYS2 is not in C:/msys64).
+        find_program(ARMSX3_MSYS2_BASH bash.exe PATHS "C:/msys64/usr/bin" NO_DEFAULT_PATH REQUIRED)
+        execute_process(
+            COMMAND "${ARMSX3_MSYS2_BASH}" -c "export PATH=/usr/bin:/mingw64/bin && exec bash \"$0\" \"$@\""
+                "${CMAKE_SOURCE_DIR}/android/build-ffmpeg.sh" "${ANDROID_NDK}" "${FFMPEG_PATH}"
+            RESULT_VARIABLE FFMPEG_BUILD_RESULT
+        )
+    else()
+        execute_process(
+            COMMAND "${CMAKE_SOURCE_DIR}/android/build-ffmpeg.sh" "${ANDROID_NDK}" "${FFMPEG_PATH}"
+            RESULT_VARIABLE FFMPEG_BUILD_RESULT
+        )
+    endif()
     if(NOT FFMPEG_BUILD_RESULT EQUAL 0)
         message(FATAL_ERROR "ARMSX3: building ffmpeg failed (android/build-ffmpeg.sh)")
     endif()

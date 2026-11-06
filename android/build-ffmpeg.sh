@@ -29,6 +29,9 @@ JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc)}"
 case "$(uname -s)" in
 	Darwin) HOST_TAG=darwin-x86_64 ;;
 	Linux) HOST_TAG=linux-x86_64 ;;
+	# Windows: run through MSYS2's bash (with make and diffutils), see android/ffmpeg.cmake.
+	# Paths in MSYS2 form: tar reads "G:/..." as a remote host.
+	MINGW*|MSYS*) HOST_TAG=windows-x86_64; NDK=$(cygpath -u "$NDK"); PREFIX=$(cygpath -u "$PREFIX") ;;
 	*) echo "build-ffmpeg.sh: unsupported host $(uname -s)" >&2; exit 1 ;;
 esac
 TC="$NDK/toolchains/llvm/prebuilt/$HOST_TAG"
@@ -43,7 +46,11 @@ mkdir -p "$WORK"
 TARBALL="$WORK/ffmpeg-n${VERSION}.tar.gz"
 echo "build-ffmpeg.sh: downloading ffmpeg ${VERSION}"
 curl -fL --retry 3 -o "$TARBALL" "$URL"
-GOT=$(shasum -a 512 "$TARBALL" | cut -d' ' -f1)
+if command -v shasum >/dev/null 2>&1; then
+	GOT=$(shasum -a 512 "$TARBALL" | cut -d' ' -f1)
+else
+	GOT=$(sha512sum "$TARBALL" | cut -d' ' -f1)
+fi
 if [ "$GOT" != "$SHA512" ]; then
 	echo "build-ffmpeg.sh: SHA512 mismatch for $URL" >&2
 	echo "  expected $SHA512" >&2
