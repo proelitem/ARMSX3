@@ -232,7 +232,8 @@ class XrEmulationActivity : ComponentActivity() {
     private var askedGunPermissions = false
 
     @Deprecated("Deprecated in Java")
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+    // ComponentActivity declares Array<String> here, not Activity's Array<out String>.
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
         @Suppress("DEPRECATION")
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQUEST_GUN_PERMISSIONS && WonderFitterGun.permitted(this) && XrPresentation.lightgun(this)) {
