@@ -77,6 +77,13 @@ class XrEmulationActivity : ComponentActivity() {
         // back to STOPPED, and that is this activity's cue to go.
         lifecycleScope.launch {
             while (!leaving) {
+                // Menu held alone for 1.5 s: close the game the way Back does. closeGame() sends
+                // a frontend launch back to the frontend once the game has stopped.
+                if (runCatching { com.armsx3.core.ARMSX3.instance.xrTakeQuitRequest() }.getOrDefault(false) &&
+                    MainActivityRuntime.eState.value != EmuState.STOPPED
+                ) {
+                    MainActivityRuntime.closeGame()
+                }
                 when (MainActivityRuntime.eState.value) {
                     EmuState.RUNNING, EmuState.PAUSED -> sawGameRunning = true
                     EmuState.STOPPED -> if (sawGameRunning) {

@@ -68,6 +68,10 @@ namespace armsx3::xr
 	// Fixed when the controller rides in a physical gun, whose own trigger is the one pulled.
 	void set_gun_hand(int hand);
 
+	// The menu button held alone for 1.5 s asks to close the game (the gesture every emulator in
+	// Tremu answers to). True once per hold; the app polls it and closes the game its own way.
+	bool take_quit_request();
+
 	// The extent the quad swapchain is created at. What GSFrameBase::client_width/height
 	// report while active(), so the present framebuffer and the layer agree.
 	//

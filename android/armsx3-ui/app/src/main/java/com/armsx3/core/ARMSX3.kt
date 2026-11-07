@@ -165,6 +165,8 @@ class ARMSX3 {
     external fun xrGunTrigger(down: Boolean)
     /** Headset: which controller is the gun. -1 follows the last trigger pulled, 0 left, 1 right. */
     external fun xrSetGunHand(hand: Int)
+    /** Headset: true once after the menu button was held alone for 1.5 s (close the game). */
+    external fun xrTakeQuitRequest(): Boolean
     external fun setRenderPosition(portraitTop: Boolean, topInset: Int)
     external fun setPadDeviceClasses(classes: IntArray)
 

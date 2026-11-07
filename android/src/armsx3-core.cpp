@@ -9022,6 +9022,15 @@ extern "C" void _armsx3_xrSetGunHand(int hand) {
 #endif
 }
 
+// True once after the menu button was held alone in the headset: the app closes the game.
+extern "C" bool _armsx3_xrTakeQuitRequest() {
+#ifdef ARMSX3_XR
+  return armsx3::xr::take_quit_request();
+#else
+  return false;
+#endif
+}
+
 extern "C" bool _armsx3_xrActive() {
 #ifdef ARMSX3_XR
   return armsx3::xr::active();

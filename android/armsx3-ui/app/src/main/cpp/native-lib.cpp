@@ -89,6 +89,7 @@ struct CoreApi {
   void (*xrSetLightgun)(bool on);
   void (*xrGunTrigger)(bool down);
   void (*xrSetGunHand)(int hand);
+  bool (*xrTakeQuitRequest)();
   void (*setRenderPosition)(bool portraitTop, int topInset);
   void (*setPadDeviceClasses)(const int *classes, int count);
   bool (*usbDeviceEvent)(int fd, int vendorId, int productId, int event);
@@ -296,6 +297,7 @@ struct CoreLibrary : CoreApi {
     result.xrSetLightgun = reinterpret_cast<decltype(xrSetLightgun)>(dlsym(handle, "_armsx3_xrSetLightgun"));
     result.xrGunTrigger = reinterpret_cast<decltype(xrGunTrigger)>(dlsym(handle, "_armsx3_xrGunTrigger"));
     result.xrSetGunHand = reinterpret_cast<decltype(xrSetGunHand)>(dlsym(handle, "_armsx3_xrSetGunHand"));
+    result.xrTakeQuitRequest = reinterpret_cast<decltype(xrTakeQuitRequest)>(dlsym(handle, "_armsx3_xrTakeQuitRequest"));
     // Optional: a core built before this simply centres the image, as it always did.
     result.setRenderPosition = reinterpret_cast<decltype(setRenderPosition)>(dlsym(handle, "_armsx3_setRenderPosition"));
     // Optional: a core without it reports every port as a standard pad, as it always did.
@@ -1042,6 +1044,10 @@ extern "C" JNIEXPORT void JNICALL Java_com_armsx3_core_ARMSX3_xrSetGunHand(JNIEn
   if (coreLib.xrSetGunHand != nullptr) {
     coreLib.xrSetGunHand(hand);
   }
+}
+
+extern "C" JNIEXPORT jboolean JNICALL Java_com_armsx3_core_ARMSX3_xrTakeQuitRequest(JNIEnv *, jobject) {
+  return coreLib.xrTakeQuitRequest != nullptr && coreLib.xrTakeQuitRequest() ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT void JNICALL Java_com_armsx3_core_ARMSX3_memoryPressure(JNIEnv *, jobject, jint level) {

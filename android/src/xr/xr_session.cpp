@@ -172,6 +172,8 @@ namespace armsx3::xr
 			// -1: the gun hand follows the last trigger pulled; 0/1: left/right, fixed (a gun
 			// holding one controller, whose Touch trigger is out of reach).
 			std::atomic<int> gun_hand{ -1 };
+			// Set by the input pump when the menu button is held alone; taken by the app.
+			std::atomic<bool> quit_requested{ false };
 
 			vk::xr::hooks hooks{};
 		};
@@ -428,6 +430,7 @@ namespace armsx3::xr
 			XrTime menu_down_since = 0;
 			bool menu_used_as_shift = false;
 			XrTime start_pulse_until = 0;
+			bool quit_sent = false;
 
 			// What was last pushed to the pad, so only changes are sent.
 			int sent_digital1 = -1;
@@ -438,6 +441,7 @@ namespace armsx3::xr
 
 			static constexpr XrTime k_tap_ns = 400'000'000;    // a menu press shorter than this is Start
 			static constexpr XrTime k_pulse_ns = 150'000'000;  // how long Start stays pressed after the tap
+			static constexpr XrTime k_quit_ns = 1'500'000'000; // menu held alone this long closes the game
 			static constexpr float k_deadzone = 0.12f;
 			static constexpr float k_dpad_threshold = 0.5f;
 			static constexpr float k_grip_threshold = 0.5f;
@@ -892,6 +896,16 @@ namespace armsx3::xr
 				{
 					menu_down_since = now;
 					menu_used_as_shift = false;
+					quit_sent = false;
+				}
+				else if (menu && !menu_used_as_shift && !quit_sent && now - menu_down_since >= k_quit_ns)
+				{
+					// Held alone: close the game, as in every emulator Tremu starts. Counted as a
+					// shift so the release sends no Start.
+					quit_sent = true;
+					menu_used_as_shift = true;
+					g_state.quit_requested.store(true);
+					xr_log.notice("Menu held: closing the game");
 				}
 				else if (!menu && menu_was_down)
 				{
@@ -2215,6 +2229,11 @@ namespace armsx3::xr
 		{
 			xr_log.notice("Lightgun hand: %s", h < 0 ? "follows the trigger" : h == 0 ? "left, fixed" : "right, fixed");
 		}
+	}
+
+	bool take_quit_request()
+	{
+		return g_state.quit_requested.exchange(false);
 	}
 
 	void recommended_extent(u32& width, u32& height, bool stereo_output)
