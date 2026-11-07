@@ -1156,7 +1156,7 @@ error_code cellCameraGetBufferInfoEx(ppu_thread& ppu, s32 dev_num, vm::ptr<CellC
 {
 	ppu.state += cpu_flag::wait;
 
-	cellCamera.notice("cellCameraGetBufferInfoEx(dev_num=%d, info=0x%x)", dev_num, info);
+	cellCamera.trace("cellCameraGetBufferInfoEx(dev_num=%d, info=0x%x)", dev_num, info);
 
 	// calls cellCameraGetBufferInfo
 

@@ -3172,7 +3172,7 @@ error_code cellGemGetHuePixels(vm::cptr<void> camera_frame, u32 hue, vm::ptr<u8>
 
 error_code cellGemGetImageState(u32 gem_num, vm::ptr<CellGemImageState> gem_image_state)
 {
-	cellGem.warning("cellGemGetImageState(gem_num=%d, image_state=&0x%x)", gem_num, gem_image_state);
+	cellGem.trace("cellGemGetImageState(gem_num=%d, image_state=&0x%x)", gem_num, gem_image_state);
 
 	auto& gem = g_fxo->get<gem_config>();
 	std::scoped_lock lock(gem.mtx);
@@ -3229,7 +3229,7 @@ error_code cellGemGetImageState(u32 gem_num, vm::ptr<CellGemImageState> gem_imag
 
 error_code cellGemGetInertialState(u32 gem_num, u32 state_flag, u64 timestamp, vm::ptr<CellGemInertialState> inertial_state)
 {
-	cellGem.warning("cellGemGetInertialState(gem_num=%d, state_flag=%d, timestamp=0x%x, inertial_state=0x%x)", gem_num, state_flag, timestamp, inertial_state);
+	cellGem.trace("cellGemGetInertialState(gem_num=%d, state_flag=%d, timestamp=0x%x, inertial_state=0x%x)", gem_num, state_flag, timestamp, inertial_state);
 
 	auto& gem = g_fxo->get<gem_config>();
 
@@ -3402,7 +3402,7 @@ error_code cellGemGetRumble(u32 gem_num, vm::ptr<u8> rumble)
 
 error_code cellGemGetState(u32 gem_num, u32 flag, u64 time_parameter, vm::ptr<CellGemState> gem_state)
 {
-	cellGem.warning("cellGemGetState(gem_num=%d, flag=0x%x, time=0x%llx, gem_state=*0x%x)", gem_num, flag, time_parameter, gem_state);
+	cellGem.trace("cellGemGetState(gem_num=%d, flag=0x%x, time=0x%llx, gem_state=*0x%x)", gem_num, flag, time_parameter, gem_state);
 
 	auto& gem = g_fxo->get<gem_config>();
 
@@ -4100,7 +4100,7 @@ error_code cellGemUpdateFinish(ppu_thread& ppu)
 {
 	ppu.state += cpu_flag::wait;
 
-	cellGem.warning("cellGemUpdateFinish()");
+	cellGem.trace("cellGemUpdateFinish()");
 
 	auto& gem = g_fxo->get<gem_config>();
 
@@ -4134,7 +4134,7 @@ error_code cellGemUpdateFinish(ppu_thread& ppu)
 
 error_code cellGemUpdateStart(vm::cptr<void> camera_frame, u64 timestamp)
 {
-	cellGem.warning("cellGemUpdateStart(camera_frame=*0x%x, timestamp=%d)", camera_frame, timestamp);
+	cellGem.trace("cellGemUpdateStart(camera_frame=*0x%x, timestamp=%d)", camera_frame, timestamp);
 
 	auto& gem = g_fxo->get<gem_config>();
 
